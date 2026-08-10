@@ -11,7 +11,8 @@
 namespace {
 struct App {
     dense::DxrRenderer renderer; dense::TreeGenerator generator; dense::TreeParameters params=dense::TreeGenerator::parametersFor(dense::TreeSpecies::EnglishOak);dense::GpuCapabilities gpu;
-    float yaw=.55f,pitch=.18f,distance=14.0f; bool dragging=false; POINT last{}; uint32_t generation=0;
+    float yaw=.55f,pitch=.18f,distance=14.0f,sunAzimuth=.55f,windStrength=.72f;
+    bool dragging=false; POINT last{}; uint32_t generation=0;
     void regenerate(HWND window,bool nextSeed=true) {
         if(nextSeed) params.seed=5080+generation++;
         const auto start=std::chrono::steady_clock::now();
@@ -39,8 +40,9 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         if(wParam==VK_ESCAPE){DestroyWindow(window);return 0;}
         if(app&&(wParam=='R'||wParam==VK_SPACE)){app->regenerate(window);return 0;}
         if(app&&wParam>='1'&&wParam<='5'){app->setSpecies(window,static_cast<dense::TreeSpecies>(wParam-'1'));return 0;}
-        if(app&&wParam==VK_LEFT){app->params.sunlightAzimuth-=.12f;app->regenerate(window,false);return 0;}
-        if(app&&wParam==VK_RIGHT){app->params.sunlightAzimuth+=.12f;app->regenerate(window,false);return 0;}
+        if(app&&wParam==VK_LEFT){app->sunAzimuth-=.12f;return 0;}
+        if(app&&wParam==VK_RIGHT){app->sunAzimuth+=.12f;return 0;}
+        if(app&&wParam=='W'){app->windStrength=app->windStrength>.01f?0.0f:.72f;return 0;}
         break;
     default:break;
     }
@@ -55,6 +57,6 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     HWND window=CreateWindowExW(0,wc.lpszClassName,L"Dense Trees",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,rect.right-rect.left,rect.bottom-rect.top,nullptr,nullptr,instance,nullptr);if(!window)return 2;
     app=std::make_unique<App>();app->gpu=dense::queryGpuCapabilities();RECT client{};GetClientRect(window,&client);if(!app->renderer.initialize(window,client.right,client.bottom)){MessageBoxW(window,app->renderer.error(),L"Dense Trees DXR renderer error",MB_ICONERROR);return 3;}
     app->regenerate(window);ShowWindow(window,show);UpdateWindow(window);
-    MSG msg{};bool running=true;while(running){while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){if(msg.message==WM_QUIT){running=false;break;}TranslateMessage(&msg);DispatchMessageW(&msg);}if(running)app->renderer.render(app->yaw,app->pitch,app->distance,app->params.sunlightAzimuth);}
+    MSG msg{};bool running=true;while(running){while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){if(msg.message==WM_QUIT){running=false;break;}TranslateMessage(&msg);DispatchMessageW(&msg);}if(running)app->renderer.render(app->yaw,app->pitch,app->distance,app->sunAzimuth,app->windStrength);}
     app.reset();return static_cast<int>(msg.wParam);
 }

@@ -1,3 +1,4 @@
+#include "environment.hpp"
 #include "tree.hpp"
 
 #include <algorithm>
@@ -56,6 +57,59 @@ void validateTriangles(const std::vector<dense::MeshVertex>& vertices,
 } // namespace
 
 int main() {
+    dense::EnvironmentGenerator environmentGenerator;
+    const auto environment = environmentGenerator.build(0x1234abcdu);
+    const auto environmentCopy = environmentGenerator.build(0x1234abcdu);
+    constexpr size_t terrainSide=dense::EnvironmentGenerator::terrainResolution;
+    require(environment.terrainVertices.size()==terrainSide*terrainSide,
+            "hill terrain vertex inventory changed unexpectedly");
+    require(environment.terrainIndices.size()==(terrainSide-1)*(terrainSide-1)*6,
+            "hill terrain index inventory changed unexpectedly");
+    require(environment.grassPatches.size()>=9000&&environment.grassPatches.size()<=18000,
+            "procedural grass patch inventory escaped its performance budget");
+    require(environment.grassPatches.size()==environmentCopy.grassPatches.size(),
+            "same environment seed did not reproduce its grass inventory");
+    require(std::abs(dense::EnvironmentGenerator::terrainHeight(0,0))<1.0e-6f,
+            "oak root grade is no longer exactly y=0");
+    for(float z=-1.5f;z<=1.5f;z+=.5f)for(float x=-1.5f;x<=1.5f;x+=.5f)
+        if(std::sqrt(x*x+z*z)<=1.5f)
+            require(std::abs(dense::EnvironmentGenerator::terrainHeight(x,z))<1.0e-5f,
+                    "terrain intruded into the oak root-clearance zone");
+    require(environment.minimumHeight<-2.7f&&environment.minimumHeight>-4.2f&&
+                environment.maximumHeight>=-.001f&&environment.maximumHeight<.35f,
+            "hill terrain height envelope is implausible");
+    for(const auto& vertex:environment.terrainVertices){
+        require(finite(vertex.position)&&finite(vertex.normal),
+                "terrain emitted non-finite geometry");
+        require(std::abs(dense::length(vertex.normal)-1.0f)<.002f&&vertex.normal.y>.72f,
+                "terrain normal is not unit length or points below the hill");
+        require(vertex.material==2.0f,"terrain material routing changed");
+    }
+    validateTriangles(environment.terrainVertices,environment.terrainIndices,"hill terrain");
+    for(size_t i=0;i<environment.grassPatches.size();++i){
+        const auto& patch=environment.grassPatches[i];
+        require(std::isfinite(patch.minX)&&std::isfinite(patch.minY)&&
+                    std::isfinite(patch.minZ)&&std::isfinite(patch.maxX)&&
+                    std::isfinite(patch.maxY)&&std::isfinite(patch.maxZ),
+                "grass emitted a non-finite AABB");
+        require(patch.minX<patch.maxX&&patch.minY<patch.baseY&&patch.baseY<patch.maxY&&
+                    patch.minZ<patch.maxZ,
+                "grass AABB does not enclose its patch base and blade height");
+        const uint32_t blades=patch.packed&255u,heightCode=(patch.packed>>8)&255u;
+        require(blades>=11&&blades<=15&&heightCode>=42&&heightCode<=145,
+                "grass blade count or height left the configured meadow range");
+        const float normalY=std::sqrt(std::max(0.0f,1-patch.normalX*patch.normalX-
+                                                    patch.normalZ*patch.normalZ));
+        require(normalY>.72f&&patch.moisture>=0&&patch.moisture<=1,
+                "grass patch has invalid terrain alignment or moisture");
+        if(i<64){
+            const auto& copy=environmentCopy.grassPatches[i];
+            require(patch.seed==copy.seed&&patch.packed==copy.packed&&patch.baseY==copy.baseY&&
+                        patch.minX==copy.minX&&patch.maxZ==copy.maxZ,
+                    "same environment seed did not reproduce grass patch data");
+        }
+    }
+
     dense::TreeGenerator generator;
     dense::TreeParameters p;
     p.attractionPoints = 360;

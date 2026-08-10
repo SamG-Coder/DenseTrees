@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(densetrees_core
+    src/environment.cpp
     src/tree.cpp
 )
 target_include_directories(densetrees_core PUBLIC src)

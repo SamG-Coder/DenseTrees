@@ -10,7 +10,7 @@ public:
     bool initialize(HWND window,int width,int height);
     void resize(int width,int height);
     void setTree(const TreeMesh& tree);
-    void render(float yaw,float pitch,float distance,float sunAzimuth);
+    void render(float yaw,float pitch,float distance,float sunAzimuth,float windStrength=.72f);
     const wchar_t* error()const;
     bool ready()const;
 private:struct Impl;std::unique_ptr<Impl> impl_;
