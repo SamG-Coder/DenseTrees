@@ -106,8 +106,10 @@ std::vector<BranchNode> TreeGenerator::grow(const TreeParameters& p) const {
                 for(int step=0;step<steps;++step) {
                     const float q=static_cast<float>(step+1)/steps;const Vec3 position=nodes[static_cast<size_t>(parent)].position;
                     curvature=normalize(curvature*.91f+Vec3{rng.range(-1,1),rng.range(-.40f,.52f),rng.range(-1,1)}*.09f);
-                    const float sag=distalSag*clamp((q-.58f)/.42f,0,1);const float curveWeight=order<=1?.185f:(order==2?.135f:.078f);
-                    const float targetWeight=order<=1?.235f:(order==2?.285f:.335f);const float directionWeight=1-curveWeight-targetWeight;
+                    const float bendQ=clamp(q/.30f,0,1);const float bendIn=bendQ*bendQ*(3-2*bendQ);
+                    const float sag=distalSag*clamp((q-.58f)/.42f,0,1);const float baseCurve=order<=1?.185f:(order==2?.135f:.078f);
+                    const float baseTarget=order<=1?.235f:(order==2?.285f:.335f);const float curveWeight=baseCurve*(.30f+.70f*bendIn);
+                    const float targetWeight=baseTarget*(.24f+.76f*bendIn);const float directionWeight=1-curveWeight-targetWeight;
                     Vec3 desired=normalize(direction*directionWeight+normalize(target-position)*targetWeight+curvature*curveWeight+Vec3{0,sag,0});
                     if(constrainOutward) {
                         const Vec3 horizontal{desired.x,0,desired.z};
@@ -184,6 +186,7 @@ std::vector<BranchNode> TreeGenerator::grow(const TreeParameters& p) const {
                 {5.43f,4.54f,5.58f,2.28f,1.84f,1.66f,12,true},
                 {6.03f,3.94f,7.06f,2.12f,1.68f,1.38f,10,true},
                 {1.28f,1.72f,8.10f,1.85f,1.28f,.78f,8,false},
+                {4.38f,2.05f,7.78f,1.90f,1.34f,.86f,8,false},
                 {.42f,2.72f,4.46f,1.28f,1.02f,1.10f,8,false},
                 {1.94f,2.58f,6.24f,1.22f,1.04f,1.18f,8,false},
                 {3.62f,2.86f,4.92f,1.34f,1.08f,1.16f,8,false},
@@ -251,7 +254,7 @@ std::vector<BranchNode> TreeGenerator::grow(const TreeParameters& p) const {
                             const Vec3 direction=normalize(inheritedDirection*.44f+normalize(toTarget)*.70f+outward*.035f+Vec3{0,.020f,0});
                             AxisPath support=growPath(parent,direction,destination.position,outward,3,length(toTarget)*rng.range(1.006f,1.022f),lobeSpec.height<4.2f?-.028f:-.006f,false);
                             const Vec3 center=nodes[static_cast<size_t>(support.nodes.back())].position;
-                            float vigor=rng.range(.78f,1.18f);if(rng.unit()<.19f)vigor*=rng.range(.50f,.72f);
+                            float vigor=rng.range(.84f,1.18f);if(rng.unit()<.15f)vigor*=rng.range(.58f,.76f);
                             pads.push_back({std::move(support),center,outward,destination.radius,vigor,lobeSpec.peripheral});
                         }
                         return;
@@ -276,6 +279,14 @@ std::vector<BranchNode> TreeGenerator::grow(const TreeParameters& p) const {
                     const int sharedOrder=depth<2?2:3;
                     AxisPath shared=growPath(parent,sharedDirection,waypoint,outward,sharedOrder,length(waypoint-parentPosition)*1.015f,lobeSpec.height<4.2f?-.022f:-.004f,false);
                     const int branchPoint=shared.nodes.back();const Vec3 branchDirection=nodes[static_cast<size_t>(branchPoint)].direction;
+                    const bool bridgePad=(depth==1&&rng.unit()<.68f)||(depth==2&&rng.unit()<.17f);
+                    if(bridgePad) {
+                        AxisPath bridge=shared;const size_t first=static_cast<size_t>(bridge.nodes.size()*.42f);
+                        if(first>0&&first<bridge.nodes.size())bridge.nodes.erase(bridge.nodes.begin(),bridge.nodes.begin()+first);
+                        const Vec3 bridgeCenter=nodes[static_cast<size_t>(bridge.nodes.back())].position+outward*rng.range(.05f,.18f)+Vec3{0,rng.range(.04f,.16f),0};
+                        const float bridgeRadius=lobeSpec.peripheral?rng.range(.44f,.62f):rng.range(.38f,.54f);const float bridgeVigor=rng.range(.60f,.84f);
+                        pads.push_back({std::move(bridge),bridgeCenter,outward,bridgeRadius,bridgeVigor,lobeSpec.peripheral});
+                    }
 
                     int seedA=targetIds.front(),seedB=targetIds.back();float widest=-1;
                     for(size_t a=0;a<targetIds.size();++a)for(size_t b=a+1;b<targetIds.size();++b) {
@@ -556,13 +567,54 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
         nodes[i].radius=radius;
     }
 
+    // Build a transported frame along each botanical axis.  Recomputing a
+    // cylinder frame independently for every segment twists the ring vertices
+    // at bends and exposes dark seams.  The transported frame and root-to-node
+    // arc length keep both geometry and bark relief continuous through a limb.
+    std::vector<int> continuationChild(nodes.size(),-1);
+    std::vector<float> continuationScore(nodes.size(),-2.0f),arcLength(nodes.size());
+    for(size_t i=1;i<nodes.size();++i) {
+        const size_t parent=static_cast<size_t>(nodes[i].parent);const Vec3 segment=normalize(nodes[i].position-nodes[parent].position);
+        arcLength[i]=arcLength[parent]+length(nodes[i].position-nodes[parent].position);
+        if(nodes[i].axisOrder==nodes[parent].axisOrder) {
+            const float score=dot(segment,nodes[parent].direction);
+            if(score>continuationScore[parent]){continuationScore[parent]=score;continuationChild[parent]=static_cast<int>(i);}
+        }
+    }
+    std::vector<Vec3> tangents(nodes.size()),frameSides(nodes.size()),frameUps(nodes.size());
+    for(size_t i=0;i<nodes.size();++i) {
+        Vec3 incoming=nodes[i].direction;
+        if(nodes[i].parent>=0)incoming=normalize(nodes[i].position-nodes[static_cast<size_t>(nodes[i].parent)].position);
+        Vec3 tangent=incoming;
+        if(continuationChild[i]>=0) {
+            const Vec3 outgoing=normalize(nodes[static_cast<size_t>(continuationChild[i])].position-nodes[i].position);
+            tangent=normalize(incoming+outgoing);
+        }
+        tangents[i]=tangent;
+        if(nodes[i].parent<0)basis(tangent,frameSides[i],frameUps[i]);
+        else {
+            const Vec3 inherited=frameSides[static_cast<size_t>(nodes[i].parent)];const Vec3 projected=inherited-tangent*dot(inherited,tangent);
+            if(lengthSq(projected)<.0025f)basis(tangent,frameSides[i],frameUps[i]);
+            else {frameSides[i]=normalize(projected);frameUps[i]=normalize(cross(tangent,frameSides[i]));}
+        }
+    }
+
     const float speciesMaterial=static_cast<float>(static_cast<unsigned>(p.species))*.1f;
     for(size_t i=1;i<nodes.size();++i) {
-        const BranchNode& b=nodes[i];const BranchNode& a=nodes[static_cast<size_t>(b.parent)];const Vec3 axis=normalize(b.position-a.position);Vec3 s,u;basis(axis,s,u);const uint32_t base=static_cast<uint32_t>(mesh.branchVertices.size());
+        const BranchNode& b=nodes[i];const size_t parentIndex=static_cast<size_t>(b.parent);const BranchNode& a=nodes[parentIndex];const Vec3 axis=normalize(b.position-a.position);const uint32_t base=static_cast<uint32_t>(mesh.branchVertices.size());
         const int sides=p.species==TreeSpecies::EnglishOak?(b.axisOrder<=1?24:(b.axisOrder==2?16:8)):14;
         const float overlap=std::min(.012f,length(b.position-a.position)*.08f);
         const bool continuation=b.axisOrder==a.axisOrder&&dot(axis,a.direction)>.70f;const float branchStartRadius=continuation?a.radius:std::min(a.radius,b.radius*1.22f);
-        for(int ring=0;ring<2;++ring)for(int k=0;k<sides;++k){const float angle=2*pi*k/sides;const Vec3 n=s*std::cos(angle)+u*std::sin(angle);float flare=1;if(a.parent<0&&ring==0)flare=1.75f+.22f*std::max(0.0f,std::sin(angle*4));const float radius=(ring?b.radius:branchStartRadius)*flare*(1+.055f*std::sin(angle*5+i*.37f)+.018f*std::sin(angle*11+i));const float ageShade=.76f+.24f*clamp(static_cast<float>(b.age)/70,0,1);const Vec3 ringCenter=(ring?b.position+axis*overlap:a.position-axis*overlap);mesh.branchVertices.push_back({ringCenter+n*radius,n,vary(t.barkColor,ageShade),speciesMaterial});}
+        for(int ring=0;ring<2;++ring)for(int k=0;k<sides;++k) {
+            const float angle=2*pi*k/sides;const Vec3 ringSide=ring?frameSides[i]:(continuation?frameSides[parentIndex]:frameSides[i]);
+            const Vec3 ringUp=ring?frameUps[i]:(continuation?frameUps[parentIndex]:frameUps[i]);const Vec3 n=normalize(ringSide*std::cos(angle)+ringUp*std::sin(angle));
+            float flare=1;if(a.parent<0&&ring==0)flare=1.75f+.22f*std::max(0.0f,std::sin(angle*4));
+            const float baseRadius=ring?b.radius:branchStartRadius;const float arc=ring?arcLength[i]:arcLength[parentIndex];
+            const float relief=1+.050f*std::sin(angle*5+arc*1.70f)+.016f*std::sin(angle*11-arc*.90f)+.010f*std::sin(angle*2+arc*3.70f);
+            const float radius=baseRadius*flare*relief;const float maturity=std::sqrt(clamp(baseRadius/.18f,0,1));const float ageShade=.76f+.24f*maturity;
+            const Vec3 ringCenter=ring?b.position+tangents[i]*overlap:a.position-(continuation?tangents[parentIndex]:tangents[i])*overlap;
+            mesh.branchVertices.push_back({ringCenter+n*radius,n,vary(t.barkColor,ageShade),speciesMaterial});
+        }
         for(int k=0;k<sides;++k){const uint32_t n=(k+1)%sides;mesh.branchIndices.insert(mesh.branchIndices.end(),{base+static_cast<uint32_t>(k),base+n,base+sides+static_cast<uint32_t>(k),base+n,base+sides+n,base+sides+static_cast<uint32_t>(k)});}
     }
 
