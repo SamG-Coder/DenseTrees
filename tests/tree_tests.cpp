@@ -24,6 +24,35 @@ bool finite(dense::Vec3 value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
 
+void validateTriangles(const std::vector<dense::MeshVertex>& vertices,
+                       const std::vector<uint32_t>& indices,
+                       std::string_view label) {
+    if (indices.size() % 3 != 0) {
+        std::cerr << "FAIL: " << label << " index count is not divisible by three\n";
+        std::exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < indices.size(); i += 3) {
+        const uint32_t ia = indices[i];
+        const uint32_t ib = indices[i + 1];
+        const uint32_t ic = indices[i + 2];
+        if (ia >= vertices.size() || ib >= vertices.size() || ic >= vertices.size()) {
+            std::cerr << "FAIL: " << label << " triangle " << i / 3
+                      << " contains an out-of-range vertex index\n";
+            std::exit(EXIT_FAILURE);
+        }
+        const auto& a = vertices[ia].position;
+        const auto& b = vertices[ib].position;
+        const auto& c = vertices[ic].position;
+        const dense::Vec3 doubledArea = dense::cross(b - a, c - a);
+        if (!finite(a) || !finite(b) || !finite(c) || !finite(doubledArea) ||
+            dense::lengthSq(doubledArea) <= 1.0e-18f) {
+            std::cerr << "FAIL: " << label << " triangle " << i / 3
+                      << " is non-finite or has zero area\n";
+            std::exit(EXIT_FAILURE);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -75,7 +104,26 @@ int main() {
     // runaway early while leaving well over an order of magnitude of headroom.
     require(oakNodes.size() < 2'000'000, "mature oak node population ran away catastrophically");
 
+    const size_t nodeInventoryBeforeMesh = oakNodes.size();
+    size_t currentYearInventoryBeforeMesh = 0;
+    size_t livingInventoryBeforeMesh = 0;
+    for (const auto& node : oakNodes) {
+        currentYearInventoryBeforeMesh += node.currentYear;
+        livingInventoryBeforeMesh += node.alive;
+    }
+
     auto oakMesh = generator.buildMesh(oakNodes, oak);
+    require(oakNodes.size() == nodeInventoryBeforeMesh,
+            "root/mesh construction changed the biological node inventory");
+    size_t currentYearInventoryAfterMesh = 0;
+    size_t livingInventoryAfterMesh = 0;
+    for (const auto& node : oakNodes) {
+        currentYearInventoryAfterMesh += node.currentYear;
+        livingInventoryAfterMesh += node.alive;
+    }
+    require(currentYearInventoryAfterMesh == currentYearInventoryBeforeMesh &&
+                livingInventoryAfterMesh == livingInventoryBeforeMesh,
+            "root/mesh construction changed the living or current-year shoot inventory");
     require(!oakMesh.branchVertices.empty() && oakMesh.branchIndices.size() % 3 == 0,
             "mature oak branch mesh is empty or malformed");
     require(!oakMesh.leafVertices.empty() && oakMesh.leafIndices.size() % 3 == 0,
@@ -84,6 +132,130 @@ int main() {
             "mature oak branch vertices exceed the 32-bit mesh index range");
     require(oakMesh.leafVertices.size() <= std::numeric_limits<uint32_t>::max(),
             "mature oak leaf vertices exceed the 32-bit mesh index range");
+    require(static_cast<uint64_t>(oakMesh.structuralSegments) + oakMesh.fineShootSegments ==
+                oakNodes.size() - 1,
+            "mesh-only root geometry leaked into the biological segment inventory");
+
+    // The oak branch mesh uses extra rings on structural wood and collars.
+    // Reconstruct continuation choices and segment offsets so UV checks remain local to the
+    // branch that owns them, then identify the mesh-only root range exactly.
+    std::vector<int> meshContinuation(oakNodes.size(),-1);
+    std::vector<float> meshContinuationScore(oakNodes.size(),-2.0f);
+    for(size_t i=1;i<oakNodes.size();++i){const size_t parent=static_cast<size_t>(oakNodes[i].parent);if(oakNodes[i].axisOrder!=oakNodes[parent].axisOrder)continue;const float score=dense::dot(dense::normalize(oakNodes[i].position-oakNodes[parent].position),oakNodes[parent].direction);if(score>meshContinuationScore[parent]){meshContinuationScore[parent]=score;meshContinuation[parent]=static_cast<int>(i);}}
+    size_t biologicalBranchVertexCount = 0;
+    size_t biologicalBranchIndexCount = 0;
+    size_t sampledUvSegments = 0;
+    for (size_t i = 1; i < oakNodes.size(); ++i) {
+        const int sides = oakNodes[i].axisOrder == 0 ? 48 : (oakNodes[i].axisOrder == 1 ? 32 : (oakNodes[i].axisOrder == 2 ? 16 : 8));
+        const size_t ringVertices = static_cast<size_t>(sides + 1);
+        const size_t parent=static_cast<size_t>(oakNodes[i].parent);const bool continuation=meshContinuation[parent]==static_cast<int>(i);const float childRatio=oakNodes[i].radius/std::max(oakNodes[parent].radius,.0001f);const bool structuralCollar=!continuation&&oakNodes[i].axisOrder<=2&&childRatio<.72f;const int ringCount=structuralCollar?5:(oakNodes[i].axisOrder<=2?3:2);
+        require(biologicalBranchVertexCount + ringVertices * ringCount <= oakMesh.branchVertices.size(),
+                "oak branch vertex stream ended inside a biological segment");
+
+        // Sample all coarse structure and a deterministic cross-section of fine
+        // shoots. This checks local arc-length mapping without making the test
+        // runtime proportional to every UV in a very high-detail crown.
+        if (i < 512 || i % 509 == 0) {
+            const auto* start = oakMesh.branchVertices.data() + biologicalBranchVertexCount;
+            const auto* end = start + ringVertices*(ringCount-1);
+            require(std::abs(start[0].u) <= 1.0e-6f && std::abs(start[sides].u - 1.0f) <= 1.0e-6f &&
+                        std::abs(end[0].u) <= 1.0e-6f && std::abs(end[sides].u - 1.0f) <= 1.0e-6f,
+                    "oak bark U coordinate does not cover one complete local circumference");
+            for (int k = 0; k <= sides; ++k) {
+                const float expectedU = static_cast<float>(k) / sides;
+                require(std::isfinite(start[k].u) && std::isfinite(start[k].v) &&
+                            std::isfinite(end[k].u) && std::isfinite(end[k].v),
+                        "oak bark UV contains a non-finite value");
+                require(std::abs(start[k].u - expectedU) <= 1.0e-6f &&
+                            std::abs(end[k].u - expectedU) <= 1.0e-6f,
+                        "oak bark U coordinate is not monotonic around its local ring");
+                require(std::abs(start[k].v - start[0].v) <= 1.0e-5f &&
+                            std::abs(end[k].v - end[0].v) <= 1.0e-5f,
+                        "oak bark V coordinate varies around one cross-section");
+            }
+            const float localLength = dense::length(
+                oakNodes[i].position - oakNodes[static_cast<size_t>(oakNodes[i].parent)].position);
+            const float mappedLength = end[0].v - start[0].v;
+            require(mappedLength >= localLength - std::max(2.0e-5f, localLength * 2.0e-4f) &&
+                        mappedLength <= localLength + .0261f,
+                    "oak bark V coordinate does not include the rendered collar length");
+            require(dense::lengthSq(start[0].position - start[sides].position) <= 1.0e-8f &&
+                        dense::lengthSq(end[0].position - end[sides].position) <= 1.0e-8f,
+                    "oak bark seam does not close geometrically");
+            ++sampledUvSegments;
+        }
+        biologicalBranchVertexCount += ringVertices * ringCount;
+        biologicalBranchIndexCount += static_cast<size_t>(sides) * (ringCount-1) * 6;
+    }
+    require(sampledUvSegments > 500, "oak bark UV regression sample is unexpectedly small");
+
+    constexpr size_t rootCount = 7;
+    constexpr size_t rootSegments = 12;
+    constexpr size_t rootSides = 16;
+    constexpr size_t rootVertices = rootCount * (rootSegments + 1) * (rootSides + 1);
+    constexpr size_t rootIndices = rootCount * rootSegments * rootSides * 6;
+    require(oakMesh.branchVertices.size() == biologicalBranchVertexCount + rootVertices,
+            "oak mesh no longer contains exactly seven mesh-only shallow roots");
+    require(oakMesh.branchIndices.size() == biologicalBranchIndexCount + rootIndices,
+            "oak root index inventory no longer matches its declared topology");
+
+    for (const auto& vertex : oakMesh.branchVertices) {
+        require(finite(vertex.position) && finite(vertex.normal),
+                "oak branch/root vertex contains non-finite geometry");
+        const float normalLength = dense::length(vertex.normal);
+        require(std::isfinite(normalLength) && normalLength >= .995f && normalLength <= 1.005f,
+                "oak branch/root normal is not unit length");
+        require(std::isfinite(vertex.u) && std::isfinite(vertex.v),
+                "oak branch/root material coordinates are non-finite");
+        require(std::isfinite(vertex.material) && std::abs(vertex.material) <= 1.0e-6f,
+                "oak branch/root vertex lost the English-oak bark material class");
+    }
+    for (const auto& vertex : oakMesh.leafVertices) {
+        require(finite(vertex.position) && finite(vertex.normal) && std::isfinite(vertex.material),
+                "oak leaf vertex contains non-finite geometry or material data");
+        require(std::abs(vertex.material - 1.0f) <= 1.0e-6f,
+                "oak leaf vertex lost the English-oak foliage material class");
+    }
+
+    const float trunkRadius = oakNodes.front().radius;
+    const size_t firstSegmentSides = 48;
+    double basalRadiusSum = 0;
+    float basalRadiusMaximum = 0;
+    for (size_t k = 0; k < firstSegmentSides; ++k) {
+        const auto& position = oakMesh.branchVertices[k].position;
+        const float radius = std::sqrt(position.x * position.x + position.z * position.z);
+        basalRadiusSum += radius;
+        basalRadiusMaximum = std::max(basalRadiusMaximum, radius);
+    }
+    const float basalRadiusMean = static_cast<float>(basalRadiusSum / firstSegmentSides);
+    require(basalRadiusMean > trunkRadius * 1.30f && basalRadiusMaximum > trunkRadius * 1.44f,
+            "oak root collar lost its broad, irregular basal flare");
+
+    dense::Vec3 rootMinimum = oakMesh.branchVertices[biologicalBranchVertexCount].position;
+    dense::Vec3 rootMaximum = rootMinimum;
+    float maximumRootReach = 0;
+    for (size_t i = biologicalBranchVertexCount; i < oakMesh.branchVertices.size(); ++i) {
+        const auto& position = oakMesh.branchVertices[i].position;
+        rootMinimum.x = std::min(rootMinimum.x, position.x);
+        rootMinimum.y = std::min(rootMinimum.y, position.y);
+        rootMinimum.z = std::min(rootMinimum.z, position.z);
+        rootMaximum.x = std::max(rootMaximum.x, position.x);
+        rootMaximum.y = std::max(rootMaximum.y, position.y);
+        rootMaximum.z = std::max(rootMaximum.z, position.z);
+        maximumRootReach = std::max(maximumRootReach,
+                                    std::sqrt(position.x * position.x + position.z * position.z));
+    }
+    const float rootHorizontalSpan = std::max(rootMaximum.x - rootMinimum.x,
+                                              rootMaximum.z - rootMinimum.z);
+    const float rootVerticalSpan = rootMaximum.y - rootMinimum.y;
+    require(maximumRootReach > trunkRadius * 2.15f && rootHorizontalSpan > trunkRadius * 4.1f,
+            "mesh-only woody roots no longer spread beyond the root collar");
+    require(rootMinimum.y > -.20f && rootMaximum.y < .45f &&
+                rootVerticalSpan < rootHorizontalSpan * .24f,
+            "mesh-only woody roots are no longer broad and shallow at the ground plane");
+
+    validateTriangles(oakMesh.branchVertices, oakMesh.branchIndices, "oak branch/root mesh");
+    validateTriangles(oakMesh.leafVertices, oakMesh.leafIndices, "oak leaf mesh");
 
     dense::Vec3 minimum = oakNodes.front().position;
     dense::Vec3 maximum = minimum;
@@ -250,7 +422,9 @@ int main() {
               << " leafArea=" << oakMesh.totalLeafAreaM2 << "m2 extent=" << spanX << 'x'
               << treeHeight << 'x' << spanZ << " width/height=" << crownMajor / treeHeight
               << " fork=" << firstPrimaryHeight << "m attachmentLevels=" << distinctAttachmentLevels
-              << " sectorCV=" << sectorCv << " leaves/shoot="
+              << " sectorCV=" << sectorCv << " basalFlare=" << basalRadiusMean / trunkRadius
+              << "x rootSpan=" << rootHorizontalSpan << 'x' << rootVerticalSpan
+              << "m leaves/shoot="
               << static_cast<double>(oakMesh.leafCount) / leafBearingShoots << " orders="
               << orders[0] << ',' << orders[1] << ',' << orders[2] << ',' << orders[3] << ','
               << orders[4] << '\n';

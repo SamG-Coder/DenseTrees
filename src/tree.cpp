@@ -622,22 +622,55 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
     }
 
     const float speciesMaterial=static_cast<float>(static_cast<unsigned>(p.species))*.1f;
+    const float buttressPhase=p.seed*.017f;
     for(size_t i=1;i<nodes.size();++i) {
         const BranchNode& b=nodes[i];const size_t parentIndex=static_cast<size_t>(b.parent);const BranchNode& a=nodes[parentIndex];const uint32_t base=static_cast<uint32_t>(mesh.branchVertices.size());
-        const int sides=p.species==TreeSpecies::EnglishOak?(b.axisOrder<=1?24:(b.axisOrder==2?16:8)):14;
-        const bool continuation=continuationChild[parentIndex]==static_cast<int>(i);const float overlap=continuation?0.0f:std::min(.012f,length(b.position-a.position)*.08f);
-        const float branchStartRadius=continuation?a.radius:std::min(a.radius,b.radius*1.22f);
-        for(int ring=0;ring<2;++ring)for(int k=0;k<sides;++k) {
-            const float angle=2*pi*k/sides;const Vec3 ringSide=ring?frameSides[i]:(continuation?frameSides[parentIndex]:frameSides[i]);
-            const Vec3 ringUp=ring?frameUps[i]:(continuation?frameUps[parentIndex]:frameUps[i]);const Vec3 n=normalize(ringSide*std::cos(angle)+ringUp*std::sin(angle));
-            float flare=1;if(a.parent<0&&ring==0)flare=1.75f+.22f*std::max(0.0f,std::sin(angle*4));
-            const float baseRadius=ring?b.radius:branchStartRadius;const float arc=ring?arcLength[i]:arcLength[parentIndex];
-            const float relief=1+.050f*std::sin(angle*5+arc*1.70f)+.016f*std::sin(angle*11-arc*.90f)+.010f*std::sin(angle*2+arc*3.70f);
+        const int sides=p.species==TreeSpecies::EnglishOak?(b.axisOrder==0?48:(b.axisOrder==1?32:(b.axisOrder==2?16:8))):14;
+        const bool continuation=continuationChild[parentIndex]==static_cast<int>(i);const float childRatio=b.radius/std::max(a.radius,.0001f);const bool structuralCollar=!continuation&&b.axisOrder<=2&&childRatio<.72f;
+        const float overlap=continuation?0.0f:std::min(structuralCollar?.026f:.010f,length(b.position-a.position)*(structuralCollar?.18f:.08f));
+        const float branchStartRadius=continuation?a.radius:std::min(a.radius,b.radius*(structuralCollar?1.16f:1.08f));const int ringVertices=sides+1,ringCount=structuralCollar?5:(b.axisOrder<=2?3:2);const Vec3 segmentAxis=normalize(b.position-a.position);const float segmentLength=length(b.position-a.position);
+        Vec3 startSide=frameSides[parentIndex],startUp=frameUps[parentIndex];
+        if(!continuation){Vec3 projected=startSide-segmentAxis*dot(startSide,segmentAxis);if(lengthSq(projected)<.0025f)projected=startUp-segmentAxis*dot(startUp,segmentAxis);if(lengthSq(projected)<.0025f)basis(segmentAxis,startSide,startUp);else{startSide=normalize(projected);startUp=normalize(cross(segmentAxis,startSide));}}
+        for(int ring=0;ring<ringCount;++ring)for(int k=0;k<=sides;++k) {
+            const float linearQ=static_cast<float>(ring)/(ringCount-1),q=structuralCollar?std::pow(linearQ,1.35f):linearQ,smoothQ=q*q*(3-2*q);const float texU=static_cast<float>(k)/sides;const float angle=2*pi*texU;const Vec3 startTangent=continuation?tangents[parentIndex]:segmentAxis;const Vec3 ringTangent=normalize(lerp(startTangent,tangents[i],smoothQ));Vec3 ringSide=lerp(startSide,frameSides[i],smoothQ);ringSide=ringSide-ringTangent*dot(ringSide,ringTangent);if(lengthSq(ringSide)<.0025f){Vec3 fallbackUp;basis(ringTangent,ringSide,fallbackUp);}else ringSide=normalize(ringSide);const Vec3 ringUp=normalize(cross(ringTangent,ringSide));const Vec3 radial=normalize(ringSide*std::cos(angle)+ringUp*std::sin(angle));const Vec3 circumferential=normalize(ringUp*std::cos(angle)-ringSide*std::sin(angle));
+            const Vec3 ringCenter=lerp(a.position,b.position,q)-segmentAxis*(overlap*(1-q)*(1-q));float flare=1;const float ringHeight=ringCenter.y;
+            float dFlareTheta=0,dFlareArc=0;
+            if(p.species==TreeSpecies::EnglishOak&&a.axisOrder==0&&b.axisOrder==0) {
+                const float basal=std::exp(-std::max(0.0f,ringHeight)/.58f);const float lobePhase=angle*7+buttressPhase;const float wave=std::sin(lobePhase),positive=std::max(0.0f,wave);const float rootLobe=positive*positive;
+                flare+=basal*(.30f+.15f*rootLobe);
+                const float dLobeTheta=wave>0?14.0f*positive*std::cos(lobePhase):0.0f;dFlareTheta=basal*.15f*dLobeTheta;dFlareArc=-(flare-1.0f)/.58f*ringTangent.y;
+            } else if(a.parent<0&&ring==0)flare=1.75f+.22f*std::max(0.0f,std::sin(angle*4));
+            const float baseRadius=branchStartRadius+(b.radius-branchStartRadius)*smoothQ;const float arcStart=std::max(0.0f,arcLength[parentIndex]-overlap),arc=arcStart+(arcLength[i]-arcStart)*q;
+            const float phase5=angle*5+arc*.38f,phase11=angle*9-arc*.24f,phase2=angle*2+arc*.61f;const float relief=1+.0050f*std::sin(phase5)+.0025f*std::sin(phase11)+.0015f*std::sin(phase2);
+            const float dReliefTheta=.0250f*std::cos(phase5)+.0225f*std::cos(phase11)+.0030f*std::cos(phase2);const float dReliefArc=.00190f*std::cos(phase5)-.00060f*std::cos(phase11)+.000915f*std::cos(phase2);
             const float radius=baseRadius*flare*relief;const float maturity=std::sqrt(clamp(baseRadius/.18f,0,1));const float ageShade=.76f+.24f*maturity;
-            const Vec3 ringCenter=ring?b.position:a.position-tangents[i]*overlap;
-            mesh.branchVertices.push_back({ringCenter+n*radius,n,vary(t.barkColor,ageShade),speciesMaterial});
+            const float dSmoothQ=ringCount==2?1.0f:6*q*(1-q);const float dBaseRadiusArc=(b.radius-branchStartRadius)*dSmoothQ/std::max(segmentLength+overlap,.001f);const float dRadiusTheta=baseRadius*(relief*dFlareTheta+flare*dReliefTheta);const float dRadiusArc=dBaseRadiusArc*flare*relief+baseRadius*(relief*dFlareArc+flare*dReliefArc);const Vec3 surfaceNormal=normalize(radial-circumferential*(dRadiusTheta/std::max(radius,.00001f))-ringTangent*dRadiusArc);
+            mesh.branchVertices.push_back({ringCenter+radial*radius,surfaceNormal,vary(t.barkColor,ageShade),speciesMaterial,texU,arc});
         }
-        for(int k=0;k<sides;++k){const uint32_t n=(k+1)%sides;mesh.branchIndices.insert(mesh.branchIndices.end(),{base+static_cast<uint32_t>(k),base+n,base+sides+static_cast<uint32_t>(k),base+n,base+sides+n,base+sides+static_cast<uint32_t>(k)});}
+        for(int ring=0;ring<ringCount-1;++ring)for(int k=0;k<sides;++k){const uint32_t current=base+ring*ringVertices+static_cast<uint32_t>(k),next=current+1,endCurrent=current+ringVertices,endNext=endCurrent+1;mesh.branchIndices.insert(mesh.branchIndices.end(),{current,next,endCurrent,next,endNext,endCurrent});}
+    }
+
+    if(p.species==TreeSpecies::EnglishOak&&p.fullBiologicalInventory) {
+        // Seven shallow, unequal woody roots continue the same flare lobes into
+        // the ground plane.  They overlap the trunk core, so no open seam or
+        // star-shaped skirt is visible at the root collar.
+        constexpr int rootCount=7,rootSegments=12,rootSides=16;const float trunkRadius=nodes.front().radius;
+        for(int root=0;root<rootCount;++root) {
+            const float theta=(pi*.5f-buttressPhase+2*pi*root)/rootCount+.045f*std::sin(root*2.17f+p.seed*.003f);Vec3 radial=frameSides[0]*std::cos(theta)+frameUps[0]*std::sin(theta);radial.y=0;if(lengthSq(radial)<.01f)radial={std::cos(theta),0,std::sin(theta)};radial=normalize(radial);const Vec3 side{-radial.z,0,radial.x};
+            const float rootLength=.45f+trunkRadius*(2.15f+.48f*std::sin(root*1.91f+1.2f));const uint32_t base=static_cast<uint32_t>(mesh.branchVertices.size());
+            auto rootPoint=[&](float q,float angle){q=clamp(q,0,1);const float smoothQ=q*q*(3-2*q),taper=1-smoothQ;const float width=.003f+trunkRadius*(.42f+.075f*std::sin(root*2.31f))*taper;const float height=.002f+width*(.32f-.08f*q);const float bend=std::sin(q*pi)*(.085f+.032f*std::sin(root*1.37f));float burial=clamp((q-.55f)/.45f,0,1);burial=burial*burial*(3-2*burial);const Vec3 center=radial*(trunkRadius*.18f+rootLength*q)+side*bend+Vec3{0,height*.56f-.012f-.115f*burial,0};return center+side*(std::cos(angle)*width)+Vec3{0,std::sin(angle)*height,0};};
+            for(int segment=0;segment<=rootSegments;++segment) {
+                const float q=static_cast<float>(segment)/rootSegments;const float arc=q*rootLength;
+                for(int k=0;k<=rootSides;++k) {
+                    const float texU=static_cast<float>(k)/rootSides,angle=2*pi*texU,dq=.25f/rootSegments,dTheta=.25f*(2*pi/rootSides);const Vec3 point=rootPoint(q,angle),longitudinal=rootPoint(q+dq,angle)-rootPoint(q-dq,angle),around=rootPoint(q,angle+dTheta)-rootPoint(q,angle-dTheta);Vec3 normal=normalize(cross(longitudinal,around));const Vec3 centerline=rootPoint(q,0)*.5f+rootPoint(q,pi)*.5f;if(dot(normal,point-centerline)<0)normal=normal*-1.0f;
+                    const float shade=.82f+.16f*(1-q);mesh.branchVertices.push_back({point,normal,vary(t.barkColor,shade),speciesMaterial,texU,arc});
+                }
+            }
+            const int ringVertices=rootSides+1;
+            for(int segment=0;segment<rootSegments;++segment)for(int k=0;k<rootSides;++k) {
+                const uint32_t a=base+segment*ringVertices+k,b=a+1,c=a+ringVertices,d=c+1;mesh.branchIndices.insert(mesh.branchIndices.end(),{a,b,c,b,d,c});
+            }
+        }
     }
 
     Rng rng(p.seed^0x9e3779b9u);const Vec3 sun=normalize(Vec3{std::sin(p.sunlightAzimuth),1.35f,std::cos(p.sunlightAzimuth)});

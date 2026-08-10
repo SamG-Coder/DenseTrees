@@ -21,7 +21,7 @@ struct SpeciesTraits {
     float leafLength = 0.039f;
     float leafDensity = 1.0f;
     float pipeExponent = 2.15f;
-    uint32_t barkColor = 0xff263b52u;
+    uint32_t barkColor = 0xff4e5e69u;
     uint32_t leafColor = 0xff277638u;
 };
 
