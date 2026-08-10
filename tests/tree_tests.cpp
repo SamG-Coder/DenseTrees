@@ -69,23 +69,27 @@ int main() {
             "procedural grass patch inventory escaped its performance budget");
     require(environment.grassPatches.size()==environmentCopy.grassPatches.size(),
             "same environment seed did not reproduce its grass inventory");
+    require(environment.detailVertices.size()==environmentCopy.detailVertices.size()&&
+                environment.detailIndices.size()==environmentCopy.detailIndices.size(),
+            "same environment seed did not reproduce its scene-dressing inventory");
     require(std::abs(dense::EnvironmentGenerator::terrainHeight(0,0))<1.0e-6f,
             "oak root grade is no longer exactly y=0");
     for(float z=-1.5f;z<=1.5f;z+=.5f)for(float x=-1.5f;x<=1.5f;x+=.5f)
         if(std::sqrt(x*x+z*z)<=1.5f)
             require(std::abs(dense::EnvironmentGenerator::terrainHeight(x,z))<1.0e-5f,
                     "terrain intruded into the oak root-clearance zone");
-    require(environment.minimumHeight<-2.7f&&environment.minimumHeight>-4.2f&&
-                environment.maximumHeight>=-.001f&&environment.maximumHeight<.35f,
-            "hill terrain height envelope is implausible");
+    require(environment.minimumHeight<-2.6f&&environment.minimumHeight>-4.4f&&
+                environment.maximumHeight>5.0f&&environment.maximumHeight<14.5f,
+            "hill-and-mountain terrain height envelope is implausible");
     for(const auto& vertex:environment.terrainVertices){
         require(finite(vertex.position)&&finite(vertex.normal),
                 "terrain emitted non-finite geometry");
-        require(std::abs(dense::length(vertex.normal)-1.0f)<.002f&&vertex.normal.y>.72f,
-                "terrain normal is not unit length or points below the hill");
+        require(std::abs(dense::length(vertex.normal)-1.0f)<.002f&&vertex.normal.y>.43f,
+                "terrain normal is not unit length or points below the landscape");
         require(vertex.material==2.0f,"terrain material routing changed");
     }
     validateTriangles(environment.terrainVertices,environment.terrainIndices,"hill terrain");
+    uint32_t decodedTallPatches=0;
     for(size_t i=0;i<environment.grassPatches.size();++i){
         const auto& patch=environment.grassPatches[i];
         require(std::isfinite(patch.minX)&&std::isfinite(patch.minY)&&
@@ -95,12 +99,18 @@ int main() {
         require(patch.minX<patch.maxX&&patch.minY<patch.baseY&&patch.baseY<patch.maxY&&
                     patch.minZ<patch.maxZ,
                 "grass AABB does not enclose its patch base and blade height");
-        const uint32_t blades=patch.packed&255u,heightCode=(patch.packed>>8)&255u;
-        require(blades>=11&&blades<=15&&heightCode>=42&&heightCode<=145,
-                "grass blade count or height left the configured meadow range");
+        const uint32_t blades=patch.packed&255u,shortCode=(patch.packed>>8)&255u;
+        const uint32_t tallCount=(patch.packed>>16)&255u,tallCode=(patch.packed>>24)&255u;
+        const bool tall=tallCount!=0;
+        if(tall)++decodedTallPatches;
+        require(blades>=10&&blades<=15&&shortCode>=24&&shortCode<=90,
+                "grass candidate count or short height left the meadow range");
+        require(tall?(tallCount>=3&&tallCount<=5&&tallCount<blades&&tallCode>=90&&
+                       tallCode<=255&&tallCode>shortCode):(tallCode==0),
+                "clustered long-grass encoding is invalid");
         const float normalY=std::sqrt(std::max(0.0f,1-patch.normalX*patch.normalX-
                                                     patch.normalZ*patch.normalZ));
-        require(normalY>.72f&&patch.moisture>=0&&patch.moisture<=1,
+        require(normalY>.70f&&patch.moisture>=0&&patch.moisture<=1,
                 "grass patch has invalid terrain alignment or moisture");
         if(i<64){
             const auto& copy=environmentCopy.grassPatches[i];
@@ -109,6 +119,37 @@ int main() {
                     "same environment seed did not reproduce grass patch data");
         }
     }
+    require(decodedTallPatches==environment.tallGrassPatchCount,
+            "long-grass summary does not match the packed patch data");
+    require(environment.tallGrassPatchCount>600&&
+                environment.tallGrassPatchCount<environment.grassPatches.size()/2,
+            "clustered long grass is absent or overwhelms the short meadow");
+    require(environment.rockCount>=30&&environment.rockCount<=90,
+            "rock families escaped their ecological inventory");
+    require(environment.shrubCount>=20&&environment.shrubCount<=110,
+            "near/background shrub inventory is implausible");
+    require(environment.backgroundTreeCount>=120&&environment.backgroundTreeCount<=155,
+            "background forest inventory escaped its proxy budget");
+    require(!environment.detailVertices.empty()&&environment.detailIndices.size()/3<100000,
+            "scene dressing is empty or exceeded its static triangle budget");
+    for(const auto& vertex:environment.detailVertices){
+        require(finite(vertex.position)&&finite(vertex.normal)&&
+                    std::abs(dense::length(vertex.normal)-1.0f)<.004f,
+                "scene dressing emitted a non-finite or non-unit vertex");
+        require(vertex.material==3.0f||(vertex.material>=4.0f&&vertex.material<4.3f)||
+                    vertex.material==5.0f,
+                "scene dressing lost its rock, foliage, or wood material route");
+    }
+    validateTriangles(environment.detailVertices,environment.detailIndices,"scene dressing");
+    int mountainSectors=0;
+    for(int sector=0;sector<24;++sector){
+        const float angle=2*dense::pi*(sector+.5f)/24;float peak=-100;
+        for(float radius=58;radius<=112;radius+=2)
+            peak=std::max(peak,dense::EnvironmentGenerator::terrainHeight(
+                                   std::cos(angle)*radius,std::sin(angle)*radius));
+        if(peak>3.0f)++mountainSectors;
+    }
+    require(mountainSectors>=18,"distant mountain range has large missing angular sectors");
 
     dense::TreeGenerator generator;
     dense::TreeParameters p;

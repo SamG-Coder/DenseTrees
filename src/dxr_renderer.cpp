@@ -61,7 +61,8 @@ std::vector<std::vector<uint32_t>> makeNormalMipChain(std::vector<uint32_t> top,
 
 struct DxrRenderer::Impl{
     HWND window{};int width=1,height=1;std::wstring lastError;bool initialized=false;UINT frameIndex=0;float lastYaw=99,lastPitch=99,lastDistance=0,lastSun=99,lastWind=-1;
-    std::chrono::steady_clock::time_point simulationStart=std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastSimulationUpdate=std::chrono::steady_clock::now();
+    float simulationSeconds=0;
     EnvironmentMesh environment{};
     IDXGIFactory6*factory{};IDXGISwapChain3*swap{};ID3D12Device5*device{};ID3D12CommandQueue*queue{};ID3D12CommandAllocator*allocator{};ID3D12GraphicsCommandList4*list{};
     ID3D12Fence*fence{};HANDLE fenceEvent{};UINT64 fenceValue{};ID3D12DescriptorHeap*rtvHeap{};ID3D12DescriptorHeap*gpuHeap{};UINT rtvSize{};ID3D12Resource*backBuffers[2]{};
@@ -135,9 +136,9 @@ struct DxrRenderer::Impl{
 
         std::vector<MeshVertex>vertices;std::vector<uint32_t>indices;
         vertices.reserve(tree.branchVertices.size()+tree.leafVertices.size()+
-                         environment.terrainVertices.size());
+                         environment.terrainVertices.size()+environment.detailVertices.size());
         indices.reserve(tree.branchIndices.size()+tree.leafIndices.size()+
-                        environment.terrainIndices.size());
+                        environment.terrainIndices.size()+environment.detailIndices.size());
         vertices=tree.branchVertices;indices=tree.branchIndices;
         const uint32_t leafBase=static_cast<uint32_t>(vertices.size());
         vertices.insert(vertices.end(),tree.leafVertices.begin(),tree.leafVertices.end());
@@ -146,6 +147,10 @@ struct DxrRenderer::Impl{
         vertices.insert(vertices.end(),environment.terrainVertices.begin(),
                         environment.terrainVertices.end());
         for(uint32_t index:environment.terrainIndices)indices.push_back(terrainBase+index);
+        const uint32_t detailBase=static_cast<uint32_t>(vertices.size());
+        vertices.insert(vertices.end(),environment.detailVertices.begin(),
+                        environment.detailVertices.end());
+        for(uint32_t index:environment.detailIndices)indices.push_back(detailBase+index);
         vertexCount=static_cast<UINT>(vertices.size());indexCount=static_cast<UINT>(indices.size());
         vertexBuffer=uploadDefault(vertices);indexBuffer=uploadDefault(indices);
         grassBuffer=uploadDefault(environment.grassPatches);
@@ -237,18 +242,21 @@ void DxrRenderer::render(float yaw,float pitch,float distance,float sunAzimuth,f
     eye.y=std::max(eye.y,EnvironmentGenerator::terrainHeight(eye.x,eye.z)+.34f);
     const Vec3 forward=normalize(target-eye),right=normalize(cross({0,1,0},forward));
     const Vec3 up=cross(forward,right);
-    const float simulationSeconds=std::chrono::duration<float>(
-        std::chrono::steady_clock::now()-i.simulationStart).count();
+    const auto simulationNow=std::chrono::steady_clock::now();
+    const float rawSimulationDelta=std::chrono::duration<float>(
+        simulationNow-i.lastSimulationUpdate).count();
+    i.lastSimulationUpdate=simulationNow;
+    i.simulationSeconds+=std::min(rawSimulationDelta,1.0f/20.0f);
     struct Camera{
         float eye[3],tanHalf;float forward[3],aspect;float right[3];UINT frame;
         float up[3];UINT maxFrames;float sun[3],exposure;UINT resolution[2];
         float timeSeconds,windStrength;float atmosphere[4];
     }c{{eye.x,eye.y,eye.z},std::tan(52*pi/360),
        {forward.x,forward.y,forward.z},static_cast<float>(i.width)/i.height,
-       {right.x,right.y,right.z},i.frameIndex,{up.x,up.y,up.z},8,
+       {right.x,right.y,right.z},i.frameIndex,{up.x,up.y,up.z},windStrength>.03f?1u:8u,
        {-std::sin(sunAzimuth),-1.35f,-std::cos(sunAzimuth)},1.08f,
        {static_cast<UINT>(i.width),static_cast<UINT>(i.height)},
-       simulationSeconds,windStrength,{2.15f,.20f,.52f,0}};
+       i.simulationSeconds,windStrength,{2.15f,.20f,.52f,0}};
     std::memcpy(i.cameraMapped,&c,sizeof(c));if(!i.begin())return;
     ID3D12DescriptorHeap*heaps[]={i.gpuHeap};i.list->SetDescriptorHeaps(1,heaps);
     i.list->SetComputeRootSignature(i.root);i.list->SetPipelineState1(i.state);

@@ -27,15 +27,23 @@ static_assert(offsetof(GrassPatchGpu,seed) == 24);
 struct EnvironmentMesh {
     std::vector<MeshVertex> terrainVertices;
     std::vector<uint32_t> terrainIndices;
+    // Static scene dressing shares the triangle BLAS with the oak and terrain.
+    // Materials 3, 4 and 5 route rocks, foliage and secondary wood in HLSL.
+    std::vector<MeshVertex> detailVertices;
+    std::vector<uint32_t> detailIndices;
     std::vector<GrassPatchGpu> grassPatches;
+    uint32_t tallGrassPatchCount{};
+    uint32_t rockCount{};
+    uint32_t shrubCount{};
+    uint32_t backgroundTreeCount{};
     float minimumHeight{};
     float maximumHeight{};
 };
 
 class EnvironmentGenerator {
 public:
-    static constexpr int terrainResolution = 193;
-    static constexpr float terrainHalfExtent = 120.0f;
+    static constexpr int terrainResolution = 257;
+    static constexpr float terrainHalfExtent = 480.0f;
     static constexpr float grassHalfExtent = 24.0f;
 
     static float terrainHeight(float x, float z);
