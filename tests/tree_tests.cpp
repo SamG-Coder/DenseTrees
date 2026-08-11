@@ -131,6 +131,30 @@ int main() {
                 "terrain normal is not unit length or points below the landscape");
         require(vertex.material==2.0f,"terrain material routing changed");
     }
+    const std::array<size_t,5> sampledTerrainTriangles{{
+        0,1,1379,environment.terrainIndices.size()/6,
+        environment.terrainIndices.size()/3-1
+    }};
+    for(const size_t triangle:sampledTerrainTriangles){
+        const size_t first=triangle*3;
+        const auto&p0=environment.terrainVertices[environment.terrainIndices[first]].position;
+        const auto&p1=environment.terrainVertices[environment.terrainIndices[first+1]].position;
+        const auto&p2=environment.terrainVertices[environment.terrainIndices[first+2]].position;
+        constexpr float w0=.19f,w1=.34f,w2=.47f;
+        const dense::Vec3 expected=p0*w0+p1*w1+p2*w2;
+        const auto sampled=dense::EnvironmentGenerator::sampleTerrainSurface(expected.x,expected.z);
+        const dense::Vec3 expectedNormal=dense::normalize(dense::cross(p1-p0,p2-p0));
+        require(sampled.insideBounds&&std::abs(sampled.position.y-expected.y)<2.0e-4f&&
+                    dense::dot(sampled.normal,expectedNormal)>.9999f,
+                "rendered-terrain query disagrees with its emitted triangle");
+    }
+    const auto outsideTerrain=dense::EnvironmentGenerator::sampleTerrainSurface(
+        dense::EnvironmentGenerator::terrainHalfExtent+10.0f,0);
+    require(!outsideTerrain.insideBounds&&
+                std::abs(outsideTerrain.position.x-
+                         dense::EnvironmentGenerator::terrainHalfExtent)<1.0e-4f&&
+                finite(outsideTerrain.position)&&finite(outsideTerrain.normal),
+            "out-of-bounds terrain query did not return a finite clamped edge sample");
     size_t hydrologyRegion=0,hydrologyEligible=0,flatLocalMinima=0,
            selectedFlatLocalMinima=0;
     constexpr float cosEightDegrees=.990268f,cosFourDegrees=.997564f;

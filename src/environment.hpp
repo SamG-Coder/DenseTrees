@@ -47,6 +47,16 @@ struct EnvironmentMesh {
     float maximumHeight{};
 };
 
+// Exact sample of the triangle surface emitted by EnvironmentGenerator::build.
+// Queries outside the finite terrain square are clamped to its edge and marked
+// invalid so callers can keep collision state finite without treating the
+// clamped point as traversable ground.
+struct TerrainSurfaceSample {
+    Vec3 position{};
+    Vec3 normal{0,1,0};
+    bool insideBounds{};
+};
+
 class EnvironmentGenerator {
 public:
     static constexpr int terrainResolution = 257;
@@ -58,6 +68,7 @@ public:
 
     static float terrainHeight(float x, float z);
     static Vec3 terrainNormal(float x, float z);
+    static TerrainSurfaceSample sampleTerrainSurface(float x, float z);
     EnvironmentMesh build(uint32_t seed = 0x6f616b31u) const;
 };
 

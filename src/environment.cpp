@@ -8,9 +8,18 @@
 namespace dense {
 namespace {
 
+constexpr float terrainGridExponent=1.78f;
+
 float smoothStep(float low,float high,float value) {
     const float t=clamp((value-low)/(high-low),0.0f,1.0f);
     return t*t*(3.0f-2.0f*t);
+}
+
+float terrainGridCoordinate(int coordinate) {
+    constexpr int centre=(EnvironmentGenerator::terrainResolution-1)/2;
+    const float centred=static_cast<float>(coordinate-centre)/centre;
+    return std::copysign(EnvironmentGenerator::terrainHalfExtent*
+                         std::pow(std::abs(centred),terrainGridExponent),centred);
 }
 
 float meadowHash(float x,float z) {
@@ -361,20 +370,58 @@ Vec3 EnvironmentGenerator::terrainNormal(float x,float z) {
     return normalize({-dx,1.0f,-dz});
 }
 
+TerrainSurfaceSample EnvironmentGenerator::sampleTerrainSurface(float x,float z) {
+    if(!std::isfinite(x)||!std::isfinite(z))return {};
+
+    constexpr int centre=(terrainResolution-1)/2;
+    const bool inside=x>=-terrainHalfExtent&&x<=terrainHalfExtent&&
+                      z>=-terrainHalfExtent&&z<=terrainHalfExtent;
+    const float worldX=clamp(x,-terrainHalfExtent,terrainHalfExtent);
+    const float worldZ=clamp(z,-terrainHalfExtent,terrainHalfExtent);
+    const auto gridPosition=[](float world) {
+        const float normalized=clamp(world/terrainHalfExtent,-1.0f,1.0f);
+        const float uniform=std::copysign(
+            std::pow(std::abs(normalized),1.0f/terrainGridExponent),normalized);
+        return centre+uniform*centre;
+    };
+    const float gridX=gridPosition(worldX),gridZ=gridPosition(worldZ);
+    const int cellX=std::clamp(static_cast<int>(std::floor(gridX)),0,
+                               terrainResolution-2);
+    const int cellZ=std::clamp(static_cast<int>(std::floor(gridZ)),0,
+                               terrainResolution-2);
+    const float x0=terrainGridCoordinate(cellX),x1=terrainGridCoordinate(cellX+1);
+    const float z0=terrainGridCoordinate(cellZ),z1=terrainGridCoordinate(cellZ+1);
+    const float u=clamp((worldX-x0)/(x1-x0),0.0f,1.0f);
+    const float v=clamp((worldZ-z0)/(z1-z0),0.0f,1.0f);
+
+    const Vec3 a{x0,terrainHeight(x0,z0),z0};
+    const Vec3 b{x1,terrainHeight(x1,z0),z0};
+    const Vec3 c{x0,terrainHeight(x0,z1),z1};
+    const Vec3 d{x1,terrainHeight(x1,z1),z1};
+    Vec3 p0,p1,p2;float w0,w1,w2;
+    if(((cellX+cellZ)&1)==0) {
+        if(v>=u) {
+            p0=a;p1=c;p2=d;w0=1-v;w1=v-u;w2=u;
+        } else {
+            p0=a;p1=d;p2=b;w0=1-u;w1=v;w2=u-v;
+        }
+    } else if(u+v<=1.0f) {
+        p0=a;p1=c;p2=b;w0=1-u-v;w1=v;w2=u;
+    } else {
+        p0=b;p1=c;p2=d;w0=1-v;w1=1-u;w2=u+v-1;
+    }
+    const float height=p0.y*w0+p1.y*w1+p2.y*w2;
+    return {{worldX,height,worldZ},normalize(cross(p1-p0,p2-p0)),inside};
+}
+
 EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
     EnvironmentMesh mesh;
     constexpr int resolution=terrainResolution;
-    constexpr float extent=terrainHalfExtent;
     mesh.terrainVertices.reserve(static_cast<size_t>(resolution)*resolution);
     mesh.terrainIndices.reserve(static_cast<size_t>(resolution-1)*(resolution-1)*6);
     mesh.minimumHeight=std::numeric_limits<float>::max();
     mesh.maximumHeight=std::numeric_limits<float>::lowest();
 
-    const auto gridCoordinate=[&](int coordinate) {
-        const float centered=static_cast<float>(coordinate-(resolution-1)/2)/
-                             static_cast<float>((resolution-1)/2);
-        return std::copysign(extent*std::pow(std::abs(centered),1.78f),centered);
-    };
     // Hydrology is solved once on the CPU.  A location can retain standing
     // water only when every sampled escape direction crosses a higher rim.
     // This spill-depth test rejects convex hilltops even when their immediate
@@ -386,7 +433,7 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
                        waterRetention(terrainVertexCount);
     std::vector<Vec3> normalGrid(terrainVertexCount);
     for(int coordinate=0;coordinate<resolution;++coordinate)
-        gridCoordinates[coordinate]=gridCoordinate(coordinate);
+        gridCoordinates[coordinate]=terrainGridCoordinate(coordinate);
     const auto gridIndex=[&](int x,int z){return static_cast<size_t>(z)*resolution+x;};
     for(int z=0;z<resolution;++z)for(int x=0;x<resolution;++x) {
         const size_t index=gridIndex(x,z);

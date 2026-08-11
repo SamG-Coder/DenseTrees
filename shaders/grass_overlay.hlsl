@@ -5,8 +5,9 @@ struct Camera {
     float3 forward; float aspect;
     float3 right; uint frameIndex;
     float3 up; uint maxFrames;
-    float exposure; float3 padding0;
-    uint2 resolution; float2 padding1;
+    float exposure; float localLightIntensity; float localLightRange;
+    float localLightInnerCos;
+    uint2 resolution; uint environmentIndexOffset; float localLightOuterCos;
     float4 grassSettings;
     float4 groundSettings;
 };
@@ -22,6 +23,7 @@ struct GrassPatch {
 Texture2D<float4> SceneDepth : register(t0);
 Texture2D<float4> SceneColor : register(t1);
 StructuredBuffer<GrassPatch> GrassPatches : register(t2);
+RaytracingAccelerationStructure Scene : register(t3);
 ConstantBuffer<Camera> camera : register(b0);
 cbuffer GrassDraw : register(b2) {
     uint drawPatchOffset;
@@ -88,6 +90,55 @@ float3 keyLightRadiance() {
 
 float3 lightningRadiance() {
     return float3(.52,.66,1.0)*g_LightningFlash;
+}
+
+struct LocalLightSample {
+    float3 direction;
+    float distance;
+    float3 radiance;
+    float active;
+};
+
+LocalLightSample samplePlayerLocalLight(float3 hit) {
+    LocalLightSample sample;
+    sample.direction=float3(0,1,0);sample.distance=0;
+    sample.radiance=0;sample.active=0;
+    if(camera.localLightIntensity<=.001||camera.localLightRange<=.05)return sample;
+
+    float3 position=camera.eye+camera.forward*.08+camera.right*.15-camera.up*.18;
+    float3 toLight=position-hit;
+    float distanceSquared=dot(toLight,toLight);
+    float rangeSquared=camera.localLightRange*camera.localLightRange;
+    if(distanceSquared<=1e-6||distanceSquared>=rangeSquared)return sample;
+
+    float distanceToLight=sqrt(distanceSquared);
+    float3 direction=toLight/distanceToLight;
+    float cone=1;
+    if(camera.localLightOuterCos>-.5){
+        float coneCosine=dot(-direction,camera.forward);
+        cone=smoothstep(camera.localLightOuterCos,
+                        max(camera.localLightInnerCos,
+                            camera.localLightOuterCos+1e-4),coneCosine);
+    }
+    if(cone<=1e-4)return sample;
+
+    float normalizedDistanceSquared=distanceSquared/rangeSquared;
+    float rangeWindow=saturate(1-normalizedDistanceSquared*normalizedDistanceSquared);
+    float attenuation=rangeWindow*rangeWindow/max(distanceSquared,.25);
+    sample.direction=direction;sample.distance=distanceToLight;
+    sample.radiance=float3(1.0,.71,.48)*camera.localLightIntensity*attenuation*cone;
+    sample.active=1;
+    return sample;
+}
+
+float playerLocalLightVisibility(float3 hit,float3 direction,float distanceToLight) {
+    if(distanceToLight<=.04)return 1;
+    RayDesc ray;ray.Origin=hit+direction*.012;ray.Direction=direction;
+    ray.TMin=.003;ray.TMax=max(distanceToLight-.025,.004);
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_FORCE_OPAQUE> query;
+    query.TraceRayInline(Scene,RAY_FLAG_NONE,0x1,ray);
+    while(query.Proceed()){}
+    return query.CommittedStatus()==COMMITTED_NOTHING?1:0;
 }
 
 float3 skyIrradiance(float3 normal) {
@@ -437,8 +488,20 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float backLight=saturate(dot(-n,sun));
     float3 ambient=.5*(skyIrradiance(n)+skyIrradiance(-n))*(.50+.18*along);
     float3 direct=keyRadiance*frontLight*sunVisibility*1.28;
+    // Coverage and scene-depth rejection have already run, so inline rays are
+    // issued only for surviving grass fragments inside the local-light range.
+    // The raster blades themselves are intentionally not in the
+    // TLAS; this tests tree, terrain, and environment occlusion without costly
+    // blade-to-blade shadowing.
+    LocalLightSample localLight=samplePlayerLocalLight(input.worldPosition);
+    float localNdotL=localLight.active*saturate(dot(n,localLight.direction));
+    if(localNdotL>1e-4){
+        float localVisibility=playerLocalLightVisibility(
+            input.worldPosition,localLight.direction,localLight.distance);
+        direct+=localLight.radiance*localNdotL*localVisibility;
+    }
     float3 unmodulated=keyRadiance*float3(.42,.74,.20)*backLight*
-                       sunVisibility*.72;
+                        sunVisibility*.72;
     float3 halfVector=normalize(sun+view);
     float wetExponent=lerp(22.0,110.0,wetness);
     unmodulated+=keyRadiance*pow(saturate(dot(n,halfVector)),wetExponent)*

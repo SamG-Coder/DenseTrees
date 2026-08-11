@@ -1,4 +1,5 @@
 #include "dxr_renderer.hpp"
+#include "first_person_camera.hpp"
 #include "rtx_caps.hpp"
 #include "tree.hpp"
 
@@ -25,6 +26,12 @@ constexpr int environmentSectionButtonId = 2190;
 constexpr int environmentResetButtonId = 2290;
 constexpr int environmentPauseButtonId = 2291;
 constexpr int environmentLightningButtonId = 2292;
+constexpr float firstPersonMouseSensitivity = .0022f;
+
+enum class CameraMode {
+    Orbit,
+    FirstPerson
+};
 
 struct SliderSpec {
     int controlId;
@@ -91,12 +98,24 @@ struct App {
     dense::GpuCapabilities gpu;
     dense::DebugRenderSettings debugSettings;
     dense::EnvironmentSimulation environment;
+    dense::FirstPersonCameraController firstPersonCamera;
+    dense::PlayerLocalLight playerLocalLight;
 
     float yaw = .55f;
     float pitch = .18f;
     float distance = 14.0f;
+    CameraMode cameraMode = CameraMode::Orbit;
     bool dragging = false;
     POINT last{};
+    bool firstPersonMouseCaptured = false;
+    bool resumeCaptureAfterDebugPanel = false;
+    bool moveForward = false;
+    bool moveBackward = false;
+    bool moveLeft = false;
+    bool moveRight = false;
+    bool sprint = false;
+    float pendingYawDelta = 0.0f;
+    float pendingPitchDelta = 0.0f;
     uint32_t generation = 0;
 
     HWND mainWindow{};
@@ -118,8 +137,10 @@ struct App {
     double smoothedFrameMilliseconds = 0.0;
     std::chrono::steady_clock::time_point nextPerformanceTitleUpdate{};
     std::chrono::steady_clock::time_point lastEnvironmentUpdate{};
+    std::chrono::steady_clock::time_point lastCameraUpdate{};
 
     ~App() {
+        releaseFirstPersonCapture();
         if(debugPanel && IsWindow(debugPanel))DestroyWindow(debugPanel);
         if(uiFontBold)DeleteObject(uiFontBold);
         if(uiFont)DeleteObject(uiFont);
@@ -127,6 +148,158 @@ struct App {
 
     int scaled(int value) const {
         return static_cast<int>(std::lround(static_cast<float>(value)*uiScale));
+    }
+
+    std::wstring interactionTitleSuffix() const {
+        if(cameraMode==CameraMode::Orbit)
+            return L" \u2014 Orbit [F2: first person]";
+        return playerLocalLight.enabled?
+            L" \u2014 First person [F2: orbit | WASD+Shift | LMB light: on]":
+            L" \u2014 First person [F2: orbit | WASD+Shift | LMB light: off]";
+    }
+
+    void refreshInteractionTitle() {
+        nextPerformanceTitleUpdate={};
+        if(mainWindow&&!sceneTitle.empty()) {
+            const std::wstring title=sceneTitle+interactionTitleSuffix();
+            SetWindowTextW(mainWindow,title.c_str());
+        }
+    }
+
+    void clearFirstPersonInput() {
+        moveForward=moveBackward=moveLeft=moveRight=sprint=false;
+        pendingYawDelta=0.0f;
+        pendingPitchDelta=0.0f;
+    }
+
+    void updateFirstPersonCursorClip() const {
+        if(!firstPersonMouseCaptured||!mainWindow||IsIconic(mainWindow))return;
+        RECT client{};
+        if(!GetClientRect(mainWindow,&client))return;
+        POINT corners[2]{{client.left,client.top},{client.right,client.bottom}};
+        if(!ClientToScreen(mainWindow,&corners[0])||
+           !ClientToScreen(mainWindow,&corners[1]))return;
+        RECT screen{corners[0].x,corners[0].y,corners[1].x,corners[1].y};
+        ClipCursor(&screen);
+    }
+
+    void releaseFirstPersonCapture() {
+        const bool ownedCapture=mainWindow&&GetCapture()==mainWindow;
+        firstPersonMouseCaptured=false;
+        clearFirstPersonInput();
+        ClipCursor(nullptr);
+        if(ownedCapture)ReleaseCapture();
+        SetCursor(LoadCursorW(nullptr,IDC_ARROW));
+    }
+
+    void captureFirstPersonMouse() {
+        if(cameraMode!=CameraMode::FirstPerson||debugPanelVisible||!mainWindow||
+           !IsWindowVisible(mainWindow)||IsIconic(mainWindow))return;
+        dragging=false;
+        if(GetCapture()==mainWindow)ReleaseCapture();
+        clearFirstPersonInput();
+        SetFocus(mainWindow);
+        firstPersonMouseCaptured=true;
+        SetCapture(mainWindow);
+        updateFirstPersonCursorClip();
+        SetCursor(nullptr);
+        lastCameraUpdate=std::chrono::steady_clock::now();
+    }
+
+    bool setFirstPersonMovementKey(WPARAM key,bool pressed) {
+        bool* state=nullptr;
+        switch(key) {
+        case 'W':state=&moveForward;break;
+        case 'S':state=&moveBackward;break;
+        case 'A':state=&moveLeft;break;
+        case 'D':state=&moveRight;break;
+        case VK_SHIFT:
+        case VK_LSHIFT:
+        case VK_RSHIFT:state=&sprint;break;
+        default:return false;
+        }
+        if(cameraMode==CameraMode::FirstPerson) {
+            *state=firstPersonMouseCaptured&&pressed;
+            return true;
+        }
+        if(!pressed)*state=false;
+        return false;
+    }
+
+    void handleRawMouse(HRAWINPUT inputHandle) {
+        if(cameraMode!=CameraMode::FirstPerson||!firstPersonMouseCaptured)return;
+        UINT byteCount=0;
+        if(GetRawInputData(inputHandle,RID_INPUT,nullptr,&byteCount,
+                           sizeof(RAWINPUTHEADER))!=0||byteCount<sizeof(RAWINPUT))return;
+        std::vector<unsigned char> bytes(byteCount);
+        if(GetRawInputData(inputHandle,RID_INPUT,bytes.data(),&byteCount,
+                           sizeof(RAWINPUTHEADER))!=byteCount)return;
+        const RAWINPUT* raw=reinterpret_cast<const RAWINPUT*>(bytes.data());
+        if(raw->header.dwType!=RIM_TYPEMOUSE||
+           (raw->data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)!=0)return;
+        pendingYawDelta+=static_cast<float>(raw->data.mouse.lLastX)*
+                         firstPersonMouseSensitivity;
+        pendingPitchDelta+=static_cast<float>(raw->data.mouse.lLastY)*
+                           firstPersonMouseSensitivity;
+    }
+
+    void toggleCameraMode() {
+        dragging=false;
+        if(GetCapture()==mainWindow&& !firstPersonMouseCaptured)ReleaseCapture();
+        resumeCaptureAfterDebugPanel=false;
+        if(cameraMode==CameraMode::Orbit) {
+            cameraMode=CameraMode::FirstPerson;
+            if(debugPanelVisible)showDebugPanel(false);
+            captureFirstPersonMouse();
+        } else {
+            cameraMode=CameraMode::Orbit;
+            releaseFirstPersonCapture();
+        }
+        lastCameraUpdate=std::chrono::steady_clock::now();
+        refreshInteractionTitle();
+    }
+
+    void updateCamera() {
+        const auto now=std::chrono::steady_clock::now();
+        const float elapsed=lastCameraUpdate.time_since_epoch().count()==0?0.0f:
+            std::chrono::duration<float>(now-lastCameraUpdate).count();
+        lastCameraUpdate=now;
+        if(cameraMode!=CameraMode::FirstPerson) {
+            pendingYawDelta=pendingPitchDelta=0.0f;
+            return;
+        }
+        dense::FirstPersonCameraInput input{};
+        if(firstPersonMouseCaptured) {
+            input.forward=moveForward;
+            input.backward=moveBackward;
+            input.left=moveLeft;
+            input.right=moveRight;
+            input.sprint=sprint;
+            input.yawDelta=pendingYawDelta;
+            input.pitchDelta=pendingPitchDelta;
+        }
+        pendingYawDelta=pendingPitchDelta=0.0f;
+        firstPersonCamera.update(elapsed,input);
+    }
+
+    dense::CameraView cameraView() const {
+        if(cameraMode==CameraMode::FirstPerson) {
+            const dense::FirstPersonCameraPose pose=firstPersonCamera.pose();
+            return {pose.eye,pose.forward};
+        }
+        const dense::Vec3 target{0,4.1f,0};
+        dense::Vec3 eye=target+dense::Vec3{
+            std::sin(yaw)*std::cos(pitch)*distance,
+            std::sin(pitch)*distance,
+            -std::cos(yaw)*std::cos(pitch)*distance};
+        eye.y=std::max(eye.y,dense::EnvironmentGenerator::terrainHeight(eye.x,eye.z)+.34f);
+        return {eye,dense::normalize(target-eye)};
+    }
+
+    dense::PlayerLocalLight activePlayerLocalLight() const {
+        dense::PlayerLocalLight light=playerLocalLight;
+        light.enabled=light.enabled&&cameraMode==CameraMode::FirstPerson;
+        return light;
     }
 
     void regenerate(HWND window,bool nextSeed = true) {
@@ -144,7 +317,9 @@ struct App {
               << static_cast<int>(mesh.totalLeafAreaM2) << L" m\u00B2 leaf area / "
               << L"build " << milliseconds << L" ms \u2014 " << gpu.adapter << L" / DXR "
               << gpu.rayTracingTier/10 << L'.' << gpu.rayTracingTier%10;
-        sceneTitle=title.str();SetWindowTextW(window,sceneTitle.c_str());
+        sceneTitle=title.str();
+        const std::wstring windowTitle=sceneTitle+interactionTitleSuffix();
+        SetWindowTextW(window,windowTitle.c_str());
         smoothedFrameMilliseconds=0.0;nextPerformanceTitleUpdate={};
     }
 
@@ -157,7 +332,8 @@ struct App {
         const double framesPerSecond=1000.0/std::max(smoothedFrameMilliseconds,.001);
         std::wstringstream title;title.setf(std::ios::fixed);
         title << sceneTitle << L" \u2014 " << std::setprecision(1) << smoothedFrameMilliseconds
-              << L" ms frame / " << std::setprecision(0) << framesPerSecond << L" FPS";
+              << L" ms frame / " << std::setprecision(0) << framesPerSecond << L" FPS"
+              << interactionTitleSuffix();
         SetWindowTextW(window,title.str().c_str());
     }
 
@@ -168,7 +344,13 @@ struct App {
     }
 
     bool handleSceneKey(HWND window,WPARAM key) {
-        if(key==VK_ESCAPE){DestroyWindow(window);return true;}
+        if(key==VK_ESCAPE) {
+            if(cameraMode==CameraMode::FirstPerson&&firstPersonMouseCaptured) {
+                resumeCaptureAfterDebugPanel=false;
+                releaseFirstPersonCapture();
+            } else DestroyWindow(window);
+            return true;
+        }
         if(key=='R'||key==VK_SPACE){regenerate(window);return true;}
         if(key>='1'&&key<='5'){
             setSpecies(window,static_cast<dense::TreeSpecies>(key-'1'));
@@ -176,7 +358,7 @@ struct App {
         }
         if(key==VK_LEFT){environment.controls.sunAzimuthRadians-=.12f;return true;}
         if(key==VK_RIGHT){environment.controls.sunAzimuthRadians+=.12f;return true;}
-        if(key=='W'){
+        if(key=='W'&&cameraMode==CameraMode::Orbit){
             if(environment.controls.windStrength>.01f) {
                 lastNonZeroWindStrength=environment.controls.windStrength;
                 environment.controls.windStrength=0.0f;
@@ -478,6 +660,11 @@ struct App {
 
     void showDebugPanel(bool visible) {
         if(!debugPanel||!IsWindow(debugPanel))return;
+        if(visible&&!debugPanelVisible) {
+            resumeCaptureAfterDebugPanel=
+                cameraMode==CameraMode::FirstPerson&&firstPersonMouseCaptured;
+            if(firstPersonMouseCaptured)releaseFirstPersonCapture();
+        }
         debugPanelVisible = visible;
         if(visible) {
             positionDebugPanel();
@@ -487,6 +674,10 @@ struct App {
         } else {
             ShowWindow(debugPanel,SW_HIDE);
             if(mainWindow)SetFocus(mainWindow);
+            const bool shouldResume=resumeCaptureAfterDebugPanel&&
+                cameraMode==CameraMode::FirstPerson;
+            resumeCaptureAfterDebugPanel=false;
+            if(shouldResume)captureFirstPersonMouse();
         }
     }
 
@@ -611,30 +802,48 @@ LRESULT CALLBACK debugPanelProc(HWND window,UINT message,WPARAM wParam,LPARAM lP
 LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
     switch(message) {
     case WM_DESTROY:
+        if(app)app->releaseFirstPersonCapture();
         PostQuitMessage(0);
         return 0;
     case WM_SIZE:
-        if(app&&wParam!=SIZE_MINIMIZED) {
-            app->renderer.resize(LOWORD(lParam),HIWORD(lParam));
-            app->positionDebugPanel();
+        if(app) {
+            if(wParam==SIZE_MINIMIZED) {
+                app->resumeCaptureAfterDebugPanel=false;
+                app->releaseFirstPersonCapture();
+            } else {
+                app->renderer.resize(LOWORD(lParam),HIWORD(lParam));
+                app->positionDebugPanel();
+                app->updateFirstPersonCursorClip();
+            }
         }
         return 0;
     case WM_MOVE:
-        if(app)app->positionDebugPanel();
+        if(app){app->positionDebugPanel();app->updateFirstPersonCursorClip();}
         return 0;
     case WM_LBUTTONDOWN:
         if(app) {
             SetFocus(window);
-            app->dragging=true;
-            app->last={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
-            SetCapture(window);
+            if(app->cameraMode==CameraMode::FirstPerson) {
+                if(!app->firstPersonMouseCaptured)app->captureFirstPersonMouse();
+                else {
+                    app->playerLocalLight.enabled=!app->playerLocalLight.enabled;
+                    app->refreshInteractionTitle();
+                }
+            } else {
+                app->dragging=true;
+                app->last={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
+                SetCapture(window);
+            }
         }
         return 0;
     case WM_LBUTTONUP:
-        if(app){app->dragging=false;ReleaseCapture();}
+        if(app&&app->cameraMode==CameraMode::Orbit&&app->dragging) {
+            app->dragging=false;
+            if(GetCapture()==window)ReleaseCapture();
+        }
         return 0;
     case WM_MOUSEMOVE:
-        if(app&&app->dragging) {
+        if(app&&app->cameraMode==CameraMode::Orbit&&app->dragging) {
             POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
             app->yaw+=(point.x-app->last.x)*.008f;
             app->pitch=std::clamp(app->pitch+(point.y-app->last.y)*.006f,-.35f,1.15f);
@@ -642,15 +851,55 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         }
         return 0;
     case WM_MOUSEWHEEL:
-        if(app)app->distance=std::clamp(app->distance-
+        if(app&&app->cameraMode==CameraMode::Orbit)app->distance=std::clamp(app->distance-
             static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam))/120.0f,7.0f,30.0f);
         return 0;
+    case WM_INPUT:
+        if(app)app->handleRawMouse(reinterpret_cast<HRAWINPUT>(lParam));
+        return DefWindowProcW(window,message,wParam,lParam);
     case WM_KEYDOWN:
+        if(app&&wParam==VK_F2) {
+            if((lParam&(static_cast<LPARAM>(1)<<30))==0)app->toggleCameraMode();
+            return 0;
+        }
         if(app&&wParam==VK_F1){
             if((lParam&(static_cast<LPARAM>(1)<<30))==0)app->toggleDebugPanel();
             return 0;
         }
-        if(app&&app->handleSceneKey(window,wParam))return 0;
+        if(app&&app->setFirstPersonMovementKey(wParam,true))return 0;
+        if(app&&(lParam&(static_cast<LPARAM>(1)<<30))==0&&
+           app->handleSceneKey(window,wParam))return 0;
+        break;
+    case WM_KEYUP:
+        if(app&&app->setFirstPersonMovementKey(wParam,false))return 0;
+        break;
+    case WM_SETCURSOR:
+        if(app&&app->firstPersonMouseCaptured&&LOWORD(lParam)==HTCLIENT) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
+        break;
+    case WM_KILLFOCUS:
+        if(app)app->releaseFirstPersonCapture();
+        return 0;
+    case WM_ACTIVATEAPP:
+        if(app&&!wParam) {
+            app->resumeCaptureAfterDebugPanel=false;
+            app->releaseFirstPersonCapture();
+        }
+        return 0;
+    case WM_CANCELMODE:
+        if(app) {
+            app->resumeCaptureAfterDebugPanel=false;
+            app->releaseFirstPersonCapture();
+            app->dragging=false;
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if(app&&reinterpret_cast<HWND>(lParam)!=window) {
+            if(app->firstPersonMouseCaptured)app->releaseFirstPersonCapture();
+            app->dragging=false;
+        }
         break;
     default:break;
     }
@@ -694,6 +943,15 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
 
     app=std::make_unique<App>();
     app->gpu=dense::queryGpuCapabilities();
+    RAWINPUTDEVICE mouseDevice{};
+    mouseDevice.usUsagePage=0x01;
+    mouseDevice.usUsage=0x02;
+    mouseDevice.dwFlags=0;
+    mouseDevice.hwndTarget=window;
+    if(!RegisterRawInputDevices(&mouseDevice,1,sizeof(mouseDevice))) {
+        MessageBoxW(window,L"Raw mouse input could not be registered. First-person mouse look "
+                           L"will be unavailable.",L"Dense Trees input",MB_ICONWARNING);
+    }
     RECT client{};
     GetClientRect(window,&client);
     if(!app->renderer.initialize(window,client.right,client.bottom)) {
@@ -714,6 +972,11 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     while(running) {
         while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
             if(message.message==WM_QUIT){running=false;break;}
+            if(app&&message.message==WM_KEYDOWN&&message.wParam==VK_F2) {
+                if((message.lParam&(static_cast<LPARAM>(1)<<30))==0)
+                    app->toggleCameraMode();
+                continue;
+            }
             if(app&&message.message==WM_KEYDOWN&&message.wParam==VK_F1) {
                 if((message.lParam&(static_cast<LPARAM>(1)<<30))==0)app->toggleDebugPanel();
                 continue;
@@ -731,9 +994,12 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         }
         if(running) {
             const auto frameStart=std::chrono::steady_clock::now();
+            app->updateCamera();
             app->updateEnvironment();
-            app->renderer.render(app->yaw,app->pitch,app->distance,app->debugSettings,
-                                 app->environment.constants());
+            const dense::CameraView camera=app->cameraView();
+            const dense::PlayerLocalLight localLight=app->activePlayerLocalLight();
+            app->renderer.render(camera,app->debugSettings,
+                                 app->environment.constants(),localLight);
             const double frameMilliseconds=std::chrono::duration<double,std::milli>(
                 std::chrono::steady_clock::now()-frameStart).count();
             app->updatePerformanceTitle(window,frameMilliseconds);

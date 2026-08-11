@@ -6,8 +6,9 @@ struct Camera {
     float3 forward; float aspect;
     float3 right; uint frameIndex;
     float3 up; uint maxFrames;
-    float exposure; float3 padding0;
-    uint2 resolution; uint environmentIndexOffset; float padding1;
+    float exposure; float localLightIntensity; float localLightRange;
+    float localLightInnerCos;
+    uint2 resolution; uint environmentIndexOffset; float localLightOuterCos;
     float4 grassSettings;
     float4 groundSettings;
 };
@@ -140,6 +141,59 @@ float3 lightningRadiance() {
     return float3(.52,.66,1.0)*g_LightningFlash;
 }
 float daylightAmount() { return smoothstep(-.12,.08,directionToSun().y); }
+
+struct LocalLightSample {
+    float3 direction;
+    float distance;
+    float3 radiance;
+    float active;
+};
+
+LocalLightSample samplePlayerLocalLight(float3 hit) {
+    LocalLightSample sample;
+    sample.direction=float3(0,1,0);sample.distance=0;
+    sample.radiance=0;sample.active=0;
+    if(camera.localLightIntensity<=.001||camera.localLightRange<=.05)return sample;
+
+    // Keep the source player-local but slightly below/right of the eye. Exact
+    // eye coincidence would make every primary shadow ray retrace the view ray
+    // and therefore hide all cast-shadow parallax from a first-person camera.
+    float3 position=camera.eye+camera.forward*.08+camera.right*.15-camera.up*.18;
+    float3 toLight=position-hit;
+    float distanceSquared=dot(toLight,toLight);
+    float rangeSquared=camera.localLightRange*camera.localLightRange;
+    if(distanceSquared<=1e-6||distanceSquared>=rangeSquared)return sample;
+
+    float distanceToLight=sqrt(distanceSquared);
+    float3 direction=toLight/distanceToLight;
+    float cone=1;
+    if(camera.localLightOuterCos>-.5){
+        float coneCosine=dot(-direction,camera.forward);
+        cone=smoothstep(camera.localLightOuterCos,
+                        max(camera.localLightInnerCos,
+                            camera.localLightOuterCos+1e-4),coneCosine);
+    }
+    if(cone<=1e-4)return sample;
+
+    float normalizedDistanceSquared=distanceSquared/rangeSquared;
+    float rangeWindow=saturate(1-normalizedDistanceSquared*normalizedDistanceSquared);
+    float attenuation=rangeWindow*rangeWindow/max(distanceSquared,.25);
+    sample.direction=direction;sample.distance=distanceToLight;
+    sample.radiance=float3(1.0,.71,.48)*camera.localLightIntensity*attenuation*cone;
+    sample.active=1;
+    return sample;
+}
+
+float playerLocalLightVisibility(float3 hit,float3 direction,float distanceToLight) {
+    if(distanceToLight<=.04)return 1;
+    VisibilityPayload shadow;shadow.visible=0;
+    RayDesc ray;ray.Origin=hit+direction*.012;ray.Direction=direction;
+    ray.TMin=.003;ray.TMax=max(distanceToLight-.025,.004);
+    TraceRay(Scene,
+             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+             0x1,1,0,1,ray,shadow);
+    return float(shadow.visible);
+}
 
 float3 skyIrradiance(float3 normal) {
     float up=saturate(normal.y*.5+.5),daylight=daylightAmount();
@@ -770,6 +824,18 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     VisibilityPayload ao;ao.visible=1;if(payload.depth==0&&!terrainSurface){ao.visible=0;RayDesc ar;ar.Origin=hit+surfaceNormal*.015;ar.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*47),hash(pixel.yx+camera.frameIndex*71)));ar.TMin=.01;ar.TMax=1.35;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,ar,ao);}
     float3 keyRadiance=keyLightRadiance();
     float ndl=saturate(dot(n,sunDir));float occlusion=lerp(.76,1.0,float(ao.visible));float3 ambient=skyIrradiance(n)*(.48+.16*saturate(n.y))*occlusion;ambient+=lerp(float3(.010,.014,.020),float3(.20,.17,.12),daylightAmount())*(.08+.14*saturate(-n.y));ambient+=lightningRadiance()*(.16+.14*saturate(n.y));float3 direct=keyRadiance*ndl*visibility*1.28;float3 unmodulated=0;
+    // Restrict the additional traversal to visible primary surfaces inside
+    // the finite local-light range. Secondary/bounce hits retain the current performance
+    // budget, while direct local shadows remain exact for the displayed scene.
+    if(payload.depth==0){
+        LocalLightSample localLight=samplePlayerLocalLight(hit);
+        float localNdotL=localLight.active*saturate(dot(n,localLight.direction));
+        if(localNdotL>1e-4){
+            float localVisibility=playerLocalLightVisibility(
+                hit,localLight.direction,localLight.distance);
+            direct+=localLight.radiance*localNdotL*localVisibility;
+        }
+    }
     if(kind<.5)ambient*=lerp(1,.68,barkCavity);
     if(kind>1.5&&kind<2.5){
         ambient*=lerp(.94,1.02,terrainMoisture)*lerp(1.0,.86,terrainCavity);

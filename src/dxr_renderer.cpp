@@ -61,7 +61,9 @@ std::vector<std::vector<uint32_t>> makeNormalMipChain(std::vector<uint32_t> top,
 }
 
 struct DxrRenderer::Impl{
-    HWND window{};int width=1,height=1;std::wstring lastError;bool initialized=false;UINT frameIndex=0;float lastYaw=99,lastPitch=99,lastDistance=0;
+    HWND window{};int width=1,height=1;std::wstring lastError;bool initialized=false;UINT frameIndex=0;
+    CameraView lastView{};PlayerLocalLight lastLocalLight{};
+    bool haveLastView=false,haveLastLocalLight=false;
     DebugRenderSettings lastDebugSettings{};bool haveLastDebugSettings=false;
     EnvironmentCB lastEnvironment{};bool haveLastEnvironment=false;
     EnvironmentMesh environment{};
@@ -176,14 +178,17 @@ struct DxrRenderer::Impl{
 
     bool createGrassPipeline(){
         D3D12_DESCRIPTOR_RANGE range{};range.RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;range.NumDescriptors=2;range.BaseShaderRegister=0;range.OffsetInDescriptorsFromTableStart=0;
-        D3D12_ROOT_PARAMETER params[5]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[0].Descriptor.ShaderRegister=0;params[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_PARAMETER params[6]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[0].Descriptor.ShaderRegister=0;params[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
         params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;params[1].Descriptor.ShaderRegister=2;params[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
         params[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[2].DescriptorTable.NumDescriptorRanges=1;params[2].DescriptorTable.pDescriptorRanges=&range;params[2].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
         params[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[3].Constants.ShaderRegister=2;params[3].Constants.Num32BitValues=2;
         params[3].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
         params[4].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[4].Descriptor.ShaderRegister=1;params[4].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC signature{};signature.NumParameters=5;signature.pParameters=params;signature.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        params[5].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[5].Descriptor.ShaderRegister=3;
+        params[5].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC signature{};signature.NumParameters=6;signature.pParameters=params;signature.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         ID3DBlob*blob{},*errors{};HRESULT hr=D3D12SerializeRootSignature(&signature,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&errors);if(FAILED(hr)){release(errors);return fail(hr,L"Grass root-signature serialization failed");}
         hr=device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),__uuidof(ID3D12RootSignature),reinterpret_cast<void**>(&grassRoot));release(blob);release(errors);if(FAILED(hr))return fail(hr,L"Grass root-signature creation failed");
         const auto vertexShader=loadShader(L"grass_overlay_vs.dxil"),pixelShader=loadShader(L"grass_overlay_ps.dxil");if(vertexShader.empty()||pixelShader.empty()){lastError=L"Compiled grass overlay shaders were not found beside the build output.";return false;}
@@ -434,16 +439,55 @@ struct DxrRenderer::Impl{
 };
 
 DxrRenderer::DxrRenderer():impl_(std::make_unique<Impl>()){}DxrRenderer::~DxrRenderer()=default;
-bool DxrRenderer::initialize(HWND window,int width,int height){auto&i=*impl_;i.window=window;i.width=std::max(1,width);i.height=std::max(1,height);HRESULT hr=CreateDXGIFactory1(__uuidof(IDXGIFactory6),reinterpret_cast<void**>(&i.factory));if(FAILED(hr))return i.fail(hr,L"DXGI factory creation failed");IDXGIAdapter1*adapter{};for(UINT n=0;i.factory->EnumAdapterByGpuPreference(n,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,__uuidof(IDXGIAdapter1),reinterpret_cast<void**>(&adapter))!=DXGI_ERROR_NOT_FOUND;++n){DXGI_ADAPTER_DESC1 d{};adapter->GetDesc1(&d);if(!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)&&SUCCEEDED(D3D12CreateDevice(adapter,D3D_FEATURE_LEVEL_12_1,__uuidof(ID3D12Device5),reinterpret_cast<void**>(&i.device))))break;release(adapter);}release(adapter);if(!i.device){i.lastError=L"No DXR-capable DirectX 12 device was found.";return false;}D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};if(FAILED(i.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5,&options,sizeof(options)))||options.RaytracingTier==D3D12_RAYTRACING_TIER_NOT_SUPPORTED){i.lastError=L"The selected GPU does not expose DXR.";return false;}
+bool DxrRenderer::initialize(HWND window,int width,int height){auto&i=*impl_;i.window=window;i.width=std::max(1,width);i.height=std::max(1,height);HRESULT hr=CreateDXGIFactory1(__uuidof(IDXGIFactory6),reinterpret_cast<void**>(&i.factory));if(FAILED(hr))return i.fail(hr,L"DXGI factory creation failed");IDXGIAdapter1*adapter{};for(UINT n=0;i.factory->EnumAdapterByGpuPreference(n,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,__uuidof(IDXGIAdapter1),reinterpret_cast<void**>(&adapter))!=DXGI_ERROR_NOT_FOUND;++n){DXGI_ADAPTER_DESC1 d{};adapter->GetDesc1(&d);if(!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)&&SUCCEEDED(D3D12CreateDevice(adapter,D3D_FEATURE_LEVEL_12_1,__uuidof(ID3D12Device5),reinterpret_cast<void**>(&i.device))))break;release(adapter);}release(adapter);if(!i.device){i.lastError=L"No DXR-capable DirectX 12 device was found.";return false;}D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};if(FAILED(i.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5,&options,sizeof(options)))||options.RaytracingTier<D3D12_RAYTRACING_TIER_1_1){i.lastError=L"The selected GPU does not expose DXR 1.1 inline ray queries.";return false;}
     D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;hr=i.device->CreateCommandQueue(&q,__uuidof(ID3D12CommandQueue),reinterpret_cast<void**>(&i.queue));if(FAILED(hr))return i.fail(hr,L"DXR command queue creation failed");hr=i.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,__uuidof(ID3D12CommandAllocator),reinterpret_cast<void**>(&i.allocator));if(FAILED(hr))return i.fail(hr,L"DXR command allocator creation failed");hr=i.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,i.allocator,nullptr,__uuidof(ID3D12GraphicsCommandList4),reinterpret_cast<void**>(&i.list));if(FAILED(hr))return i.fail(hr,L"DXR command-list creation failed");i.list->Close();
     DXGI_SWAP_CHAIN_DESC1 sd{};sd.Width=i.width;sd.Height=i.height;sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;sd.BufferCount=2;sd.SampleDesc.Count=1;sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;IDXGISwapChain1*base{};hr=i.factory->CreateSwapChainForHwnd(i.queue,window,&sd,nullptr,nullptr,&base);if(FAILED(hr))return i.fail(hr,L"DXR swap chain creation failed");hr=base->QueryInterface(__uuidof(IDXGISwapChain3),reinterpret_cast<void**>(&i.swap));release(base);if(FAILED(hr))return i.fail(hr,L"DXR swap-chain interface unavailable");
     D3D12_DESCRIPTOR_HEAP_DESC rh{};rh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;rh.NumDescriptors=2;i.device->CreateDescriptorHeap(&rh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.rtvHeap));i.rtvSize=i.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);D3D12_DESCRIPTOR_HEAP_DESC dh{};dh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;dh.NumDescriptors=1;i.device->CreateDescriptorHeap(&dh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.dsvHeap));D3D12_DESCRIPTOR_HEAP_DESC gh{};gh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;gh.NumDescriptors=7;gh.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;i.device->CreateDescriptorHeap(&gh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.gpuHeap));i.srvSize=i.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);i.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,__uuidof(ID3D12Fence),reinterpret_cast<void**>(&i.fence));i.fenceEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!i.createBackBuffers()||!i.createOutputs()||!i.createBarkNormal()||!i.createGroundMaterials()||!i.createPipeline()||!i.createGrassPipeline()||!i.createTreeWindPipeline())return false;i.cameraBuffer=i.makeBuffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);i.environmentBuffer=i.makeBuffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!i.cameraBuffer||!i.environmentBuffer||FAILED(i.cameraBuffer->Map(0,nullptr,&i.cameraMapped))||FAILED(i.environmentBuffer->Map(0,nullptr,&i.environmentMapped)))return false;i.initialized=true;return true;}
 void DxrRenderer::resize(int width,int height){auto&i=*impl_;if(!i.initialized||width<=0||height<=0)return;i.wait();i.width=width;i.height=height;for(auto&b:i.backBuffers)release(b);if(SUCCEEDED(i.swap->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,0))){i.createBackBuffers();i.createOutputs();}}
 void DxrRenderer::setTree(const TreeMesh&tree){if(impl_->initialized&&!impl_->buildAcceleration(tree))MessageBoxW(impl_->window,impl_->lastError.c_str(),L"Dense Trees DXR geometry error",MB_ICONERROR);}
-void DxrRenderer::render(float yaw,float pitch,float distance,
+void DxrRenderer::render(const CameraView&requestedView,
                          const DebugRenderSettings&settings,
-                         const EnvironmentCB&environment){
+                         const EnvironmentCB&environment,
+                         const PlayerLocalLight&requestedLocalLight){
     auto&i=*impl_;if(!i.initialized||!i.tlas)return;
+    const auto finiteVec=[](const Vec3&value){
+        return std::isfinite(value.x)&&std::isfinite(value.y)&&std::isfinite(value.z);
+    };
+    Vec3 eye=finiteVec(requestedView.eye)?requestedView.eye:Vec3{0.0f,4.1f,-14.0f};
+    Vec3 forward=requestedView.forward;
+    if(!finiteVec(forward)||lengthSq(forward)<1e-8f)forward={0.0f,0.0f,1.0f};
+    else forward=normalize(forward);
+    Vec3 right=cross({0.0f,1.0f,0.0f},forward);
+    if(lengthSq(right)<1e-8f)right=cross({0.0f,0.0f,1.0f},forward);
+    if(lengthSq(right)<1e-8f)right={1.0f,0.0f,0.0f};
+    else right=normalize(right);
+    const Vec3 up=normalize(cross(forward,right));
+
+    PlayerLocalLight localLight=requestedLocalLight;
+    localLight.intensity=std::isfinite(localLight.intensity)?
+        clamp(localLight.intensity,0.0f,2048.0f):60.0f;
+    localLight.range=std::isfinite(localLight.range)?
+        clamp(localLight.range,.25f,128.0f):22.0f;
+    localLight.innerConeRadians=std::isfinite(localLight.innerConeRadians)?
+        clamp(localLight.innerConeRadians,0.0f,1.54f):.19198622f;
+    localLight.outerConeRadians=std::isfinite(localLight.outerConeRadians)?
+        clamp(localLight.outerConeRadians,localLight.innerConeRadians+.001f,1.56f):
+        std::max(localLight.innerConeRadians+.001f,.31415927f);
+    const CameraView view{eye,forward};
+    const auto changed=[](float a,float b){return std::abs(a-b)>.0001f;};
+    const bool viewChanged=!i.haveLastView||
+        changed(view.eye.x,i.lastView.eye.x)||changed(view.eye.y,i.lastView.eye.y)||
+        changed(view.eye.z,i.lastView.eye.z)||
+        changed(view.forward.x,i.lastView.forward.x)||
+        changed(view.forward.y,i.lastView.forward.y)||
+        changed(view.forward.z,i.lastView.forward.z);
+    const bool localLightChanged=!i.haveLastLocalLight||
+        localLight.enabled!=i.lastLocalLight.enabled||
+        localLight.spotlight!=i.lastLocalLight.spotlight||
+        changed(localLight.intensity,i.lastLocalLight.intensity)||
+        changed(localLight.range,i.lastLocalLight.range)||
+        changed(localLight.innerConeRadians,i.lastLocalLight.innerConeRadians)||
+        changed(localLight.outerConeRadians,i.lastLocalLight.outerConeRadians);
     const bool debugChanged=!i.haveLastDebugSettings||
         std::abs(settings.grassDensity-i.lastDebugSettings.grassDensity)>.0001f||
         std::abs(settings.bladeHeightScale-i.lastDebugSettings.bladeHeightScale)>.0001f||
@@ -460,19 +504,13 @@ void DxrRenderer::render(float yaw,float pitch,float distance,
     const bool environmentChanged=!i.haveLastEnvironment||
         std::memcmp(&visualEnvironment,&previousVisualEnvironment,
                     sizeof(visualEnvironment))!=0;
-    if(std::abs(yaw-i.lastYaw)>.0001f||std::abs(pitch-i.lastPitch)>.0001f||
-       std::abs(distance-i.lastDistance)>.0001f||debugChanged||environmentChanged){
-        i.frameIndex=0;i.lastYaw=yaw;i.lastPitch=pitch;i.lastDistance=distance;
-        i.lastDebugSettings=settings;i.lastEnvironment=environment;
-        i.haveLastDebugSettings=true;i.haveLastEnvironment=true;
+    if(viewChanged||localLightChanged||debugChanged||environmentChanged){
+        i.frameIndex=0;
     }
-    const Vec3 target{0,4.1f,0};
-    Vec3 eye=target+Vec3{std::sin(yaw)*std::cos(pitch)*distance,
-                         std::sin(pitch)*distance,
-                         -std::cos(yaw)*std::cos(pitch)*distance};
-    eye.y=std::max(eye.y,EnvironmentGenerator::terrainHeight(eye.x,eye.z)+.34f);
-    const Vec3 forward=normalize(target-eye),right=normalize(cross({0,1,0},forward));
-    const Vec3 up=cross(forward,right);
+    i.lastView=view;i.lastLocalLight=localLight;
+    i.lastDebugSettings=settings;i.lastEnvironment=environment;
+    i.haveLastView=i.haveLastLocalLight=true;
+    i.haveLastDebugSettings=i.haveLastEnvironment=true;
     const bool animatedEnvironment=environment.windSpeed>.001f||
         environment.rainIntensity>.001f||environment.lightningFlash>.001f||
         environmentChanged;
@@ -490,19 +528,26 @@ void DxrRenderer::render(float yaw,float pitch,float distance,
     i.visibleFarGrassPatchCount=visibleGrass.second;
     struct Camera{
         float eye[3],tanHalf;float forward[3],aspect;float right[3];UINT frame;
-        float up[3];UINT maxFrames;float exposure,padding0[3];
-        UINT resolution[2];UINT environmentIndexOffset;float padding1;
+        float up[3];UINT maxFrames;
+        float exposure,localLightIntensity,localLightRange,localLightInnerCos;
+        UINT resolution[2];UINT environmentIndexOffset;float localLightOuterCos;
         float grassSettings[4];float groundSettings[4];
     }c{{eye.x,eye.y,eye.z},tanHalf,
        {forward.x,forward.y,forward.z},static_cast<float>(i.width)/i.height,
        {right.x,right.y,right.z},shaderFrame,{up.x,up.y,up.z},temporalFrames,
-        1.0f,{0,0,0},{static_cast<UINT>(i.width),static_cast<UINT>(i.height)},
-        i.treeIndexCount,0,
+        1.0f,localLight.enabled?localLight.intensity:0.0f,localLight.range,
+        localLight.spotlight?std::cos(localLight.innerConeRadians):-1.0f,
+        {static_cast<UINT>(i.width),static_cast<UINT>(i.height)},
+        i.treeIndexCount,
+        localLight.spotlight?std::cos(localLight.outerConeRadians):-1.0f,
         {settings.grassDensity,settings.bladeHeightScale,settings.shortGrassDrawDistance,
          settings.tallGrassDrawDistance},
          {settings.groundNormalStrength,settings.groundDetailStrength,
           static_cast<float>(nearGrassStride),0}};
     static_assert(sizeof(Camera)==128);
+    static_assert(offsetof(Camera,localLightIntensity)==68);
+    static_assert(offsetof(Camera,resolution)==80);
+    static_assert(offsetof(Camera,grassSettings)==96);
     // The mapped constants are single-buffered.  begin() waits for the prior
     // submission before we overwrite them, preventing the previous frame's
     // ray/compute work from observing partially updated camera or wind data.
@@ -560,6 +605,7 @@ void DxrRenderer::render(float yaw,float pitch,float distance,
     D3D12_GPU_DESCRIPTOR_HANDLE grassTextures=i.gpuHeap->GetGPUDescriptorHandleForHeapStart();
     grassTextures.ptr+=5ull*i.srvSize;i.list->SetGraphicsRootDescriptorTable(2,grassTextures);
     i.list->SetGraphicsRootConstantBufferView(4,i.environmentBuffer->GetGPUVirtualAddress());
+    i.list->SetGraphicsRootShaderResourceView(5,i.tlas->GetGPUVirtualAddress());
     i.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if(settings.grassDensity>.001f){
         if(i.visibleNearGrassPatchCount){
@@ -583,5 +629,17 @@ void DxrRenderer::render(float yaw,float pitch,float distance,
     i.list->ResourceBarrier(3,barriers);
     if(i.execute()){i.swap->Present(1,0);i.frameIndex=std::min<UINT>(i.frameIndex+1,1023);}
 }
+
+void DxrRenderer::render(float yaw,float pitch,float distance,
+                         const DebugRenderSettings&settings,
+                         const EnvironmentCB&environment){
+    const Vec3 target{0.0f,4.1f,0.0f};
+    Vec3 eye=target+Vec3{std::sin(yaw)*std::cos(pitch)*distance,
+                         std::sin(pitch)*distance,
+                         -std::cos(yaw)*std::cos(pitch)*distance};
+    eye.y=std::max(eye.y,EnvironmentGenerator::terrainHeight(eye.x,eye.z)+.34f);
+    render(CameraView{eye,normalize(target-eye)},settings,environment,PlayerLocalLight{});
+}
+
 const wchar_t*DxrRenderer::error()const{return impl_->lastError.c_str();}bool DxrRenderer::ready()const{return impl_->initialized;}
 }
