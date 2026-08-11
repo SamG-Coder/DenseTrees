@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(densetrees_core
     src/environment.cpp
+    src/environment_simulation.cpp
     src/ground_texture.cpp
     src/tree.cpp
 )
@@ -30,9 +31,12 @@ endif()
 
 add_executable(densetrees_tests tests/tree_tests.cpp)
 target_link_libraries(densetrees_tests PRIVATE densetrees_core)
+add_executable(environment_simulation_tests tests/environment_simulation_tests.cpp)
+target_link_libraries(environment_simulation_tests PRIVATE densetrees_core)
 enable_testing()
 add_test(NAME procedural_tree_tests COMMAND densetrees_tests)
+add_test(NAME environment_simulation_tests COMMAND environment_simulation_tests)
 
-set_target_properties(DenseTrees densetrees_tests PROPERTIES
+set_target_properties(DenseTrees densetrees_tests environment_simulation_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )

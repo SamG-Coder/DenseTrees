@@ -61,16 +61,15 @@ std::vector<std::vector<uint32_t>> makeNormalMipChain(std::vector<uint32_t> top,
 }
 
 struct DxrRenderer::Impl{
-    HWND window{};int width=1,height=1;std::wstring lastError;bool initialized=false;UINT frameIndex=0;float lastYaw=99,lastPitch=99,lastDistance=0,lastSun=99,lastWind=-1;
+    HWND window{};int width=1,height=1;std::wstring lastError;bool initialized=false;UINT frameIndex=0;float lastYaw=99,lastPitch=99,lastDistance=0;
     DebugRenderSettings lastDebugSettings{};bool haveLastDebugSettings=false;
-    std::chrono::steady_clock::time_point lastSimulationUpdate=std::chrono::steady_clock::now();
-    float simulationSeconds=0;
+    EnvironmentCB lastEnvironment{};bool haveLastEnvironment=false;
     EnvironmentMesh environment{};
     IDXGIFactory6*factory{};IDXGISwapChain3*swap{};ID3D12Device5*device{};ID3D12CommandQueue*queue{};ID3D12CommandAllocator*allocator{};ID3D12GraphicsCommandList4*list{};
     ID3D12Fence*fence{};HANDLE fenceEvent{};UINT64 fenceValue{};ID3D12DescriptorHeap*rtvHeap{};ID3D12DescriptorHeap*dsvHeap{};ID3D12DescriptorHeap*gpuHeap{};UINT rtvSize{},srvSize{};ID3D12Resource*backBuffers[2]{};
     ID3D12RootSignature*root{};ID3D12StateObject*state{};ID3D12StateObjectProperties*stateProps{};
     ID3D12RootSignature*grassRoot{};ID3D12PipelineState*grassPipeline{};
-    ID3D12Resource*output{};ID3D12Resource*accumulation{};ID3D12Resource*grassDepth{};ID3D12Resource*barkNormal{};ID3D12Resource*groundAlbedo{};ID3D12Resource*groundNormal{};ID3D12Resource*cameraBuffer{};void*cameraMapped{};
+    ID3D12Resource*output{};ID3D12Resource*accumulation{};ID3D12Resource*grassDepth{};ID3D12Resource*barkNormal{};ID3D12Resource*groundAlbedo{};ID3D12Resource*groundNormal{};ID3D12Resource*cameraBuffer{};void*cameraMapped{};ID3D12Resource*environmentBuffer{};void*environmentMapped{};
     ID3D12Resource*vertexBuffer{};ID3D12Resource*indexBuffer{};ID3D12Resource*blas{};ID3D12Resource*tlas{};ID3D12Resource*blasScratch{};ID3D12Resource*tlasScratch{};ID3D12Resource*instanceBuffer{};
     ID3D12Resource*grassBuffer{};ID3D12Resource*visibleGrassBuffer{};
     ID3D12Resource*grassBlas{};ID3D12Resource*grassBlasScratch{};
@@ -79,7 +78,7 @@ struct DxrRenderer::Impl{
     UINT vertexCount{},indexCount{},grassPatchCount{};
     UINT visibleNearGrassPatchCount{},visibleFarGrassPatchCount{};
 
-    ~Impl(){wait();if(cameraBuffer&&cameraMapped)cameraBuffer->Unmap(0,nullptr);if(visibleGrassBuffer&&visibleGrassMapped)visibleGrassBuffer->Unmap(0,nullptr);release(hitTable);release(missTable);release(raygenTable);release(instanceBuffer);release(tlasScratch);release(grassBlasScratch);release(blasScratch);release(tlas);release(grassBlas);release(blas);release(visibleGrassBuffer);release(grassBuffer);release(indexBuffer);release(vertexBuffer);release(cameraBuffer);release(groundNormal);release(groundAlbedo);release(barkNormal);release(grassDepth);release(accumulation);release(output);release(grassPipeline);release(grassRoot);release(stateProps);release(state);release(root);for(auto&b:backBuffers)release(b);release(gpuHeap);release(dsvHeap);release(rtvHeap);release(list);release(allocator);release(fence);release(queue);release(swap);release(device);release(factory);if(fenceEvent)CloseHandle(fenceEvent);}
+    ~Impl(){wait();if(cameraBuffer&&cameraMapped)cameraBuffer->Unmap(0,nullptr);if(environmentBuffer&&environmentMapped)environmentBuffer->Unmap(0,nullptr);if(visibleGrassBuffer&&visibleGrassMapped)visibleGrassBuffer->Unmap(0,nullptr);release(hitTable);release(missTable);release(raygenTable);release(instanceBuffer);release(tlasScratch);release(grassBlasScratch);release(blasScratch);release(tlas);release(grassBlas);release(blas);release(visibleGrassBuffer);release(grassBuffer);release(indexBuffer);release(vertexBuffer);release(environmentBuffer);release(cameraBuffer);release(groundNormal);release(groundAlbedo);release(barkNormal);release(grassDepth);release(accumulation);release(output);release(grassPipeline);release(grassRoot);release(stateProps);release(state);release(root);for(auto&b:backBuffers)release(b);release(gpuHeap);release(dsvHeap);release(rtvHeap);release(list);release(allocator);release(fence);release(queue);release(swap);release(device);release(factory);if(fenceEvent)CloseHandle(fenceEvent);}
     bool fail(HRESULT hr,const wchar_t*message){wchar_t text[320];wsprintfW(text,L"%s (HRESULT 0x%08X)",message,static_cast<unsigned>(hr));lastError=text;return false;}
     void wait(){if(!queue||!fence)return;const UINT64 value=++fenceValue;if(SUCCEEDED(queue->Signal(fence,value))&&fence->GetCompletedValue()<value){fence->SetEventOnCompletion(value,fenceEvent);WaitForSingleObject(fenceEvent,INFINITE);}}
     bool begin(){wait();if(FAILED(allocator->Reset()))return false;if(FAILED(list->Reset(allocator,nullptr)))return false;return true;}
@@ -160,9 +159,9 @@ struct DxrRenderer::Impl{
     std::vector<char>loadShader(const wchar_t*name){wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);auto path=std::filesystem::path(exe).parent_path().parent_path()/L"shaders"/name;std::ifstream stream(path,std::ios::binary|std::ios::ate);if(!stream)return{};const auto size=stream.tellg();stream.seekg(0);std::vector<char>data(static_cast<size_t>(size));stream.read(data.data(),size);return data;}
     std::vector<char>loadDxil(){return loadShader(L"raytracing.dxil");}
     bool createPipeline(){D3D12_DESCRIPTOR_RANGE ranges[3]{};ranges[0].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_UAV;ranges[0].NumDescriptors=2;ranges[0].BaseShaderRegister=0;ranges[0].OffsetInDescriptorsFromTableStart=0;ranges[1].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;ranges[1].NumDescriptors=1;ranges[1].BaseShaderRegister=3;ranges[1].OffsetInDescriptorsFromTableStart=2;ranges[2].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;ranges[2].NumDescriptors=2;ranges[2].BaseShaderRegister=5;ranges[2].OffsetInDescriptorsFromTableStart=3;
-        D3D12_ROOT_PARAMETER params[6]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[0].DescriptorTable.NumDescriptorRanges=3;params[0].DescriptorTable.pDescriptorRanges=ranges;for(int p=1;p<=3;++p){params[p].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;params[p].Descriptor.ShaderRegister=static_cast<UINT>(p-1);}params[4].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[4].Descriptor.ShaderRegister=0;params[5].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;params[5].Descriptor.ShaderRegister=4;
+        D3D12_ROOT_PARAMETER params[7]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[0].DescriptorTable.NumDescriptorRanges=3;params[0].DescriptorTable.pDescriptorRanges=ranges;for(int p=1;p<=3;++p){params[p].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;params[p].Descriptor.ShaderRegister=static_cast<UINT>(p-1);}params[4].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[4].Descriptor.ShaderRegister=0;params[5].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;params[5].Descriptor.ShaderRegister=4;params[6].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[6].Descriptor.ShaderRegister=1;
         D3D12_STATIC_SAMPLER_DESC sampler{};sampler.Filter=D3D12_FILTER_ANISOTROPIC;sampler.AddressU=D3D12_TEXTURE_ADDRESS_MODE_WRAP;sampler.AddressV=D3D12_TEXTURE_ADDRESS_MODE_WRAP;sampler.AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;sampler.MaxAnisotropy=8;sampler.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;sampler.MinLOD=0;sampler.MaxLOD=10;sampler.ShaderRegister=0;sampler.ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rs{};rs.NumParameters=6;rs.pParameters=params;rs.NumStaticSamplers=1;rs.pStaticSamplers=&sampler;ID3DBlob*blob{},*errors{};HRESULT hr=D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&errors);if(FAILED(hr)){release(errors);return fail(hr,L"DXR root-signature serialization failed");}hr=device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),__uuidof(ID3D12RootSignature),reinterpret_cast<void**>(&root));release(blob);release(errors);if(FAILED(hr))return fail(hr,L"DXR root-signature creation failed");
+        D3D12_ROOT_SIGNATURE_DESC rs{};rs.NumParameters=7;rs.pParameters=params;rs.NumStaticSamplers=1;rs.pStaticSamplers=&sampler;ID3DBlob*blob{},*errors{};HRESULT hr=D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&errors);if(FAILED(hr)){release(errors);return fail(hr,L"DXR root-signature serialization failed");}hr=device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),__uuidof(ID3D12RootSignature),reinterpret_cast<void**>(&root));release(blob);release(errors);if(FAILED(hr))return fail(hr,L"DXR root-signature creation failed");
         auto dxil=loadDxil();if(dxil.empty()){lastError=L"Compiled raytracing.dxil was not found beside the build output.";return false;}
         const wchar_t*exports[]={L"RayGen",L"RadianceMiss",L"VisibilityMiss",L"RadianceHit",L"VisibilityHit",L"GrassIntersection",L"GrassRadianceHit"};D3D12_EXPORT_DESC exportDescs[7]{};for(int n=0;n<7;++n)exportDescs[n].Name=exports[n];D3D12_DXIL_LIBRARY_DESC library{};library.DXILLibrary={dxil.data(),dxil.size()};library.NumExports=7;library.pExports=exportDescs;
         D3D12_HIT_GROUP_DESC hit0{};hit0.HitGroupExport=L"RadianceHitGroup";hit0.ClosestHitShaderImport=L"RadianceHit";hit0.Type=D3D12_HIT_GROUP_TYPE_TRIANGLES;D3D12_HIT_GROUP_DESC hit1{};hit1.HitGroupExport=L"VisibilityHitGroup";hit1.ClosestHitShaderImport=L"VisibilityHit";hit1.Type=D3D12_HIT_GROUP_TYPE_TRIANGLES;
@@ -171,13 +170,14 @@ struct DxrRenderer::Impl{
 
     bool createGrassPipeline(){
         D3D12_DESCRIPTOR_RANGE range{};range.RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;range.NumDescriptors=2;range.BaseShaderRegister=0;range.OffsetInDescriptorsFromTableStart=0;
-        D3D12_ROOT_PARAMETER params[4]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[0].Descriptor.ShaderRegister=0;params[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_PARAMETER params[5]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[0].Descriptor.ShaderRegister=0;params[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
         params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;params[1].Descriptor.ShaderRegister=2;params[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
         params[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[2].DescriptorTable.NumDescriptorRanges=1;params[2].DescriptorTable.pDescriptorRanges=&range;params[2].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
         params[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[3].Constants.ShaderRegister=1;params[3].Constants.Num32BitValues=2;
+        params[3].Constants.ShaderRegister=2;params[3].Constants.Num32BitValues=2;
         params[3].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
-        D3D12_ROOT_SIGNATURE_DESC signature{};signature.NumParameters=4;signature.pParameters=params;signature.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        params[4].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;params[4].Descriptor.ShaderRegister=1;params[4].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC signature{};signature.NumParameters=5;signature.pParameters=params;signature.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         ID3DBlob*blob{},*errors{};HRESULT hr=D3D12SerializeRootSignature(&signature,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&errors);if(FAILED(hr)){release(errors);return fail(hr,L"Grass root-signature serialization failed");}
         hr=device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),__uuidof(ID3D12RootSignature),reinterpret_cast<void**>(&grassRoot));release(blob);release(errors);if(FAILED(hr))return fail(hr,L"Grass root-signature creation failed");
         const auto vertexShader=loadShader(L"grass_overlay_vs.dxil"),pixelShader=loadShader(L"grass_overlay_ps.dxil");if(vertexShader.empty()||pixelShader.empty()){lastError=L"Compiled grass overlay shaders were not found beside the build output.";return false;}
@@ -307,13 +307,13 @@ DxrRenderer::DxrRenderer():impl_(std::make_unique<Impl>()){}DxrRenderer::~DxrRen
 bool DxrRenderer::initialize(HWND window,int width,int height){auto&i=*impl_;i.window=window;i.width=std::max(1,width);i.height=std::max(1,height);HRESULT hr=CreateDXGIFactory1(__uuidof(IDXGIFactory6),reinterpret_cast<void**>(&i.factory));if(FAILED(hr))return i.fail(hr,L"DXGI factory creation failed");IDXGIAdapter1*adapter{};for(UINT n=0;i.factory->EnumAdapterByGpuPreference(n,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,__uuidof(IDXGIAdapter1),reinterpret_cast<void**>(&adapter))!=DXGI_ERROR_NOT_FOUND;++n){DXGI_ADAPTER_DESC1 d{};adapter->GetDesc1(&d);if(!(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)&&SUCCEEDED(D3D12CreateDevice(adapter,D3D_FEATURE_LEVEL_12_1,__uuidof(ID3D12Device5),reinterpret_cast<void**>(&i.device))))break;release(adapter);}release(adapter);if(!i.device){i.lastError=L"No DXR-capable DirectX 12 device was found.";return false;}D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};if(FAILED(i.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5,&options,sizeof(options)))||options.RaytracingTier==D3D12_RAYTRACING_TIER_NOT_SUPPORTED){i.lastError=L"The selected GPU does not expose DXR.";return false;}
     D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;hr=i.device->CreateCommandQueue(&q,__uuidof(ID3D12CommandQueue),reinterpret_cast<void**>(&i.queue));if(FAILED(hr))return i.fail(hr,L"DXR command queue creation failed");hr=i.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,__uuidof(ID3D12CommandAllocator),reinterpret_cast<void**>(&i.allocator));if(FAILED(hr))return i.fail(hr,L"DXR command allocator creation failed");hr=i.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,i.allocator,nullptr,__uuidof(ID3D12GraphicsCommandList4),reinterpret_cast<void**>(&i.list));if(FAILED(hr))return i.fail(hr,L"DXR command-list creation failed");i.list->Close();
     DXGI_SWAP_CHAIN_DESC1 sd{};sd.Width=i.width;sd.Height=i.height;sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;sd.BufferCount=2;sd.SampleDesc.Count=1;sd.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;IDXGISwapChain1*base{};hr=i.factory->CreateSwapChainForHwnd(i.queue,window,&sd,nullptr,nullptr,&base);if(FAILED(hr))return i.fail(hr,L"DXR swap chain creation failed");hr=base->QueryInterface(__uuidof(IDXGISwapChain3),reinterpret_cast<void**>(&i.swap));release(base);if(FAILED(hr))return i.fail(hr,L"DXR swap-chain interface unavailable");
-    D3D12_DESCRIPTOR_HEAP_DESC rh{};rh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;rh.NumDescriptors=2;i.device->CreateDescriptorHeap(&rh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.rtvHeap));i.rtvSize=i.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);D3D12_DESCRIPTOR_HEAP_DESC dh{};dh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;dh.NumDescriptors=1;i.device->CreateDescriptorHeap(&dh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.dsvHeap));D3D12_DESCRIPTOR_HEAP_DESC gh{};gh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;gh.NumDescriptors=7;gh.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;i.device->CreateDescriptorHeap(&gh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.gpuHeap));i.srvSize=i.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);i.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,__uuidof(ID3D12Fence),reinterpret_cast<void**>(&i.fence));i.fenceEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!i.createBackBuffers()||!i.createOutputs()||!i.createBarkNormal()||!i.createGroundMaterials()||!i.createPipeline()||!i.createGrassPipeline())return false;i.cameraBuffer=i.makeBuffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!i.cameraBuffer||FAILED(i.cameraBuffer->Map(0,nullptr,&i.cameraMapped)))return false;i.initialized=true;return true;}
+    D3D12_DESCRIPTOR_HEAP_DESC rh{};rh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;rh.NumDescriptors=2;i.device->CreateDescriptorHeap(&rh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.rtvHeap));i.rtvSize=i.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);D3D12_DESCRIPTOR_HEAP_DESC dh{};dh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;dh.NumDescriptors=1;i.device->CreateDescriptorHeap(&dh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.dsvHeap));D3D12_DESCRIPTOR_HEAP_DESC gh{};gh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;gh.NumDescriptors=7;gh.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;i.device->CreateDescriptorHeap(&gh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.gpuHeap));i.srvSize=i.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);i.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,__uuidof(ID3D12Fence),reinterpret_cast<void**>(&i.fence));i.fenceEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!i.createBackBuffers()||!i.createOutputs()||!i.createBarkNormal()||!i.createGroundMaterials()||!i.createPipeline()||!i.createGrassPipeline())return false;i.cameraBuffer=i.makeBuffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);i.environmentBuffer=i.makeBuffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!i.cameraBuffer||!i.environmentBuffer||FAILED(i.cameraBuffer->Map(0,nullptr,&i.cameraMapped))||FAILED(i.environmentBuffer->Map(0,nullptr,&i.environmentMapped)))return false;i.initialized=true;return true;}
 void DxrRenderer::resize(int width,int height){auto&i=*impl_;if(!i.initialized||width<=0||height<=0)return;i.wait();i.width=width;i.height=height;for(auto&b:i.backBuffers)release(b);if(SUCCEEDED(i.swap->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,0))){i.createBackBuffers();i.createOutputs();}}
 void DxrRenderer::setTree(const TreeMesh&tree){if(impl_->initialized&&!impl_->buildAcceleration(tree))MessageBoxW(impl_->window,impl_->lastError.c_str(),L"Dense Trees DXR geometry error",MB_ICONERROR);}
-void DxrRenderer::render(float yaw,float pitch,float distance,float sunAzimuth,float windStrength,
-                         const DebugRenderSettings&settings){
+void DxrRenderer::render(float yaw,float pitch,float distance,
+                         const DebugRenderSettings&settings,
+                         const EnvironmentCB&environment){
     auto&i=*impl_;if(!i.initialized||!i.tlas)return;
-    windStrength=clamp(windStrength,0.0f,1.0f);
     const bool debugChanged=!i.haveLastDebugSettings||
         std::abs(settings.grassDensity-i.lastDebugSettings.grassDensity)>.0001f||
         std::abs(settings.bladeHeightScale-i.lastDebugSettings.bladeHeightScale)>.0001f||
@@ -321,12 +321,20 @@ void DxrRenderer::render(float yaw,float pitch,float distance,float sunAzimuth,f
         std::abs(settings.groundDetailStrength-i.lastDebugSettings.groundDetailStrength)>.0001f||
         std::abs(settings.shortGrassDrawDistance-i.lastDebugSettings.shortGrassDrawDistance)>.0001f||
         std::abs(settings.tallGrassDrawDistance-i.lastDebugSettings.tallGrassDrawDistance)>.0001f;
+    EnvironmentCB visualEnvironment=environment;
+    EnvironmentCB previousVisualEnvironment=i.lastEnvironment;
+    // Total time and dt are not visible when every time-driven effect is
+    // disabled. Ignoring those two clock fields lets a paused scene converge.
+    visualEnvironment.time=previousVisualEnvironment.time=0.0f;
+    visualEnvironment.deltaTime=previousVisualEnvironment.deltaTime=0.0f;
+    const bool environmentChanged=!i.haveLastEnvironment||
+        std::memcmp(&visualEnvironment,&previousVisualEnvironment,
+                    sizeof(visualEnvironment))!=0;
     if(std::abs(yaw-i.lastYaw)>.0001f||std::abs(pitch-i.lastPitch)>.0001f||
-       std::abs(distance-i.lastDistance)>.0001f||std::abs(sunAzimuth-i.lastSun)>.0001f||
-       std::abs(windStrength-i.lastWind)>.0001f||debugChanged){
+       std::abs(distance-i.lastDistance)>.0001f||debugChanged||environmentChanged){
         i.frameIndex=0;i.lastYaw=yaw;i.lastPitch=pitch;i.lastDistance=distance;
-        i.lastSun=sunAzimuth;i.lastWind=windStrength;i.lastDebugSettings=settings;
-        i.haveLastDebugSettings=true;
+        i.lastDebugSettings=settings;i.lastEnvironment=environment;
+        i.haveLastDebugSettings=true;i.haveLastEnvironment=true;
     }
     const Vec3 target{0,4.1f,0};
     Vec3 eye=target+Vec3{std::sin(yaw)*std::cos(pitch)*distance,
@@ -335,12 +343,11 @@ void DxrRenderer::render(float yaw,float pitch,float distance,float sunAzimuth,f
     eye.y=std::max(eye.y,EnvironmentGenerator::terrainHeight(eye.x,eye.z)+.34f);
     const Vec3 forward=normalize(target-eye),right=normalize(cross({0,1,0},forward));
     const Vec3 up=cross(forward,right);
-    const auto simulationNow=std::chrono::steady_clock::now();
-    const float rawSimulationDelta=std::chrono::duration<float>(
-        simulationNow-i.lastSimulationUpdate).count();
-    i.lastSimulationUpdate=simulationNow;
-    i.simulationSeconds+=std::min(rawSimulationDelta,1.0f/20.0f);
-    const UINT temporalFrames=windStrength>.03f?1u:8u;
+    const bool animatedEnvironment=environment.windSpeed>.001f||
+        environment.windStrength>.001f||
+        environment.rainIntensity>.001f||environment.lightningFlash>.001f||
+        environmentChanged;
+    const UINT temporalFrames=animatedEnvironment?1u:8u;
     const UINT shaderFrame=temporalFrames>1u?i.frameIndex:0u;
     const float tanHalf=std::tan(52*pi/360);
     const float grassDensity=clamp(settings.grassDensity,0.0f,6.0f);
@@ -354,20 +361,19 @@ void DxrRenderer::render(float yaw,float pitch,float distance,float sunAzimuth,f
     i.visibleFarGrassPatchCount=visibleGrass.second;
     struct Camera{
         float eye[3],tanHalf;float forward[3],aspect;float right[3];UINT frame;
-        float up[3];UINT maxFrames;float sun[3],exposure;UINT resolution[2];
-        float timeSeconds,windStrength;float atmosphere[4];float grassSettings[4];
-        float groundSettings[4];
+        float up[3];UINT maxFrames;float exposure,padding0[3];
+        UINT resolution[2];float padding1[2];float grassSettings[4];float groundSettings[4];
     }c{{eye.x,eye.y,eye.z},tanHalf,
        {forward.x,forward.y,forward.z},static_cast<float>(i.width)/i.height,
        {right.x,right.y,right.z},shaderFrame,{up.x,up.y,up.z},temporalFrames,
-        {-std::sin(sunAzimuth),-1.35f,-std::cos(sunAzimuth)},1.0f,
-       {static_cast<UINT>(i.width),static_cast<UINT>(i.height)},
-        i.simulationSeconds,windStrength,{2.15f,.20f,.52f,.00032f},
+        1.0f,{0,0,0},{static_cast<UINT>(i.width),static_cast<UINT>(i.height)},{0,0},
         {settings.grassDensity,settings.bladeHeightScale,settings.shortGrassDrawDistance,
          settings.tallGrassDrawDistance},
          {settings.groundNormalStrength,settings.groundDetailStrength,
           static_cast<float>(nearGrassStride),0}};
-    std::memcpy(i.cameraMapped,&c,sizeof(c));if(!i.begin())return;
+    static_assert(sizeof(Camera)==128);
+    std::memcpy(i.cameraMapped,&c,sizeof(c));
+    std::memcpy(i.environmentMapped,&environment,sizeof(environment));if(!i.begin())return;
     ID3D12DescriptorHeap*heaps[]={i.gpuHeap};i.list->SetDescriptorHeaps(1,heaps);
     i.list->SetComputeRootSignature(i.root);i.list->SetPipelineState1(i.state);
     i.list->SetComputeRootDescriptorTable(0,i.gpuHeap->GetGPUDescriptorHandleForHeapStart());
@@ -376,6 +382,7 @@ void DxrRenderer::render(float yaw,float pitch,float distance,float sunAzimuth,f
     i.list->SetComputeRootShaderResourceView(3,i.indexBuffer->GetGPUVirtualAddress());
     i.list->SetComputeRootConstantBufferView(4,i.cameraBuffer->GetGPUVirtualAddress());
     i.list->SetComputeRootShaderResourceView(5,i.grassBuffer->GetGPUVirtualAddress());
+    i.list->SetComputeRootConstantBufferView(6,i.environmentBuffer->GetGPUVirtualAddress());
     D3D12_DISPATCH_RAYS_DESC rays{};
     rays.RayGenerationShaderRecord={i.raygenTable->GetGPUVirtualAddress(),
                                     D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES};
@@ -413,6 +420,7 @@ void DxrRenderer::render(float yaw,float pitch,float distance,float sunAzimuth,f
     i.list->SetGraphicsRootShaderResourceView(1,i.visibleGrassBuffer->GetGPUVirtualAddress());
     D3D12_GPU_DESCRIPTOR_HANDLE grassTextures=i.gpuHeap->GetGPUDescriptorHandleForHeapStart();
     grassTextures.ptr+=5ull*i.srvSize;i.list->SetGraphicsRootDescriptorTable(2,grassTextures);
+    i.list->SetGraphicsRootConstantBufferView(4,i.environmentBuffer->GetGPUVirtualAddress());
     i.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if(settings.grassDensity>.001f){
         if(i.visibleNearGrassPatchCount){

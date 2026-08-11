@@ -1,4 +1,5 @@
 #pragma once
+#include "environment_simulation.hpp"
 #include "tree.hpp"
 #include <windows.h>
 #include <memory>
@@ -20,8 +21,8 @@ public:
     bool initialize(HWND window,int width,int height);
     void resize(int width,int height);
     void setTree(const TreeMesh& tree);
-    void render(float yaw,float pitch,float distance,float sunAzimuth,float windStrength,
-                const DebugRenderSettings& settings);
+    void render(float yaw,float pitch,float distance,const DebugRenderSettings& settings,
+                const EnvironmentCB& environment);
     const wchar_t* error()const;
     bool ready()const;
 private:struct Impl;std::unique_ptr<Impl> impl_;

@@ -1,11 +1,12 @@
+#include "environment_cb.hlsli"
+
 struct Camera {
     float3 eye; float tanHalfFov;
     float3 forward; float aspect;
     float3 right; uint frameIndex;
     float3 up; uint maxFrames;
-    float3 sunDirection; float exposure;
-    uint2 resolution; float timeSeconds; float windStrength;
-    float4 atmosphere;
+    float exposure; float3 padding0;
+    uint2 resolution; float2 padding1;
     float4 grassSettings;
     float4 groundSettings;
 };
@@ -22,7 +23,7 @@ Texture2D<float4> SceneDepth : register(t0);
 Texture2D<float4> SceneColor : register(t1);
 StructuredBuffer<GrassPatch> GrassPatches : register(t2);
 ConstantBuffer<Camera> camera : register(b0);
-cbuffer GrassDraw : register(b1) {
+cbuffer GrassDraw : register(b2) {
     uint drawPatchOffset;
     uint drawInstanceStride;
 };
@@ -63,30 +64,62 @@ float randomUint(uint x) {
 }
 
 float3 directionToSun() {
-    return -normalize(camera.sunDirection);
+    return normalize(g_SunDirection);
+}
+
+float3 directionToMoon() {
+    return normalize(g_MoonDirection);
+}
+
+bool sunIsKeyLight() {
+    const float3 luminance=float3(.2126,.7152,.0722);
+    return dot(g_SunColor*g_SunIntensity,luminance)>=
+           dot(g_MoonColor*g_MoonIntensity,luminance);
+}
+
+float3 directionToKeyLight() {
+    return sunIsKeyLight()?directionToSun():directionToMoon();
+}
+
+float3 keyLightRadiance() {
+    return sunIsKeyLight()?
+        g_SunColor*g_SunIntensity:g_MoonColor*g_MoonIntensity;
+}
+
+float3 lightningRadiance() {
+    return float3(.52,.66,1.0)*g_LightningFlash;
 }
 
 float3 skyIrradiance(float3 normal) {
     float up=saturate(normal.y*.5+.5);
-    float sunHeight=saturate(directionToSun().y);
-    float3 horizon=lerp(float3(.38,.46,.53),float3(.58,.69,.78),sunHeight);
-    float3 zenith=lerp(float3(.075,.13,.22),float3(.16,.31,.52),sunHeight);
-    return lerp(horizon,zenith,pow(up,.58))*(.72+.18*sunHeight);
+    float daylight=smoothstep(-.12,.08,directionToSun().y);
+    float3 horizon=lerp(float3(.008,.013,.030),float3(.38,.48,.58),daylight);
+    float3 zenith=lerp(float3(.0015,.004,.016),float3(.075,.22,.48),daylight);
+    float3 sky=lerp(horizon,zenith,pow(up,.58))*lerp(1.0,.38,g_StormIntensity);
+    sky+=g_MoonColor*g_MoonIntensity*(.16+.22*up);
+    sky+=lightningRadiance()*(.12+.16*up);
+    return max(sky,0);
 }
 
 float3 clearSkyAirlight(float3 direction) {
     float3 d=normalize(direction);
-    float up=saturate(d.y),sunHeight=saturate(directionToSun().y);
-    float3 horizon=lerp(float3(.32,.39,.47),float3(.34,.52,.69),sunHeight);
-    float3 zenith=lerp(float3(.055,.075,.16),float3(.035,.16,.43),sunHeight);
-    return lerp(horizon,zenith,pow(up,.58));
+    float up=saturate(d.y),daylight=smoothstep(-.12,.08,directionToSun().y);
+    float3 horizon=lerp(float3(.009,.014,.030),float3(.34,.52,.69),daylight);
+    float3 zenith=lerp(float3(.002,.005,.018),float3(.035,.16,.43),daylight);
+    float3 airlight=lerp(horizon,zenith,pow(up,.58))*lerp(1.0,.52,g_StormIntensity);
+    float forwardScatter=pow(saturate(dot(d,directionToKeyLight())),12);
+    airlight+=keyLightRadiance()*forwardScatter*.22+lightningRadiance()*.20;
+    return max(airlight,0);
 }
 
 float3 applyAerialPerspective(float3 radiance,float3 hit,float3 rayDirection) {
     float distanceToHit=distance(camera.eye,hit);
-    float eyeDensity=exp(-max(camera.eye.y,0.0)/120.0);
-    float hitDensity=exp(-max(hit.y,0.0)/120.0);
-    float transmittance=exp(-camera.atmosphere.w*distanceToHit*.5*(eyeDensity+hitDensity));
+    float falloff=max(g_FogHeightFalloff,1e-5);
+    float eyeDensity=exp(-max(camera.eye.y,0.0)*falloff);
+    float middleDensity=exp(-max((camera.eye.y+hit.y)*.5,0.0)*falloff);
+    float hitDensity=exp(-max(hit.y,0.0)*falloff);
+    float opticalDepth=g_FogDensity*distanceToHit*(eyeDensity+4*middleDensity+hitDensity)/6.0;
+    float transmittance=exp(-max(opticalDepth,0.0));
     return radiance*transmittance+clearSkyAirlight(rayDirection)*(1-transmittance);
 }
 
@@ -147,17 +180,26 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
     return blade;
 }
 
-float3 grassWindDirection(float3 normal) {
-    float directionWave=.18*sin(camera.timeSeconds*.19);
-    float3 wind=normalize(float3(.82+directionWave,0,.57-directionWave));
+float3 grassWindDirection(BladeData blade) {
+    float2 baseDirection=normalize(g_WindDirection);
+    float2 windUV=blade.base.xz*.05+baseDirection*(g_Time*g_WindSpeed*.20);
+    float directionWave=.16*sin(dot(windUV,float2(1.31,-.87))+g_Time*.19);
+    float2 rotated=float2(baseDirection.x-directionWave*baseDirection.y,
+                          baseDirection.y+directionWave*baseDirection.x);
+    float3 wind=normalize(float3(rotated.x,0,rotated.y));
+    float3 normal=blade.normal;
     return normalize(wind-normal*dot(wind,normal));
 }
 
 float grassGust(BladeData blade) {
-    float traveling=camera.timeSeconds*1.36+dot(blade.base.xz,float2(.23,.17))+blade.phase;
+    float2 windUV=blade.base.xz*.05+g_WindDirection*(g_Time*g_WindSpeed*.20);
+    float turbulence=.5+.30*sin(dot(windUV,float2(2.17,1.31)))+
+                     .20*sin(dot(windUV,float2(-4.13,3.27))+1.7);
+    float traveling=g_Time*g_WindSpeed*max(g_WindGustFrequency,.05)+
+                     dot(blade.base.xz,float2(.23,.17))+blade.phase;
     float gust=.56+.25*sin(traveling)+.14*sin(traveling*2.31+1.7)
-              +.05*sin(camera.timeSeconds*7.2+blade.phase*3.0);
-    return saturate(gust);
+              +.05*sin(g_Time*g_WindSpeed*7.2+blade.phase*3.0);
+    return saturate(gust*lerp(.76,1.24,saturate(turbulence)));
 }
 
 struct BladeMotion {
@@ -170,10 +212,10 @@ struct BladeMotion {
 BladeMotion prepareBladeMotion(BladeData blade) {
     BladeMotion motion;
     float compliance=lerp(.43,.17,blade.stiffness)*lerp(1.0,1.18,blade.tall);
-    motion.windDirection=grassWindDirection(blade.normal);
-    motion.bend=blade.height*camera.windStrength*compliance*grassGust(blade);
-    motion.flutterPhase=camera.timeSeconds*(6.5+2.5*(1-blade.stiffness))+blade.phase;
-    motion.flutterAmplitude=blade.height*.013*camera.windStrength;
+    motion.windDirection=grassWindDirection(blade);
+    motion.bend=blade.height*g_WindStrength*compliance*grassGust(blade);
+    motion.flutterPhase=g_Time*g_WindSpeed*(6.5+2.5*(1-blade.stiffness))+blade.phase;
+    motion.flutterAmplitude=blade.height*.013*g_WindStrength;
     return motion;
 }
 
@@ -375,6 +417,8 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along)*
                   lerp(.90,1.10,dryColony);
     float3 albedo=lerp(green,straw,dry);
+    float wetness=saturate(g_WetnessFactor*.78);
+    albedo*=lerp(1.0,.61,wetness);
     float seedHead=tall*smoothstep(.70,.79,along)*(1-smoothstep(.92,1.0,along))
                   *step(.84,dryness);
     albedo=lerp(albedo,float3(.30,.27,.10),seedHead*.46);
@@ -382,19 +426,25 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float3 view=normalize(camera.eye-input.worldPosition);
     float3 n=normalize(input.normal);
     if(dot(n,view)<0)n=-n;
-    float3 sun=directionToSun();
-    // DXR stores the primary surface's actual direct-sun visibility in alpha.
+    float3 sun=directionToKeyLight();
+    float3 keyRadiance=keyLightRadiance();
+    // DXR stores the primary surface's actual key-light visibility in alpha.
     // Inferring it from display luminance double-shadowed grass over the tree
     // shadow and incorrectly treated dark bark/soil as occlusion.
     float sunVisibility=SceneColor.Load(int3(int2(pixel),0)).a;
     float frontLight=saturate(dot(n,sun));
     float backLight=saturate(dot(-n,sun));
     float3 ambient=.5*(skyIrradiance(n)+skyIrradiance(-n))*(.50+.18*along);
-    float3 direct=float3(1.02,.94,.73)*frontLight*sunVisibility*1.18;
-    direct+=float3(.42,.74,.20)*backLight*sunVisibility*.72;
+    float3 direct=keyRadiance*frontLight*sunVisibility*1.28;
+    float3 unmodulated=keyRadiance*float3(.42,.74,.20)*backLight*
+                       sunVisibility*.72;
     float3 halfVector=normalize(sun+view);
-    direct+=pow(saturate(dot(n,halfVector)),22)*.08*sunVisibility;
-    float3 result=albedo*(ambient+direct)*lerp(.72,1.0,smoothstep(0,.22,along));
+    float wetExponent=lerp(22.0,110.0,wetness);
+    unmodulated+=keyRadiance*pow(saturate(dot(n,halfVector)),wetExponent)*
+                 lerp(.08,.34,wetness)*sunVisibility;
+    ambient+=lightningRadiance()*(.18+.10*along);
+    float fade=lerp(.72,1.0,smoothstep(0,.22,along));
+    float3 result=(albedo*(ambient+direct)+unmodulated)*fade;
     float3 rayDirection=normalize(input.worldPosition-camera.eye);
     result=applyAerialPerspective(result,input.worldPosition,rayDirection);
     float3 displayColor=linearToSrgb(colorGrade(tonemap(result*camera.exposure)));
