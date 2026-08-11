@@ -187,31 +187,60 @@ struct BladeData {
     float tall;
     float species;
     float leanStrength;
+    float verticalScale;
+    float waterCoverage;
+    float waterlineAlong;
 };
+
+float2 grassWaterState(GrassPatch patch,float3 patchNormal) {
+    float puddleFill=saturate(g_PuddleCoverage);
+    // The high seed byte carries the CPU terrain sampler's exact hydrology
+    // retention.  The low 24 bits remain the patch's procedural random seed.
+    float flatSurface=smoothstep(.990268,.997564,patchNormal.y);
+    float retention=float(patch.seed>>24)*(1.0/255.0);
+    float threshold=lerp(1.08,.20,puddleFill);
+    float basin=smoothstep(threshold-.04,threshold+.04,retention);
+    float retainedMask=basin*flatSurface*smoothstep(.025,.13,retention)*
+                       smoothstep(.002,.03,puddleFill);
+
+    // Regional flooding uses the same absolute water level and global gate as
+    // the terrain shader.  Existing coherent colour fields provide a modest
+    // sub-patch shoreline offset without adding noise work to every vertex.
+    float floodGate=smoothstep(.002,.070,saturate(g_FloodCoverage));
+    float boundaryOffset=(patch.colourFertility-.5)*.070+
+                         patch.colourWarmCool*.012;
+    float waterHead=g_WaterTableHeight+boundaryOffset-patch.baseY;
+    float lowlandMask=smoothstep(-.035,.035,waterHead)*flatSurface*floodGate;
+    float coverage=saturate(retainedMask+lowlandMask-retainedMask*lowlandMask);
+    float retainedDepth=lerp(.008,.035,puddleFill)*retainedMask;
+    float floodDepth=max(waterHead+.010,0.0)*lowlandMask;
+    return float2(coverage,max(retainedDepth,floodDepth));
+}
 
 BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
                     float3 axisX,float3 axisZ,uint tallCount) {
     BladeData blade;
     blade.normal=patchNormal;
-    uint seed=hashUint(patch.seed^((bladeIndex+1u)*0x9e3779b9u));
+    uint patchRandomSeed=patch.seed&0x00ffffffu;
+    uint seed=hashUint(patchRandomSeed^((bladeIndex+1u)*0x9e3779b9u));
     blade.tall=bladeIndex<tallCount?1.0:0.0;
     float radius=sqrt(randomUint(seed))*lerp(.265,.072,blade.tall);
     float offsetAngle=randomUint(seed^0x68bc21ebu)*6.2831853;
     uint subclump=bladeIndex%3u;
-    float clusterAngle=randomUint(patch.seed^0x91e10da5u)*6.2831853+
+    float clusterAngle=randomUint(patchRandomSeed^0x91e10da5u)*6.2831853+
                        float(subclump)*2.0943951+
                        (randomUint(seed^0x243f6a88u)-.5)*.34;
-    float clusterRadius=lerp(.10,.15,randomUint(patch.seed^(subclump*0x9e3779b9u)))*blade.tall;
+    float clusterRadius=lerp(.10,.15,randomUint(patchRandomSeed^(subclump*0x9e3779b9u)))*blade.tall;
     blade.base=float3((patch.minX+patch.maxX)*.5,patch.baseY,
                       (patch.minZ+patch.maxZ)*.5)
               +axisX*(cos(offsetAngle)*radius+cos(clusterAngle)*clusterRadius)
               +axisZ*(sin(offsetAngle)*radius+sin(clusterAngle)*clusterRadius);
-    float patchAngle=randomUint(patch.seed^0x02e5be93u)*6.2831853;
+    float patchAngle=randomUint(patchRandomSeed^0x02e5be93u)*6.2831853;
     float bladeAngle=patchAngle+float(bladeIndex)*2.39996323+
                      (randomUint(seed^0x68bc21ebu)-.5)*.42;
     blade.side=normalize(axisX*cos(bladeAngle)+axisZ*sin(bladeAngle));
     blade.naturalLean=normalize(cross(blade.side,blade.normal));
-    blade.species=float(patch.seed%3u);
+    blade.species=float(patchRandomSeed%3u);
     float shortMaximum=float((patch.packed>>8)&255u)*.004;
     float tallMaximum=float((patch.packed>>24)&255u)*.004;
     float maximumHeight=lerp(shortMaximum,tallMaximum,blade.tall);
@@ -221,13 +250,27 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
                          lerp(.0035,.0085,randomUint(seed^0x63d83595u)),blade.tall)
                    *lerp(.88,1.16,patch.moisture);
     float individualPhase=randomUint(seed^0xb5297a4du)*6.2831853;
-    float coherentPhase=randomUint(patch.seed^0xd1b54a35u)*6.2831853;
+    float coherentPhase=randomUint(patchRandomSeed^0xd1b54a35u)*6.2831853;
     blade.phase=lerp(individualPhase,coherentPhase,.78*blade.tall);
     blade.stiffness=lerp(lerp(.36,.88,randomUint(seed^0x1b56c4e9u)),
                          lerp(.24,.62,randomUint(seed^0x1b56c4e9u)),blade.tall);
     blade.dryness=randomUint(seed^0xc2b2ae35u);
     blade.leanStrength=lerp(blade.tall>.5?.22:.025,blade.tall>.5?.45:.14,
                             randomUint(seed^0x94d049bbu));
+    float2 water=grassWaterState(patch,patchNormal);
+    float uncompressedWaterline=saturate(water.y/max(blade.height,.02));
+    float depthResponse=smoothstep(.08,.86,uncompressedWaterline);
+    // A shallow film wets every species but only bends short blades.  Tall
+    // stems remain upright until the physical water depth reaches a useful
+    // fraction of their height.
+    blade.waterCoverage=max(water.x*.15,depthResponse);
+    blade.verticalScale=lerp(1.0,.38,depthResponse);
+    blade.waterlineAlong=saturate(water.y/
+        max(blade.height*blade.verticalScale,.02));
+    // Stay inside the patch AABB's existing short/tall lateral budgets.
+    float flattenedLean=lerp(.42,.58,blade.tall);
+    blade.leanStrength=lerp(blade.leanStrength,flattenedLean,
+                            blade.waterCoverage*.88);
     return blade;
 }
 
@@ -265,16 +308,17 @@ BladeMotion prepareBladeMotion(BladeData blade) {
     BladeMotion motion;
     float compliance=lerp(.43,.17,blade.stiffness)*lerp(1.0,1.18,blade.tall);
     motion.windDirection=grassWindDirection(blade);
-    motion.bend=blade.height*g_WindStrength*compliance*grassGust(blade);
+    float waterPinning=lerp(1.0,.06,blade.waterCoverage);
+    motion.bend=blade.height*g_WindStrength*compliance*grassGust(blade)*waterPinning;
     motion.flutterPhase=g_Time*g_WindSpeed*(6.5+2.5*(1-blade.stiffness))+blade.phase;
-    motion.flutterAmplitude=blade.height*.013*g_WindStrength;
+    motion.flutterAmplitude=blade.height*.013*g_WindStrength*waterPinning;
     return motion;
 }
 
 float3 bladeCenter(BladeData blade,BladeMotion motion,float along) {
     float s=saturate(along),shape=s*s*(2-s);
     float flutter=sin(motion.flutterPhase+s*5.0)*motion.flutterAmplitude*s*s;
-    return blade.base+blade.normal*(blade.height*s)
+    return blade.base+blade.normal*(blade.height*s*blade.verticalScale)
          +blade.naturalLean*(blade.height*blade.leanStrength*shape)
          +motion.windDirection*(motion.bend*shape)+blade.side*flutter;
 }
@@ -285,7 +329,7 @@ float3 bladeTangent(BladeData blade,BladeMotion motion,float along) {
     float phase=motion.flutterPhase+s*5.0;
     float flutterDerivative=motion.flutterAmplitude*
                             (5*cos(phase)*s*s+2*sin(phase)*s);
-    return normalize(blade.normal*blade.height
+    return normalize(blade.normal*(blade.height*blade.verticalScale)
          +blade.naturalLean*(blade.height*blade.leanStrength*shapeDerivative)
          +motion.windDirection*(motion.bend*shapeDerivative)
          +blade.side*flutterDerivative);
@@ -363,7 +407,7 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
     float shortLodDensity=lerp(.68,1.0,1-smoothstep(3.0,shortDistance,patchDistance));
     float tallLodDensity=lerp(.62,1.0,1-smoothstep(3.0,tallDistance,patchDistance));
     float lodDensity=tallBlade?tallLodDensity:shortLodDensity;
-    uint selection=patch.seed^((bladeIndex+19u)*0x27d4eb2du);
+    uint selection=(patch.seed&0x00ffffffu)^((bladeIndex+19u)*0x27d4eb2du);
     if(distanceCoverage<=0||(bladeIndex>=2u&&randomUint(selection)>lodDensity))
         return inactiveVertex();
 
@@ -420,8 +464,16 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
     output.worldPosition=worldPosition;
     output.normal=shadingNormal;
     output.bladeCoordinates=float2(sideSign,along);
-    output.bladeParameters=float4(blade.dryness,blade.tall,blade.species,patch.moisture);
-    output.coverage=distanceCoverage*saturate(physicalWidth/max(renderWidth,1e-5));
+    // Species was unused by the pixel shader; reuse that interpolant for the
+    // patch-coherent water response without increasing varying bandwidth.
+    output.bladeParameters=float4(blade.dryness,blade.tall,
+                                  blade.waterlineAlong,patch.moisture);
+    // Fully submerged blades disappear through the same stochastic coverage
+    // path as distant grass; emergent tips remain visible above the waterline.
+    float submergedVisibility=lerp(1.0,.06,
+        smoothstep(.88,1.0,blade.waterlineAlong));
+    output.coverage=distanceCoverage*saturate(physicalWidth/max(renderWidth,1e-5))*
+                    submergedVisibility;
     output.ditherSeed=selection;
     output.colourFields=float4(patch.colourFertility,patch.colourDryColony,
                                patch.colourLushColony,patch.colourWarmCool);
@@ -452,6 +504,7 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float along=saturate(input.bladeCoordinates.y);
     float dryness=input.bladeParameters.x;
     float tall=input.bladeParameters.y;
+    float waterlineAlong=saturate(input.bladeParameters.z);
     float moisture=input.bladeParameters.w;
     float fertile=input.colourFields.x;
     float dryColony=input.colourFields.y;
@@ -469,8 +522,16 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along)*
                   lerp(.90,1.10,dryColony);
     float3 albedo=lerp(green,straw,dry);
-    float wetness=saturate(g_WetnessFactor*.78);
+    // Puddles weigh down the blade and soak its lower stem.  The tip keeps the
+    // atmospheric wetness only, so flattened grass still has readable green
+    // detail above the thin water film.
+    float waterlineWidth=max(fwidth(along)*1.5,.018);
+    float submergedStem=smoothstep(.003,.025,waterlineAlong)*
+        (1-smoothstep(waterlineAlong-waterlineWidth,
+                      waterlineAlong+waterlineWidth,along));
+    float wetness=max(saturate(g_WetnessFactor*.78),submergedStem);
     albedo*=lerp(1.0,.61,wetness);
+    albedo*=lerp(1.0,.78,submergedStem);
     float seedHead=tall*smoothstep(.70,.79,along)*(1-smoothstep(.92,1.0,along))
                   *step(.84,dryness);
     albedo=lerp(albedo,float3(.30,.27,.10),seedHead*.46);

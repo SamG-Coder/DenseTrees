@@ -17,10 +17,10 @@ struct EnvironmentFloat3 {
 };
 
 // Byte-for-byte CPU mirror of the future HLSL EnvironmentCB at register(b1).
-// The first seven registers are the required contract from the environment
-// specification. The final register carries the derived atmospheric values
-// needed by the fog, storm, and night-sky shader paths. Light directions point
-// from a shaded world position toward the emitter, so daytime sun Y is positive.
+// Registers c0-c7 preserve the original 128-byte environment contract.  The
+// appended c8 register carries global hydrology without shifting any existing
+// shader field. Light directions point from a shaded world position toward the
+// emitter, so daytime sun Y is positive.
 struct alignas(16) EnvironmentCB {
     // c0
     float time{};
@@ -60,6 +60,12 @@ struct alignas(16) EnvironmentCB {
     float fogHeightFalloff{};
     float stormIntensity{};
     float starVisibility{};
+
+    // c8 - global hydrology extension
+    float waterTableHeight{};    // Absolute world-space Y.
+    float floodCoverage{};       // Normalized global flood progression.
+    float waterRippleStrength{}; // Rain-driven ripple contribution.
+    float environmentPadding{};
 };
 
 static_assert(sizeof(EnvironmentFloat2) == 8);
@@ -67,7 +73,7 @@ static_assert(sizeof(EnvironmentFloat3) == 12);
 static_assert(std::is_standard_layout_v<EnvironmentCB>);
 static_assert(std::is_trivially_copyable_v<EnvironmentCB>);
 static_assert(alignof(EnvironmentCB) == 16);
-static_assert(sizeof(EnvironmentCB) == 128);
+static_assert(sizeof(EnvironmentCB) == 144);
 
 static_assert(offsetof(EnvironmentCB,time) == 0);
 static_assert(offsetof(EnvironmentCB,deltaTime) == 4);
@@ -92,6 +98,10 @@ static_assert(offsetof(EnvironmentCB,fogDensity) == 112);
 static_assert(offsetof(EnvironmentCB,fogHeightFalloff) == 116);
 static_assert(offsetof(EnvironmentCB,stormIntensity) == 120);
 static_assert(offsetof(EnvironmentCB,starVisibility) == 124);
+static_assert(offsetof(EnvironmentCB,waterTableHeight) == 128);
+static_assert(offsetof(EnvironmentCB,floodCoverage) == 132);
+static_assert(offsetof(EnvironmentCB,waterRippleStrength) == 136);
+static_assert(offsetof(EnvironmentCB,environmentPadding) == 140);
 
 struct EnvironmentControls {
     bool advanceTime{true};
@@ -113,7 +123,20 @@ struct EnvironmentControls {
     float rainIntensity{0.0f};
     float wetnessAccumulationRate{0.035f};
     float wetnessDryingRate{0.006f};
+    // The global water table follows accumulated surface wetness much more
+    // slowly than the material wetness response.  This prevents a short
+    // shower from flooding every eligible basin while retaining water after
+    // the rain has stopped.
+    float waterTableRiseRate{0.018f};
+    float waterTableDrainRate{0.0025f};
+    // Scene-calibrated absolute world heights.  The dry value lies below the
+    // sampled pasture minimum (-3.90 m); the flood value retains 0.55 m of
+    // clearance beneath the oak's root-grade plateau at world Y=0.
+    float waterTableDryHeight{-4.05f};
+    float waterTableFloodHeight{-0.55f};
     float maximumPuddleCoverage{0.85f};
+    // Applied to the filtered water-table saturation.  The historical name is
+    // retained for source compatibility with existing controls and presets.
     float puddleStartWetness{0.32f};
 
     float stormRainThreshold{0.55f};
@@ -132,6 +155,12 @@ struct EnvironmentState {
     double totalTimeSeconds{0.0};
     float timeOfDay{14.0f};
     float wetnessFactor{0.0f};
+    // Normalized regional saturation.  This is CPU-only state;
+    // the shader receives the derived world height and flood progression.
+    float waterTableLevel{0.0f};
+    float waterTableHeight{-4.05f};
+    float floodCoverage{0.0f};
+    float waterRippleStrength{0.0f};
     float puddleCoverage{0.0f};
     float lightningFlash{0.0f};
     float stormIntensity{0.0f};

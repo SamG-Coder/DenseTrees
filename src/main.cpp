@@ -56,6 +56,7 @@ enum class EnvironmentSliderBinding {
     Control,
     TimeOfDay,
     Wetness,
+    WaterTableHeight,
     WindDirection
 };
 
@@ -70,7 +71,7 @@ struct EnvironmentSliderSpec {
     const wchar_t* suffix;
 };
 
-constexpr std::array<EnvironmentSliderSpec,13> environmentSliderSpecs{{
+constexpr std::array<EnvironmentSliderSpec,14> environmentSliderSpecs{{
     {2200,L"Time of day",0.0f,24.0f,nullptr,EnvironmentSliderBinding::TimeOfDay,1,L" hrs"},
     {2201,L"Wind speed",0.0f,15.0f,&dense::EnvironmentControls::windSpeed,EnvironmentSliderBinding::Control,2,L""},
     {2202,L"Wind strength",0.0f,3.0f,&dense::EnvironmentControls::windStrength,EnvironmentSliderBinding::Control,2,L""},
@@ -78,6 +79,8 @@ constexpr std::array<EnvironmentSliderSpec,13> environmentSliderSpecs{{
     {2204,L"Gust frequency",0.0f,8.0f,&dense::EnvironmentControls::windGustFrequency,EnvironmentSliderBinding::Control,2,L""},
     {2205,L"Rain intensity",0.0f,1.0f,&dense::EnvironmentControls::rainIntensity,EnvironmentSliderBinding::Control,2,L""},
     {2206,L"Wetness",0.0f,1.0f,nullptr,EnvironmentSliderBinding::Wetness,2,L""},
+    {2213,L"Water table height",-4.05f,-.55f,nullptr,
+        EnvironmentSliderBinding::WaterTableHeight,2,L" m"},
     {2207,L"Max puddle coverage",0.0f,1.0f,&dense::EnvironmentControls::maximumPuddleCoverage,EnvironmentSliderBinding::Control,2,L""},
     {2208,L"Fog density",0.0f,.005f,&dense::EnvironmentControls::baseFogDensity,EnvironmentSliderBinding::Control,5,L""},
     {2209,L"Fog height falloff",0.0f,.20f,&dense::EnvironmentControls::fogHeightFalloff,EnvironmentSliderBinding::Control,4,L""},
@@ -89,6 +92,7 @@ constexpr std::array<EnvironmentSliderSpec,13> environmentSliderSpecs{{
 constexpr size_t environmentTimeOfDayIndex = 0;
 constexpr size_t environmentWindStrengthIndex = 2;
 constexpr size_t environmentWetnessIndex = 6;
+constexpr size_t environmentWaterTableIndex = 7;
 
 struct App {
     dense::DxrRenderer renderer;
@@ -409,6 +413,8 @@ struct App {
             return environment.state.timeOfDay;
         case EnvironmentSliderBinding::Wetness:
             return environment.state.wetnessFactor;
+        case EnvironmentSliderBinding::WaterTableHeight:
+            return environment.state.waterTableHeight;
         case EnvironmentSliderBinding::WindDirection: {
             constexpr float radiansToDegrees=57.29577951308232f;
             float degrees=std::atan2(environment.controls.windDirection.y,
@@ -432,6 +438,26 @@ struct App {
         case EnvironmentSliderBinding::Wetness:
             environment.state.wetnessFactor=value;
             break;
+        case EnvironmentSliderBinding::WaterTableHeight: {
+            const float dry=environment.controls.waterTableDryHeight;
+            const float flooded=std::max(dry+.001f,
+                environment.controls.waterTableFloodHeight);
+            const float targetCoverage=std::clamp((value-dry)/(flooded-dry),0.0f,1.0f);
+            const float start=std::clamp(environment.controls.puddleStartWetness,
+                                         0.0f,.99f);
+            // Invert smoothstep by monotonic bisection.  This only runs while
+            // dragging the debug slider and reproduces update() exactly.
+            float low=0.0f,high=1.0f;
+            for(int iteration=0;iteration<18;++iteration) {
+                const float middle=(low+high)*.5f;
+                const float smooth=middle*middle*(3.0f-2.0f*middle);
+                if(smooth<targetCoverage)low=middle;else high=middle;
+            }
+            environment.state.waterTableLevel=start+(1.0f-start)*(low+high)*.5f;
+            environment.state.floodCoverage=targetCoverage;
+            environment.state.waterTableHeight=value;
+            break;
+        }
         case EnvironmentSliderBinding::WindDirection: {
             constexpr float degreesToRadians=.017453292519943295f;
             const float radians=value*degreesToRadians;
@@ -485,6 +511,7 @@ struct App {
         if(debugPanelVisible&&environmentSectionExpanded) {
             synchronizeEnvironmentSlider(environmentTimeOfDayIndex);
             synchronizeEnvironmentSlider(environmentWetnessIndex);
+            synchronizeEnvironmentSlider(environmentWaterTableIndex);
         }
     }
 
@@ -622,7 +649,7 @@ struct App {
         if(!debugPanel||!IsWindow(debugPanel))return;
 
         const int clientWidth=scaled(expanded?700:344);
-        const int clientHeight=scaled(expanded?668:390);
+        const int clientHeight=scaled(expanded?713:390);
         RECT bounds{0,0,clientWidth,clientHeight};
         const DWORD style=static_cast<DWORD>(GetWindowLongPtrW(debugPanel,GWL_STYLE));
         const DWORD extendedStyle=static_cast<DWORD>(GetWindowLongPtrW(debugPanel,GWL_EXSTYLE));

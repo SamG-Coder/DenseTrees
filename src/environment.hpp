@@ -13,6 +13,9 @@ namespace dense {
 struct GrassPatchGpu {
     float minX{}, minY{}, minZ{};
     float maxX{}, maxY{}, maxZ{};
+    // Low 24 bits are the deterministic random seed.  The high byte carries
+    // the terrain's baked standing-water retention at this patch.  Packing
+    // both keeps the hot grass structured-buffer stride at 64 bytes.
     uint32_t seed{};
     uint32_t packed{};
     float baseY{};
@@ -30,6 +33,14 @@ struct GrassPatchGpu {
 static_assert(sizeof(GrassPatchGpu) == 64);
 static_assert(offsetof(GrassPatchGpu,maxX) == 12);
 static_assert(offsetof(GrassPatchGpu,seed) == 24);
+
+constexpr uint32_t grassPatchRandomSeed(uint32_t packedSeed) {
+    return packedSeed&0x00ffffffu;
+}
+
+constexpr float grassPatchWaterRetention(uint32_t packedSeed) {
+    return static_cast<float>(packedSeed>>24)*(1.0f/255.0f);
+}
 
 struct EnvironmentMesh {
     std::vector<MeshVertex> terrainVertices;

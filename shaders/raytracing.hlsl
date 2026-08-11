@@ -75,6 +75,81 @@ float filteredFbmWorld(float2 world,float baseFrequency,float footprint) {
     [unroll] for(uint octave=0;octave<4;++octave){float filter=1-smoothstep(.25,.75,frequency*footprint);result+=lerp(.5,valueNoise(p),filter)*weight;p=p*2.03+17.17;frequency*=2.03;weight*=.48;}
     return result;
 }
+
+float2 safeWindDirection2() {
+    float magnitudeSquared=dot(g_WindDirection,g_WindDirection);
+    return magnitudeSquared>1e-6?g_WindDirection*rsqrt(magnitudeSquared):
+                                  float2(.819,.574);
+}
+
+float2 waterNoiseGradient(float2 p,float epsilon) {
+    float inverseSpan=.5/max(epsilon,1e-4);
+    return float2(valueNoise(p+float2(epsilon,0))-valueNoise(p-float2(epsilon,0)),
+                  valueNoise(p+float2(0,epsilon))-valueNoise(p-float2(0,epsilon)))*
+           inverseSpan;
+}
+
+// Two decorrelated, world-space scrolling fields form a stable small-wave
+// normal. Detail amplitude is footprint-filtered instead of relying on ray
+// differentials, which are unavailable in this DXR closest-hit path.
+float2 scrollingWaterSlope(float2 worldPosition,float footprint) {
+    float2 wind=safeWindDirection2(),crossWind=float2(-wind.y,wind.x);
+    float simulationTime=max(g_Time,0.0);
+    float coarseFade=1-smoothstep(.28,.90,footprint);
+    float fineFade=1-smoothstep(.075,.32,footprint);
+    float motion=max(g_WindSpeed,0.0)*saturate(g_WindStrength);
+    float2 uvA=worldPosition*.62+wind*(simulationTime*.038*motion);
+    float2 flowB=normalize(crossWind*.87-wind*.49);
+    float2 uvB=worldPosition*1.47+flowB*(simulationTime*.061*motion)+
+               float2(37.2,-19.7);
+    float2 slopeA=waterNoiseGradient(uvA,.035)*.62*.037*coarseFade;
+    float2 slopeB=waterNoiseGradient(uvB,.045)*1.47*.016*fineFade;
+    return (slopeA+slopeB)*lerp(.58,1.35,saturate(g_WindStrength));
+}
+
+// Analytic expanding rings avoid a texture/descriptor and remain stable in
+// world space. They are evaluated only for primary puddle hits while raining.
+float2 rainRingSlope(float2 worldPosition,float footprint) {
+    float rain=saturate(g_RainIntensity);
+    float rippleStrength=saturate(g_WaterRippleStrength);
+    float detailFade=1-smoothstep(.045,.24,footprint);
+    if(rippleStrength<.004||detailFade<=.001)return 0;
+
+    const float cellSize=1.30;
+    int2 baseCell=int2(floor(worldPosition/cellSize));
+    float simulationTime=max(g_Time,0.0);
+    float eventRate=lerp(.34,1.16,rain);
+    float2 slope=0;
+    [unroll] for(int y=-1;y<=1;++y) {
+        [unroll] for(int x=-1;x<=1;++x) {
+            float2 cell=float2(baseCell+int2(x,y));
+            float seed=hash(cell+float2(71.3,-43.8));
+            float2 jitter=float2(hash(cell+float2(11.7,89.2)),
+                                 hash(cell+float2(-57.1,23.6)));
+            float2 centre=(cell+.12+.76*jitter)*cellSize;
+            float2 delta=worldPosition-centre;
+            float radialDistance=length(delta);
+            float age=frac(simulationTime*eventRate+seed);
+            float radius=age*.68;
+            float width=lerp(.018,.038,age);
+            float signedBand=(radialDistance-radius)/width;
+            float band=exp2(-2.65*signedBand*signedBand);
+            float decay=(1-age)*(1-age);
+            slope+=(radialDistance>1e-4?delta/radialDistance:float2(0,0))*
+                   (-signedBand*band*decay);
+        }
+    }
+    return slope*(.030*rippleStrength*detailFade);
+}
+
+float3 evaluatePuddleNormal(float2 worldPosition,float footprint) {
+    float2 slope=scrollingWaterSlope(worldPosition,footprint)+
+                 rainRingSlope(worldPosition,footprint);
+    float magnitude=length(slope);
+    if(magnitude>.16)slope*=.16/magnitude;
+    return normalize(float3(-slope.x,1,-slope.y));
+}
+
 float hash3(float3 p) {
     p=frac(p*.1031);p+=dot(p,p.yzx+33.33);return frac((p.x+p.y)*p.z);
 }
@@ -390,7 +465,8 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
         patch.normalZ));
     float3 axisX=normalize(float3(1,-blade.normal.x/max(blade.normal.y,.25),0));
     float3 axisZ=normalize(cross(axisX,blade.normal));
-    uint seed=hashUint(patch.seed^((bladeIndex+1u)*0x9e3779b9u));
+    uint patchRandomSeed=patch.seed&0x00ffffffu;
+    uint seed=hashUint(patchRandomSeed^((bladeIndex+1u)*0x9e3779b9u));
     uint baseCandidateCount=min(patch.packed&255u,34u);
     uint baseTallCount=min((patch.packed>>16)&255u,baseCandidateCount);
     float densityScale=clamp(camera.grassSettings.x,0.0,6.0);
@@ -399,20 +475,20 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
     blade.tall=bladeIndex<tallCount?1.0:0.0;
     float radius=sqrt(randomUint(seed))*lerp(.245,.065,blade.tall);
     float offsetAngle=randomUint(seed^0x68bc21ebu)*6.2831853;
-    float clusterAngle=randomUint(patch.seed^0x91e10da5u)*6.2831853;
-    float clusterRadius=randomUint(patch.seed^0x243f6a88u)*.095*blade.tall;
+    float clusterAngle=randomUint(patchRandomSeed^0x91e10da5u)*6.2831853;
+    float clusterRadius=randomUint(patchRandomSeed^0x243f6a88u)*.095*blade.tall;
     blade.base=float3((patch.minX+patch.maxX)*.5,patch.baseY,
                       (patch.minZ+patch.maxZ)*.5)
               +axisX*(cos(offsetAngle)*radius+cos(clusterAngle)*clusterRadius)
               +axisZ*(sin(offsetAngle)*radius+sin(clusterAngle)*clusterRadius);
-    float patchAngle=randomUint(patch.seed^0x02e5be93u)*6.2831853;
+    float patchAngle=randomUint(patchRandomSeed^0x02e5be93u)*6.2831853;
     float bladeAngle=patchAngle+float(bladeIndex)*2.39996323+
                      (randomUint(seed^0x68bc21ebu)-.5)*.42;
     blade.side=normalize(axisX*cos(bladeAngle)+axisZ*sin(bladeAngle));
     blade.naturalLean=normalize(cross(blade.side,blade.normal));
     float crossAngle=lerp(1.20,1.94,randomUint(seed^0x7f4a7c15u));
     blade.crossSide=normalize(blade.side*cos(crossAngle)+blade.naturalLean*sin(crossAngle));
-    blade.species=float(patch.seed%3u);
+    blade.species=float(patchRandomSeed%3u);
     float shortMaximum=float((patch.packed>>8)&255u)*.004;
     float tallMaximum=float((patch.packed>>24)&255u)*.004;
     float maximumHeight=lerp(shortMaximum,tallMaximum,blade.tall);
@@ -422,7 +498,7 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
                          lerp(.0035,.0085,randomUint(seed^0x63d83595u)),blade.tall)
                    *lerp(.88,1.16,patch.moisture);
     float individualPhase=randomUint(seed^0xb5297a4du)*6.2831853;
-    float coherentPhase=randomUint(patch.seed^0xd1b54a35u)*6.2831853;
+    float coherentPhase=randomUint(patchRandomSeed^0xd1b54a35u)*6.2831853;
     blade.phase=lerp(individualPhase,coherentPhase,.78*blade.tall);
     blade.stiffness=lerp(lerp(.36,.88,randomUint(seed^0x1b56c4e9u)),
                           lerp(.24,.62,randomUint(seed^0x1b56c4e9u)),blade.tall);
@@ -504,7 +580,7 @@ void GrassIntersection() {
         if(distanceCoverage<=0)continue;
         float lodDensity=lerp(blade.tall>.5?.62:.68,1.0,
                               1-smoothstep(3.0,drawDistance,patchDistance));
-        uint selection=patch.seed^((bladeIndex+19u)*0x27d4eb2du);
+        uint selection=(patch.seed&0x00ffffffu)^((bladeIndex+19u)*0x27d4eb2du);
         if(bladeIndex>=2u&&randomUint(selection)>lodDensity)continue;
         float coverageThreshold=randomUint(selection^0x165667b1u);
         bool crossed=blade.tall>.5||((hashUint(selection)&1u)==0u);
@@ -645,6 +721,8 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         }
     }
     float terrainMoisture=.5,terrainCavity=0,terrainRoughness=.9,puddleMask=0;
+    float terrainMicroHeight=.5,terrainMicroCoverage=0;
+    float3 puddleNormal=float3(0,1,0);
     float terrainRetention=0,terrainSlope=0;
     float materialRoughness=kind<.5?.74:(kind<1.5?.40:(kind<2.5?.90:
                             (kind<3.5?.67:(kind<4.5?.48:.72))));
@@ -734,6 +812,8 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             albedo*=lerp(float3(1,1,1),highFrequency,materialDetail);
             terrainRoughness=textureAlbedo.a;
             terrainCavity=textureNormal.a*nearTextureWeight*.55;
+            terrainMicroHeight=textureNormal.b;
+            terrainMicroCoverage=nearTextureWeight;
             float normalStrength=nearTextureWeight*clamp(camera.groundSettings.x,0.0,2.0)*.92;
             float2 mapXY=(textureNormal.rg*2-1)*normalStrength;
             float mapZ=sqrt(saturate(1-dot(mapXY,mapXY)));
@@ -747,23 +827,62 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             float dz=(fbm((hit.xz+float2(0,sampleStep))*frequency)-fbm((hit.xz-float2(0,sampleStep))*frequency))/(2*sampleStep);
             n=normalize(n+float3(-dx*.035,0,-dz*.035));
         }
-        if(g_PuddleCoverage>.001){
+        if(g_PuddleCoverage>.001||g_FloodCoverage>.001){
             float flatSurface=smoothstep(.990268,.997564,surfaceNormal.y);
             float drainageSuitability=saturate(terrainRetention)*flatSurface;
-            if(drainageSuitability>.001){
-                // Hydrology selects real depressions.  Noise only breaks up
-                // the shoreline; it can no longer create water on a hill.
-                float puddleNoise=filteredFbmWorld(hit.xz+float2(91.7,-53.4),
-                                                    .052,footprint);
-                float puddleThreshold=lerp(1.08,.20,saturate(g_PuddleCoverage));
-                float puddleDriver=drainageSuitability+(puddleNoise-.49)*.12;
-                float basin=smoothstep(puddleThreshold,puddleThreshold+.07,
-                                       puddleDriver);
-                // Coverage is already the CPU-derived result of accumulated
-                // wetness; applying wetness again delayed puddles twice.
-                puddleMask=basin*flatSurface;
-                n=normalize(lerp(n,float3(0,1,0),puddleMask));
-                terrainRoughness=lerp(terrainRoughness,.001,puddleMask);
+            bool retainedCandidate=g_PuddleCoverage>.001&&
+                                   drainageSuitability>.001;
+            bool lowlandCandidate=g_FloodCoverage>.001&&flatSurface>.001;
+            if(retainedCandidate||lowlandCandidate){
+                float macroEdge=filteredFbmWorld(hit.xz+float2(91.7,-53.4),
+                                                  .052,footprint);
+                float mesoEdge=filteredFbmWorld(hit.xz+float2(-28.3,64.9),
+                                                 .19,footprint);
+                float microDepression=(.5-terrainMicroHeight)*terrainMicroCoverage;
+                float retainedMask=0;
+                if(retainedCandidate){
+                    // Baked retention remains the dominant local-basin signal.
+                    // Noise and microheight only articulate its interpolated
+                    // shoreline; they cannot create a basin on their own.
+                    float fineEdge=filteredValueNoise(hit.xz+float2(17.4,-31.6),
+                                                       .82,fineFootprint);
+                    float organicEdge=(macroEdge-.49)*.095+(mesoEdge-.50)*.052+
+                                      (fineEdge-.50)*.022+microDepression*.105+
+                                      terrainCavity*.038;
+                    float threshold=lerp(1.08,.20,saturate(g_PuddleCoverage));
+                    float edgeWidth=clamp(.032+footprint*.020,.032,.090);
+                    float basin=smoothstep(threshold-edgeWidth,threshold+edgeWidth,
+                                           drainageSuitability+organicEdge);
+                    float hydrologyGate=smoothstep(.025,.13,terrainRetention);
+                    retainedMask=basin*flatSurface*hydrologyGate;
+                }
+
+                float lowlandMask=0;
+                if(lowlandCandidate){
+                    // The absolute CPU water table floods low, flat ground.
+                    // Broad offsets are measured in metres and let the global
+                    // contour merge naturally with retained local shorelines.
+                    float boundaryOffset=(macroEdge-.49)*.090+
+                                         (mesoEdge-.50)*.032+
+                                         microDepression*.045+
+                                         terrainCavity*.012;
+                    float waterHead=g_WaterTableHeight+boundaryOffset-hit.y;
+                    float levelWidth=clamp(.018+footprint*.014,.018,.075);
+                    float coverageGate=smoothstep(.002,.070,
+                                                   saturate(g_FloodCoverage));
+                    lowlandMask=smoothstep(-levelWidth,levelWidth,waterHead)*
+                                flatSurface*coverageGate;
+                }
+
+                // Union avoids a dark/double edge where a retained basin and
+                // the rising regional water table meet.
+                puddleMask=saturate(retainedMask+lowlandMask-
+                                    retainedMask*lowlandMask);
+                if(payload.depth==0&&puddleMask>.002)
+                    puddleNormal=evaluatePuddleNormal(hit.xz,footprint);
+                n=normalize(lerp(n,puddleNormal,puddleMask));
+                terrainRoughness=lerp(terrainRoughness,
+                    lerp(.004,.040,saturate(g_RainIntensity)),puddleMask);
             }
         }
         materialRoughness=terrainRoughness;
@@ -871,14 +990,27 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float3 result=albedo*(ambient+direct)+unmodulated;
     if(payload.depth==0&&puddleMask>.05){
         float3 viewDirection=normalize(camera.eye-hit);
-        float waterFresnel=.02+.98*pow(1-saturate(dot(n,viewDirection)),5);
+        float waterFresnel=.0204+.9796*
+            pow(1-saturate(dot(puddleNormal,viewDirection)),5);
         RadiancePayload reflection;reflection.color=0;reflection.depth=1;
         reflection.primaryT=2200;reflection.primaryKeyVisibility=1;
-        RayDesc reflectedRay;reflectedRay.Origin=hit+n*.018;
-        reflectedRay.Direction=normalize(reflect(WorldRayDirection(),n));
-        reflectedRay.TMin=.012;reflectedRay.TMax=2200;
+        // The bounded wave normal supplies distortion. Blend back toward a
+        // nearly level reflection whenever that distortion approaches the
+        // terrain horizon so a ripple cannot launch a ray into the ground.
+        float3 levelNormal=normalize(lerp(surfaceNormal,float3(0,1,0),.94));
+        float3 levelReflection=normalize(reflect(WorldRayDirection(),levelNormal));
+        float3 waveReflection=normalize(reflect(WorldRayDirection(),puddleNormal));
+        float horizonSafety=smoothstep(.012,.105,dot(waveReflection,levelNormal));
+        float3 reflectionDirection=normalize(lerp(levelReflection,waveReflection,
+                                                   horizonSafety));
+        if(dot(reflectionDirection,levelNormal)<.008)
+            reflectionDirection=levelReflection;
+        RayDesc reflectedRay;reflectedRay.Origin=hit+puddleNormal*.020;
+        reflectedRay.Direction=reflectionDirection;
+        reflectedRay.TMin=.014;reflectedRay.TMax=2200;
         TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,reflectedRay,reflection);
-        float reflectionWeight=puddleMask*waterFresnel;
+        float reflectionWeight=puddleMask*waterFresnel*
+            lerp(.88,1.0,smoothstep(.18,.82,puddleMask));
         result=lerp(result,reflection.color,reflectionWeight);
     }
     if(payload.depth==0&&!terrainSurface){RadiancePayload bounce;bounce.color=0;bounce.depth=1;bounce.primaryT=6;bounce.primaryKeyVisibility=1;RayDesc br;br.Origin=hit+surfaceNormal*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=6;TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}

@@ -495,6 +495,36 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         else mesh.terrainIndices.insert(mesh.terrainIndices.end(),{a,c,b,b,c,d});
     }
 
+    // Sample the exact emitted terrain triangle rather than bilinearly
+    // filtering across its alternating diagonals.  Grass and the DXR terrain
+    // shader therefore agree at puddle boundaries.
+    const auto sampleWaterRetention=[&](float worldX,float worldZ) {
+        constexpr int centre=(resolution-1)/2;
+        const auto gridPosition=[&](float world) {
+            const float normalized=clamp(world/terrainHalfExtent,-1.0f,1.0f);
+            const float uniform=std::copysign(
+                std::pow(std::abs(normalized),1.0f/terrainGridExponent),normalized);
+            return centre+uniform*centre;
+        };
+        const float gridX=gridPosition(worldX),gridZ=gridPosition(worldZ);
+        const int cellX=std::clamp(static_cast<int>(std::floor(gridX)),0,resolution-2);
+        const int cellZ=std::clamp(static_cast<int>(std::floor(gridZ)),0,resolution-2);
+        const float x0=gridCoordinates[cellX],x1=gridCoordinates[cellX+1];
+        const float z0=gridCoordinates[cellZ],z1=gridCoordinates[cellZ+1];
+        const float u=clamp((worldX-x0)/(x1-x0),0.0f,1.0f);
+        const float v=clamp((worldZ-z0)/(z1-z0),0.0f,1.0f);
+        const float a=waterRetention[gridIndex(cellX,cellZ)];
+        const float b=waterRetention[gridIndex(cellX+1,cellZ)];
+        const float c=waterRetention[gridIndex(cellX,cellZ+1)];
+        const float d=waterRetention[gridIndex(cellX+1,cellZ+1)];
+        if(((cellX+cellZ)&1)==0) {
+            if(v>=u)return a*(1-v)+c*(v-u)+d*u;
+            return a*(1-u)+d*v+b*(u-v);
+        }
+        if(u+v<=1.0f)return a*(1-u-v)+c*v+b*u;
+        return b*(1-v)+c*(1-u)+d*(u+v-1);
+    };
+
     std::array<GrassIsland,16> islands{};
     islands[0]={7.8f,-7.0f,3.5f,2.1f,.4f};
     islands[1]={-3.5f,-7.0f,3.0f,1.9f,1.7f};
@@ -560,10 +590,13 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         const float lowerReach=surfaceRise+maximumWidth*slope+grassBoundsSafety;
         const float upperReach=surfaceRise+maximumHeight*(normal.y+lateralRatio*slope)+
                                maximumWidth*slope+grassBoundsSafety;
+        const uint32_t retentionByte=static_cast<uint32_t>(clamp(
+            sampleWaterRetention(x,z)*255.0f+0.5f,0.0f,255.0f));
+        const uint32_t packedSeed=(grassRng.next()&0x00ffffffu)|(retentionByte<<24);
         mesh.grassPatches.push_back({x-horizontalReach,baseY-lowerReach,
                                      z-horizontalReach,x+horizontalReach,
                                      baseY+upperReach,z+horizontalReach,
-                                     grassRng.next(),packed,baseY,normal.x,normal.z,moisture,
+                                     packedSeed,packed,baseY,normal.x,normal.z,moisture,
                                      colour.fertility,colour.dryColony,colour.lushColony,
                                      colour.warmCool});
         if(tall)++mesh.tallGrassPatchCount;

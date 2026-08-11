@@ -198,7 +198,7 @@ int main() {
     require(flatLocalMinima>0&&selectedFlatLocalMinima==flatLocalMinima,
             "runoff bake failed to retain water in flat local depressions");
     validateTriangles(environment.terrainVertices,environment.terrainIndices,"hill terrain");
-    uint32_t decodedTallPatches=0;
+    uint32_t decodedTallPatches=0,waterRetainingGrassPatches=0;
     for(size_t i=0;i<environment.grassPatches.size();++i){
         const auto& patch=environment.grassPatches[i];
         require(std::isfinite(patch.minX)&&std::isfinite(patch.minY)&&
@@ -212,6 +212,10 @@ int main() {
         const uint32_t tallCount=(patch.packed>>16)&255u,tallCode=(patch.packed>>24)&255u;
         const bool tall=tallCount!=0;
         if(tall)++decodedTallPatches;
+        const float grassRetention=dense::grassPatchWaterRetention(patch.seed);
+        if(grassRetention>1.0f/255.0f)++waterRetainingGrassPatches;
+        require(std::isfinite(grassRetention)&&grassRetention>=0&&grassRetention<=1,
+                "grass patch runoff retention left normalized range");
         require(blades>=28&&blades<=34&&shortCode>=9&&shortCode<=34,
                 "grass candidate count or short height left the meadow range");
         require(tall?(tallCount>=18&&tallCount<=24&&tallCount<blades&&tallCode>=90&&
@@ -239,6 +243,9 @@ int main() {
     }
     require(decodedTallPatches==environment.tallGrassPatchCount,
             "long-grass summary does not match the packed patch data");
+    require(waterRetainingGrassPatches>environment.grassPatches.size()/100&&
+                waterRetainingGrassPatches<environment.grassPatches.size()/5,
+            "grass did not inherit a plausible fraction of terrain basins");
     require(environment.tallGrassPatchCount>environment.grassPatches.size()/2&&
                 environment.tallGrassPatchCount<environment.grassPatches.size()*3/4,
             "clustered long grass is absent or overwhelms the short meadow");

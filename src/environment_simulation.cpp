@@ -53,15 +53,56 @@ EnvironmentFloat3 lerp(EnvironmentFloat3 low,EnvironmentFloat3 high,float t) {
             low.z+(high.z-low.z)*t};
 }
 
-float exactWetnessStep(float wetness,float rain,float accumulationRate,
-                       float dryingRate,float deltaTime) {
+struct ExponentialDriverStep {
+    float initial{};
+    float equilibrium{};
+    float responseRate{};
+    float value{};
+};
+
+ExponentialDriverStep exactWetnessStep(float wetness,float rain,
+                                       float accumulationRate,float dryingRate,
+                                       float deltaTime) {
+    wetness=saturate(wetness);
     const float wetRate=rain*std::clamp(accumulationRate,0.0f,10.0f);
     const float dryRate=(1.0f-rain)*std::clamp(dryingRate,0.0f,10.0f);
     const float combinedRate=wetRate+dryRate;
-    if(!(combinedRate>0.0f)||!(deltaTime>0.0f))return saturate(wetness);
+    if(!(combinedRate>0.0f))return {wetness,wetness,0.0f,wetness};
     const float equilibrium=wetRate/combinedRate;
-    return saturate(equilibrium+(saturate(wetness)-equilibrium)*
-                     std::exp(-combinedRate*deltaTime));
+    const float value=deltaTime>0.0f?
+        saturate(equilibrium+(wetness-equilibrium)*
+                 std::exp(-combinedRate*deltaTime)):wetness;
+    return {wetness,equilibrium,combinedRate,value};
+}
+
+// Exact response of a first-order follower to a first-order exponential
+// driver over the same interval.  Using the complete wetness curve, rather
+// than merely its end value, keeps water-table rise and drainage independent
+// of how a frame interval is partitioned.
+float exactFollowerStep(float follower,const ExponentialDriverStep& driver,
+                        float responseRate,float deltaTime) {
+    follower=saturate(follower);
+    responseRate=std::clamp(responseRate,0.0f,10.0f);
+    if(!(responseRate>0.0f)||!(deltaTime>0.0f))return follower;
+
+    const float followerDecay=std::exp(-responseRate*deltaTime);
+    if(!(driver.responseRate>0.0f))
+        return saturate(driver.initial+(follower-driver.initial)*followerDecay);
+
+    const float driverDecay=std::exp(-driver.responseRate*deltaTime);
+    const float rateDifference=responseRate-driver.responseRate;
+    float convolution{};
+    if(std::abs(rateDifference)<=1.0e-4f*
+       std::max(responseRate,driver.responseRate)) {
+        const float timeDecay=responseRate*deltaTime>80.0f?
+            0.0f:deltaTime*followerDecay;
+        convolution=responseRate*(driver.initial-driver.equilibrium)*timeDecay;
+    } else {
+        convolution=responseRate*(driver.initial-driver.equilibrium)*
+            (driverDecay-followerDecay)/rateDifference;
+    }
+    return saturate(driver.equilibrium+
+        (follower-driver.equilibrium)*followerDecay+convolution);
 }
 
 } // namespace
@@ -108,17 +149,40 @@ const EnvironmentCB& EnvironmentSimulation::update(float deltaTimeSeconds) {
     }
 
     const float rain=saturate(finiteOr(controls.rainIntensity,0.0f));
-    state.wetnessFactor=exactWetnessStep(
+    const ExponentialDriverStep wetnessStep=exactWetnessStep(
         finiteOr(state.wetnessFactor,0.0f),rain,
         finiteOr(controls.wetnessAccumulationRate,0.035f),
         finiteOr(controls.wetnessDryingRate,0.006f),deltaTime);
+    state.wetnessFactor=wetnessStep.value;
+
+    const float tableRiseRate=std::clamp(
+        finiteOr(controls.waterTableRiseRate,0.018f),0.0f,10.0f);
+    const float tableDrainRate=std::clamp(
+        finiteOr(controls.waterTableDrainRate,0.0025f),0.0f,10.0f);
+    // Rain controls how readily saturated ground recharges the table.  During
+    // dry weather the slower rate lets retained subsurface water drain after
+    // the surface wetness has already begun to fall.
+    const float tableResponseRate=tableDrainRate+
+        (tableRiseRate-tableDrainRate)*rain;
+    state.waterTableLevel=exactFollowerStep(
+        finiteOr(state.waterTableLevel,0.0f),wetnessStep,
+        tableResponseRate,deltaTime);
 
     const float puddleStart=std::clamp(
         finiteOr(controls.puddleStartWetness,0.32f),0.0f,0.99f);
     const float puddleCapacity=saturate(
         finiteOr(controls.maximumPuddleCoverage,0.85f));
-    state.puddleCoverage=puddleCapacity*smoothStep(
-        puddleStart,1.0f,state.wetnessFactor);
+    state.floodCoverage=smoothStep(
+        puddleStart,1.0f,state.waterTableLevel);
+    state.puddleCoverage=puddleCapacity*state.floodCoverage;
+    const float dryWaterHeight=std::clamp(
+        finiteOr(controls.waterTableDryHeight,-4.05f),-100.0f,-0.10f);
+    const float floodWaterHeight=std::clamp(
+        finiteOr(controls.waterTableFloodHeight,-0.55f),
+        dryWaterHeight,-0.10f);
+    state.waterTableHeight=dryWaterHeight+
+        (floodWaterHeight-dryWaterHeight)*state.floodCoverage;
+    state.waterRippleStrength=saturate(rain*state.floodCoverage);
 
     const float stormThreshold=std::clamp(
         finiteOr(controls.stormRainThreshold,0.55f),0.0f,0.99f);
@@ -213,6 +277,10 @@ const EnvironmentCB& EnvironmentSimulation::update(float deltaTimeSeconds) {
         finiteOr(controls.fogHeightFalloff,0.020f),0.0f,4.0f);
     constants_.stormIntensity=state.stormIntensity;
     constants_.starVisibility=state.starVisibility;
+    constants_.waterTableHeight=state.waterTableHeight;
+    constants_.floodCoverage=state.floodCoverage;
+    constants_.waterRippleStrength=state.waterRippleStrength;
+    constants_.environmentPadding=0.0f;
     return constants_;
 }
 

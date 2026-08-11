@@ -30,4 +30,10 @@ cbuffer EnvironmentCB : register(b1)
     float g_FogHeightFalloff;
     float g_StormIntensity;
     float g_StarVisibility;
+
+    // c8 - appended hydrology register; c0-c7 remain ABI-stable.
+    float g_WaterTableHeight;
+    float g_FloodCoverage;
+    float g_WaterRippleStrength;
+    float g_EnvironmentPadding;
 };

@@ -53,6 +53,9 @@ int main() {
     require(near(noon.sunColor.x,1.0f)&&near(noon.sunColor.y,.95f)&&
                 near(noon.sunColor.z,.85f),
             "midday sun colour missed its target");
+    require(near(noon.waterTableHeight,-4.05f)&&noon.floodCoverage==0.0f&&
+                noon.waterRippleStrength==0.0f&&noon.environmentPadding==0.0f,
+            "dry default hydrology did not remain below the rendered pasture");
 
     simulation.state.timeOfDay=6.0f;
     const auto dawn=simulation.update(0.0f);
@@ -104,13 +107,52 @@ int main() {
     weather.update(2.0f);
     require(near(weather.state.wetnessFactor,1.0f-std::exp(-1.0f),2.0e-6f),
             "wetness accumulation does not follow its exact exponential response");
-    require(weather.state.puddleCoverage>0.25f&&weather.state.puddleCoverage<.8f,
-            "puddles did not form gradually from accumulated wetness");
+    require(weather.state.waterTableLevel>0.0f&&
+                weather.state.waterTableLevel<weather.state.wetnessFactor&&
+                weather.state.puddleCoverage==0.0f&&
+                weather.state.floodCoverage==0.0f&&
+                near(weather.state.waterTableHeight,-4.05f)&&
+                weather.state.waterRippleStrength==0.0f,
+            "a short shower bypassed the slower global water-table response");
+    weather.update(60.0f);
+    require(weather.state.waterTableLevel>.5f&&
+                weather.state.waterTableLevel<weather.state.wetnessFactor&&
+                weather.state.puddleCoverage>.4f&&weather.state.puddleCoverage<.8f&&
+                weather.state.floodCoverage>.5f&&weather.state.floodCoverage<1.0f&&
+                weather.state.waterTableHeight>-4.05f&&
+                weather.state.waterTableHeight<-.55f&&
+                near(weather.state.waterRippleStrength,
+                     weather.state.floodCoverage),
+            "sustained rain did not raise the water table and fill eligible basins");
     const float rainWetness=weather.state.wetnessFactor;
+    const float rainWaterTable=weather.state.waterTableLevel;
+    const float rainPuddles=weather.state.puddleCoverage;
     weather.controls.rainIntensity=0.0f;
     weather.update(2.0f);
     require(near(weather.state.wetnessFactor,rainWetness*std::exp(-.2f),2.0e-6f),
             "wet surfaces did not dry exponentially after rain stopped");
+    require(weather.state.waterTableLevel>=rainWaterTable&&
+                weather.state.puddleCoverage>=rainPuddles,
+            "saturated soil stopped recharging the table immediately with the rain");
+    weather.update(1200.0f);
+    require(weather.state.waterTableLevel<.1f&&weather.state.puddleCoverage==0.0f&&
+                weather.state.floodCoverage==0.0f&&
+                near(weather.state.waterTableHeight,-4.05f),
+            "the global water table did not drain after prolonged dry weather");
+
+    dense::EnvironmentSimulation fullFlood;
+    fullFlood.controls.advanceTime=false;
+    fullFlood.controls.rainIntensity=1.0f;
+    fullFlood.state.wetnessFactor=1.0f;
+    fullFlood.state.waterTableLevel=1.0f;
+    const auto floodedFrame=fullFlood.update(0.0f);
+    require(near(floodedFrame.waterTableHeight,-.55f)&&
+                floodedFrame.waterTableHeight<0.0f&&
+                near(floodedFrame.floodCoverage,1.0f)&&
+                near(floodedFrame.waterRippleStrength,1.0f)&&
+                near(floodedFrame.puddleCoverage,
+                     fullFlood.controls.maximumPuddleCoverage),
+            "full saturation did not produce a root-safe contiguous flood level");
 
     dense::EnvironmentSimulation oneStep;
     dense::EnvironmentSimulation tenSteps;
@@ -120,11 +162,17 @@ int main() {
     tenSteps.controls.rainIntensity=.65f;
     oneStep.state.wetnessFactor=.27f;
     tenSteps.state.wetnessFactor=.27f;
+    oneStep.state.waterTableLevel=.45f;
+    tenSteps.state.waterTableLevel=.45f;
     oneStep.triggerLightning(8.0f);
     tenSteps.triggerLightning(8.0f);
     oneStep.update(1.0f);
     for(int i=0;i<10;++i)tenSteps.update(.1f);
     require(near(oneStep.state.wetnessFactor,tenSteps.state.wetnessFactor,2.0e-6f)&&
+                near(oneStep.state.waterTableLevel,
+                     tenSteps.state.waterTableLevel,2.0e-6f)&&
+                near(oneStep.state.puddleCoverage,
+                     tenSteps.state.puddleCoverage,2.0e-6f)&&
                 near(oneStep.state.lightningFlash,tenSteps.state.lightningFlash,2.0e-6f),
             "weather integration depends on frame partitioning");
     require(near(oneStep.state.lightningFlash,8.0f*std::exp(-6.0f),2.0e-6f),
@@ -135,12 +183,17 @@ int main() {
     negativeDelta.controls.rainIntensity=.7f;
     negativeDelta.state.timeOfDay=9.0f;
     negativeDelta.state.wetnessFactor=.4f;
+    negativeDelta.state.waterTableLevel=.35f;
     negativeDelta.triggerLightning();
     const auto beforeNegative=negativeDelta.update(0.0f);
     const auto afterNegative=negativeDelta.update(-10.0f);
     require(near(afterNegative.time,beforeNegative.time)&&
                 near(afterNegative.timeOfDay,beforeNegative.timeOfDay)&&
                 near(afterNegative.wetnessFactor,beforeNegative.wetnessFactor)&&
+                near(negativeDelta.state.waterTableLevel,.35f)&&
+                near(afterNegative.puddleCoverage,beforeNegative.puddleCoverage)&&
+                near(afterNegative.waterTableHeight,beforeNegative.waterTableHeight)&&
+                near(afterNegative.floodCoverage,beforeNegative.floodCoverage)&&
                 near(afterNegative.lightningFlash,beforeNegative.lightningFlash),
             "negative frame delta changed environmental state");
 
@@ -181,7 +234,34 @@ int main() {
     require(std::memcmp(&deterministicA.constants(),&deterministicB.constants(),
                         sizeof(dense::EnvironmentCB))==0,
             "identical environment inputs did not produce identical constants");
+    require(near(deterministicA.state.waterTableLevel,
+                 deterministicB.state.waterTableLevel),
+            "identical weather inputs did not reproduce the CPU water table");
     requireFinite(deterministicA.constants());
+
+    dense::EnvironmentSimulation sanitizedHydrology;
+    sanitizedHydrology.controls.advanceTime=false;
+    sanitizedHydrology.controls.rainIntensity=1.0f;
+    sanitizedHydrology.controls.waterTableRiseRate=
+        std::numeric_limits<float>::infinity();
+    sanitizedHydrology.controls.waterTableDrainRate=
+        std::numeric_limits<float>::quiet_NaN();
+    sanitizedHydrology.controls.waterTableDryHeight=
+        -std::numeric_limits<float>::infinity();
+    sanitizedHydrology.controls.waterTableFloodHeight=
+        std::numeric_limits<float>::quiet_NaN();
+    sanitizedHydrology.state.waterTableLevel=
+        std::numeric_limits<float>::quiet_NaN();
+    const auto sanitizedFrame=sanitizedHydrology.update(1.0f);
+    require(std::isfinite(sanitizedHydrology.state.waterTableLevel)&&
+                sanitizedHydrology.state.waterTableLevel>=0.0f&&
+                sanitizedHydrology.state.waterTableLevel<=1.0f&&
+                std::isfinite(sanitizedFrame.puddleCoverage)&&
+                std::isfinite(sanitizedFrame.waterTableHeight)&&
+                std::isfinite(sanitizedFrame.floodCoverage)&&
+                std::isfinite(sanitizedFrame.waterRippleStrength)&&
+                sanitizedFrame.environmentPadding==0.0f,
+            "invalid hydrology controls escaped normalization");
 
     std::cout << "Environment simulation tests passed\n";
     return EXIT_SUCCESS;
