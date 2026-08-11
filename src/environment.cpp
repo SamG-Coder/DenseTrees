@@ -375,15 +375,66 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
                              static_cast<float>((resolution-1)/2);
         return std::copysign(extent*std::pow(std::abs(centered),1.78f),centered);
     };
+    // Hydrology is solved once on the CPU.  A location can retain standing
+    // water only when every sampled escape direction crosses a higher rim.
+    // This spill-depth test rejects convex hilltops even when their immediate
+    // surface is flat, while multi-scale concavity captures shallow meadow
+    // depressions.  Suitability is stored in vertex-colour alpha (RGB remains
+    // visible colour), adding no vertex stride or per-ray terrain probes.
+    const size_t terrainVertexCount=static_cast<size_t>(resolution)*resolution;
+    std::vector<float> gridCoordinates(resolution),heightGrid(terrainVertexCount),
+                       waterRetention(terrainVertexCount);
+    std::vector<Vec3> normalGrid(terrainVertexCount);
+    for(int coordinate=0;coordinate<resolution;++coordinate)
+        gridCoordinates[coordinate]=gridCoordinate(coordinate);
+    const auto gridIndex=[&](int x,int z){return static_cast<size_t>(z)*resolution+x;};
+    for(int z=0;z<resolution;++z)for(int x=0;x<resolution;++x) {
+        const size_t index=gridIndex(x,z);
+        const float worldX=gridCoordinates[x],worldZ=gridCoordinates[z];
+        heightGrid[index]=terrainHeight(worldX,worldZ);
+        normalGrid[index]=terrainNormal(worldX,worldZ);
+    }
+    for(int z=0;z<resolution;++z)for(int x=0;x<resolution;++x) {
+        const size_t index=gridIndex(x,z);const Vec3 normal=normalGrid[index];
+        const float worldX=gridCoordinates[x],worldZ=gridCoordinates[z];
+        if(std::sqrt(worldX*worldX+worldZ*worldZ)>grassHalfExtent){
+            waterRetention[index]=0;continue;
+        }
+        const float height=heightGrid[index];float minimumRim=std::numeric_limits<float>::max();
+        float meanSix=0,meanSixteen=0;
+        for(int direction=0;direction<8;++direction) {
+            const float angle=2*pi*direction/8.0f,dx=std::cos(angle),dz=std::sin(angle);
+            const float heightThree=terrainHeight(worldX+dx*3.0f,worldZ+dz*3.0f);
+            const float heightSix=terrainHeight(worldX+dx*6.0f,worldZ+dz*6.0f);
+            const float heightTen=terrainHeight(worldX+dx*10.0f,worldZ+dz*10.0f);
+            const float heightSixteen=terrainHeight(worldX+dx*16.0f,worldZ+dz*16.0f);
+            minimumRim=std::min(minimumRim,std::max({height,heightThree,heightSix,
+                                                     heightTen,heightSixteen}));
+            meanSix+=heightSix;meanSixteen+=heightSixteen;
+        }
+        meanSix*=.125f;meanSixteen*=.125f;
+        const float spillDepth=std::max(0.0f,minimumRim-height);
+        const float sixMetrePosition=meanSix-height;
+        const float sixteenMetrePosition=meanSixteen-height;
+        const float flat=smoothStep(.990268f,.997564f,normal.y);
+        const float depth=smoothStep(.008f,.12f,spillDepth);
+        const float concavity=std::max(smoothStep(.01f,.10f,sixMetrePosition),
+            .75f*smoothStep(.04f,.32f,sixteenMetrePosition));
+        const float notRidge=1-smoothStep(.02f,.18f,
+                                          std::max(0.0f,-sixteenMetrePosition));
+        waterRetention[index]=clamp(flat*depth*(.65f+.35f*concavity)*notRidge,0.0f,1.0f);
+    }
     for(int z=0;z<resolution;++z) {
-        const float worldZ=gridCoordinate(z);
+        const float worldZ=gridCoordinates[z];
         for(int x=0;x<resolution;++x) {
-            const float worldX=gridCoordinate(x);
-            const float y=terrainHeight(worldX,worldZ);
-            const Vec3 normal=terrainNormal(worldX,worldZ);
+            const float worldX=gridCoordinates[x];const size_t index=gridIndex(x,z);
+            const float y=heightGrid[index];const Vec3 normal=normalGrid[index];
             const float variation=.5f+.5f*std::sin(worldX*.071f+worldZ*.053f);
-            const uint32_t color=packColor(.20f+.035f*variation,.315f+.045f*variation,
-                                           .135f+.022f*variation);
+            uint32_t color=packColor(.20f+.035f*variation,.315f+.045f*variation,
+                                     .135f+.022f*variation);
+            const uint32_t retentionByte=static_cast<uint32_t>(
+                clamp(waterRetention[index]*255.0f+0.5f,0.0f,255.0f));
+            color=(color&0x00ffffffu)|(retentionByte<<24);
             mesh.terrainVertices.push_back({{worldX,y,worldZ},normal,color,2.0f,
                                             worldX*.08f,worldZ*.08f});
             mesh.minimumHeight=std::min(mesh.minimumHeight,y);

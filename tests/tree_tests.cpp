@@ -131,6 +131,48 @@ int main() {
                 "terrain normal is not unit length or points below the landscape");
         require(vertex.material==2.0f,"terrain material routing changed");
     }
+    size_t hydrologyRegion=0,hydrologyEligible=0,flatLocalMinima=0,
+           selectedFlatLocalMinima=0;
+    constexpr float cosEightDegrees=.990268f,cosFourDegrees=.997564f;
+    const auto retention=[](const dense::MeshVertex& vertex){
+        return static_cast<float>((vertex.color>>24)&255u)/255.0f;
+    };
+    for(size_t z=0;z<terrainSide;++z)for(size_t x=0;x<terrainSide;++x){
+        const size_t index=z*terrainSide+x;
+        const auto&vertex=environment.terrainVertices[index];
+        require(((vertex.color>>24)&255u)==
+                    ((environmentCopy.terrainVertices[index].color>>24)&255u),
+                "terrain runoff bake is not deterministic");
+        const float radius=std::sqrt(vertex.position.x*vertex.position.x+
+                                     vertex.position.z*vertex.position.z);
+        const float suitability=retention(vertex);
+        if(radius<6.0f)require(suitability==0,
+                              "oak-base hill retained standing puddle water");
+        if(vertex.normal.y<=cosEightDegrees)
+            require(suitability==0,"terrain runoff bake admitted an eight-degree slope");
+        if(radius>dense::EnvironmentGenerator::grassHalfExtent)continue;
+        ++hydrologyRegion;hydrologyEligible+=suitability>0;
+        if(x==0||z==0||x+1==terrainSide||z+1==terrainSide)continue;
+        bool strictMinimum=true,strictMaximum=true;
+        for(int dz=-1;dz<=1;++dz)for(int dx=-1;dx<=1;++dx){
+            if(dx==0&&dz==0)continue;
+            const float neighbour=environment.terrainVertices[
+                static_cast<size_t>(static_cast<int>(z)+dz)*terrainSide+
+                static_cast<size_t>(static_cast<int>(x)+dx)].position.y;
+            strictMinimum&=vertex.position.y<neighbour;
+            strictMaximum&=vertex.position.y>neighbour;
+        }
+        if(strictMaximum)require(suitability==0,
+                                "convex terrain maximum retained puddle water");
+        if(strictMinimum&&vertex.normal.y>=cosFourDegrees){
+            ++flatLocalMinima;selectedFlatLocalMinima+=suitability>.15f;
+        }
+    }
+    require(hydrologyEligible>hydrologyRegion*2/100&&
+                hydrologyEligible<hydrologyRegion*15/100,
+            "runoff bake selected an implausible fraction of the near terrain");
+    require(flatLocalMinima>0&&selectedFlatLocalMinima==flatLocalMinima,
+            "runoff bake failed to retain water in flat local depressions");
     validateTriangles(environment.terrainVertices,environment.terrainIndices,"hill terrain");
     uint32_t decodedTallPatches=0;
     for(size_t i=0;i<environment.grassPatches.size();++i){

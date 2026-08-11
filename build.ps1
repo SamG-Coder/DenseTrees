@@ -14,6 +14,8 @@ if ($LASTEXITCODE -ne 0) { throw 'DXR shader compilation failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Grass overlay vertex shader compilation failed.' }
 & $dxc -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo 'build\shaders\grass_overlay_ps.dxil' 'shaders\grass_overlay.hlsl'
 if ($LASTEXITCODE -ne 0) { throw 'Grass overlay pixel shader compilation failed.' }
+& $dxc -T cs_6_6 -E TreeWindCS -HV 2021 -O3 -Fo 'build\shaders\tree_wind.dxil' 'shaders\tree_wind.hlsl'
+if ($LASTEXITCODE -ne 0) { throw 'Tree wind compute shader compilation failed.' }
 & $cmake -S . -B build -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" "-DCMAKE_CXX_COMPILER=$compiler" -DCMAKE_BUILD_TYPE=Release
 if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
 & $cmake --build build --parallel

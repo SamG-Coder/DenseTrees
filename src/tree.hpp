@@ -1,6 +1,7 @@
 #pragma once
 
 #include "math.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -59,6 +60,10 @@ struct BranchNode {
 };
 
 struct MeshVertex { Vec3 position; Vec3 normal; uint32_t color; float material = 0.0f; float u = 0.0f; float v = 0.0f; };
+static_assert(sizeof(MeshVertex)==40,"MeshVertex must match the HLSL structured-buffer ABI");
+static_assert(offsetof(MeshVertex,color)==24&&offsetof(MeshVertex,material)==28&&
+              offsetof(MeshVertex,u)==32&&offsetof(MeshVertex,v)==36,
+              "MeshVertex field offsets must match the HLSL structured-buffer ABI");
 struct TreeMesh {
     std::vector<MeshVertex> branchVertices;
     std::vector<uint32_t> branchIndices;

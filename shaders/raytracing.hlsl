@@ -7,7 +7,7 @@ struct Camera {
     float3 right; uint frameIndex;
     float3 up; uint maxFrames;
     float exposure; float3 padding0;
-    uint2 resolution; float2 padding1;
+    uint2 resolution; uint environmentIndexOffset; float padding1;
     float4 grassSettings;
     float4 groundSettings;
 };
@@ -41,6 +41,7 @@ ConstantBuffer<Camera> camera : register(b0);
 
 float3 srgbToLinear(float3 c) { c=saturate(c);return lerp(c/12.92,pow((c+.055)/1.055,2.4),step(.04045,c)); }
 float3 unpackColor(uint packed) { return float3(packed&255,(packed>>8)&255,(packed>>16)&255)/255.0; }
+float unpackAlpha(uint packed) { return float((packed>>24)&255)/255.0; }
 float3 linearToSrgb(float3 c) { c=max(c,0);return lerp(12.92*c,1.055*pow(c,1.0/2.4)-.055,step(.0031308,c)); }
 float3 tonemap(float3 x) { return saturate((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14)); }
 float3 colorGrade(float3 c) {
@@ -235,9 +236,28 @@ float3 applyAerialPerspective(float3 radiance,float3 rayOrigin,float3 hit,
 }
 
 float rainStreakMask(uint2 pixel) {
-    float2 p=float2(pixel);
-    p.x+=p.y*g_WindDirection.x*.18;
-    p.y+=g_Time*lerp(620.0,1280.0,g_RainIntensity);
+    // Build precipitation velocity in world space first.  Its vertical
+    // component is explicitly negative, so horizontal wind can never make
+    // rain rise.  Project that velocity into the camera plane; pixel Y grows
+    // downwards, hence the minus sign on camera.up.
+    float fallSpeed=lerp(7.0,10.0,saturate(g_RainIntensity));
+    float driftSpeed=min(g_WindSpeed*g_WindStrength,12.0);
+    float3 velocityWorld=float3(g_WindDirection.x*driftSpeed,-fallSpeed,
+                                g_WindDirection.y*driftSpeed);
+    float2 velocityPixels=float2(dot(velocityWorld,camera.right),
+                                -dot(velocityWorld,camera.up));
+    // Keep rainfall visibly downward even at extreme orbit angles.  The
+    // horizontal component still carries the full projected wind drift.
+    velocityPixels.y=max(velocityPixels.y,fallSpeed*.18);
+    float pixelsPerMetre=camera.resolution.y/
+        (2.0*max(camera.tanHalfFov,1e-3)*8.0);
+    velocityPixels*=pixelsPerMetre;
+    float speed=max(length(velocityPixels),1.0);
+    float2 along=velocityPixels/speed;
+    float2 across=float2(along.y,-along.x);
+    float2 pixelCenter=float2(pixel)+.5;
+    float2 p=float2(dot(pixelCenter,across),dot(pixelCenter,along));
+    p.y-=g_Time*speed;
     float2 cell=floor(p/float2(7.0,46.0));
     float2 local=frac(p/float2(7.0,46.0));
     float seed=hash(cell+float2(37,91));
@@ -550,7 +570,10 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
 [shader("closesthit")]
 void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAttributes attr) {
     if(payload.depth==0)payload.primaryT=RayTCurrent();
-    uint primitive=PrimitiveIndex();uint i0=Indices[primitive*3],i1=Indices[primitive*3+1],i2=Indices[primitive*3+2];
+    uint primitive=PrimitiveIndex();
+    uint indexBase=InstanceID()==0u?0u:camera.environmentIndexOffset;
+    uint i0=Indices[indexBase+primitive*3],i1=Indices[indexBase+primitive*3+1],
+         i2=Indices[indexBase+primitive*3+2];
     float3 bary=float3(1-attr.barycentrics.x-attr.barycentrics.y,attr.barycentrics.x,attr.barycentrics.y);
     Vertex a=Vertices[i0],b=Vertices[i1],c=Vertices[i2];float3 geometricNormal=normalize(a.normal*bary.x+b.normal*bary.y+c.normal*bary.z);bool upperFace=dot(geometricNormal,WorldRayDirection())<0;float3 surfaceNormal=upperFace?geometricNormal:-geometricNormal;float3 n=surfaceNormal;float2 uv=a.uv*bary.x+b.uv*bary.y+c.uv*bary.z;
     float3 hit=WorldRayOrigin()+WorldRayDirection()*RayTCurrent();float3 albedo=srgbToLinear(unpackColor(a.color)*bary.x+unpackColor(b.color)*bary.y+unpackColor(c.color)*bary.z);
@@ -568,6 +591,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         }
     }
     float terrainMoisture=.5,terrainCavity=0,terrainRoughness=.9,puddleMask=0;
+    float terrainRetention=0,terrainSlope=0;
     float materialRoughness=kind<.5?.74:(kind<1.5?.40:(kind<2.5?.90:
                             (kind<3.5?.67:(kind<4.5?.48:.72))));
     if(kind>1.5&&kind<2.5){
@@ -580,6 +604,9 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float patch=filteredFbmWorld(hit.xz+float2(-11.4,63.2),.140,footprint);
         float fine=filteredValueNoise(hit.xz+float2(7.7,21.3),2.3,fineFootprint);
         float slope=1-saturate(surfaceNormal.y),rootDistance=length(hit.xz);
+        terrainSlope=length(surfaceNormal.xz)/max(surfaceNormal.y,.05);
+        terrainRetention=unpackAlpha(a.color)*bary.x+unpackAlpha(b.color)*bary.y+
+                         unpackAlpha(c.color)*bary.z;
         terrainMoisture=saturate(.10+.58*broad+.32*patch-.45*slope);
         float lushMask=smoothstep(.42,.72,terrainMoisture);
         float dryDriver=.65*(1-broad)+.35*patch;
@@ -667,15 +694,23 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             n=normalize(n+float3(-dx*.035,0,-dz*.035));
         }
         if(g_PuddleCoverage>.001){
-            float puddleNoise=filteredFbmWorld(hit.xz+float2(91.7,-53.4),.052,footprint);
-            float puddleThreshold=lerp(.94,.43,saturate(g_PuddleCoverage));
-            float basin=smoothstep(puddleThreshold,puddleThreshold+.085,puddleNoise);
-            float flatSurface=smoothstep(.85,.985,surfaceNormal.y);
-            // Coverage is already the CPU-derived result of accumulated
-            // wetness; applying wetness again delayed puddles twice.
-            puddleMask=basin*flatSurface;
-            n=normalize(lerp(n,float3(0,1,0),puddleMask));
-            terrainRoughness=lerp(terrainRoughness,.001,puddleMask);
+            float flatSurface=smoothstep(.990268,.997564,surfaceNormal.y);
+            float drainageSuitability=saturate(terrainRetention)*flatSurface;
+            if(drainageSuitability>.001){
+                // Hydrology selects real depressions.  Noise only breaks up
+                // the shoreline; it can no longer create water on a hill.
+                float puddleNoise=filteredFbmWorld(hit.xz+float2(91.7,-53.4),
+                                                    .052,footprint);
+                float puddleThreshold=lerp(1.08,.20,saturate(g_PuddleCoverage));
+                float puddleDriver=drainageSuitability+(puddleNoise-.49)*.12;
+                float basin=smoothstep(puddleThreshold,puddleThreshold+.07,
+                                       puddleDriver);
+                // Coverage is already the CPU-derived result of accumulated
+                // wetness; applying wetness again delayed puddles twice.
+                puddleMask=basin*flatSurface;
+                n=normalize(lerp(n,float3(0,1,0),puddleMask));
+                terrainRoughness=lerp(terrainRoughness,.001,puddleMask);
+            }
         }
         materialRoughness=terrainRoughness;
     }
@@ -700,15 +735,22 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
                    (kind<3.5?.88:(kind<4.5?.62:.46))));
     float rainExposure=lerp(.56,1.0,saturate(surfaceNormal.y));
     float wetness=saturate(g_WetnessFactor*wetScale*rainExposure);
+    if(kind>1.5&&kind<2.5){
+        // A thin film remains after rain, but exposed slopes drain faster and
+        // concave catchments stay saturated longer.
+        float slopeRunoff=1-smoothstep(.035,.32,terrainSlope);
+        wetness=saturate(wetness*lerp(.58,1.14,
+            saturate(.65*terrainRetention+.35*slopeRunoff)));
+    }
     wetness=max(wetness,puddleMask);
     albedo*=lerp(1.0,.55,wetness);
     materialRoughness=lerp(materialRoughness,.02,wetness);
     materialRoughness=lerp(materialRoughness,.001,puddleMask);
 
-    // Static triangle foliage stays in the immutable BLAS.  Animate its
-    // micro-normal coherently instead of rebuilding hundreds of thousands of
-    // triangles every frame; raster grass still receives full deformation.
-    if(thinFoliage&&g_WindStrength>.001){
+    // Environment foliage remains in the immutable BLAS, so it receives a
+    // small shading flutter.  Instance 0 is the physically deformed oak and
+    // must not receive this second, unrelated normal bend.
+    if(InstanceID()!=0u&&thinFoliage&&g_WindSpeed>.001&&g_WindStrength>.001){
         float2 windUV=hit.xz*.05+g_WindDirection*(g_Time*g_WindSpeed*.20);
         float gust=sin(dot(windUV,float2(2.17,1.31))+g_Time*g_WindGustFrequency)+
                    .45*sin(dot(windUV,float2(-4.13,3.27))+g_Time*g_WindSpeed*2.1);
@@ -761,7 +803,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         unmodulated+=lightningRadiance()*fresnel*wetness*.18;
     }
     float3 result=albedo*(ambient+direct)+unmodulated;
-    if(payload.depth==0&&puddleMask>.01){
+    if(payload.depth==0&&puddleMask>.05){
         float3 viewDirection=normalize(camera.eye-hit);
         float waterFresnel=.02+.98*pow(1-saturate(dot(n,viewDirection)),5);
         RadiancePayload reflection;reflection.color=0;reflection.depth=1;

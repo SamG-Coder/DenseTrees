@@ -183,7 +183,8 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
 float3 grassWindDirection(BladeData blade) {
     float2 baseDirection=normalize(g_WindDirection);
     float2 windUV=blade.base.xz*.05+baseDirection*(g_Time*g_WindSpeed*.20);
-    float directionWave=.16*sin(dot(windUV,float2(1.31,-.87))+g_Time*.19);
+    float directionWave=.16*sin(dot(windUV,float2(1.31,-.87))+
+                                g_Time*.19*saturate(g_WindSpeed));
     float2 rotated=float2(baseDirection.x-directionWave*baseDirection.y,
                           baseDirection.y+directionWave*baseDirection.x);
     float3 wind=normalize(float3(rotated.x,0,rotated.y));
