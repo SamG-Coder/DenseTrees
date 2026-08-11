@@ -43,8 +43,11 @@ struct EnvironmentMesh {
 class EnvironmentGenerator {
 public:
     static constexpr int terrainResolution = 257;
-    static constexpr float terrainHalfExtent = 480.0f;
-    static constexpr float grassHalfExtent = 24.0f;
+    static constexpr float terrainHalfExtent = 1600.0f;
+    // Covers the complete 30 m camera orbit plus the 192 m debug range.
+    // Visible blades are instanced by the raster overlay, so this broader
+    // field no longer bloats the ray-tracing acceleration structure.
+    static constexpr float grassHalfExtent = 224.0f;
 
     static float terrainHeight(float x, float z);
     static Vec3 terrainNormal(float x, float z);

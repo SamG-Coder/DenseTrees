@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(densetrees_core
     src/environment.cpp
+    src/ground_texture.cpp
     src/tree.cpp
 )
 target_include_directories(densetrees_core PUBLIC src)
@@ -19,7 +20,7 @@ add_executable(DenseTrees WIN32
     src/dxr_renderer.cpp
 )
 target_link_libraries(DenseTrees PRIVATE
-    densetrees_core d3d11 d3d12 dxgi d3dcompiler user32 gdi32 shell32
+    densetrees_core d3d11 d3d12 dxgi d3dcompiler user32 gdi32 shell32 comctl32
 )
 target_compile_definitions(DenseTrees PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(DenseTrees PRIVATE -Wall -Wextra -Wpedantic)

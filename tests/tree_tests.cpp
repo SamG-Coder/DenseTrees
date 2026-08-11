@@ -1,4 +1,5 @@
 #include "environment.hpp"
+#include "ground_texture.hpp"
 #include "tree.hpp"
 
 #include <algorithm>
@@ -57,6 +58,46 @@ void validateTriangles(const std::vector<dense::MeshVertex>& vertices,
 } // namespace
 
 int main() {
+    {
+    const auto groundAtlas=dense::makeGroundTextureAtlas(0x1234abcdu);
+    require(groundAtlas.albedoRoughness.size()==dense::GroundTextureAtlas::tileSafeMipCount&&
+                groundAtlas.normalHeightCavity.size()==dense::GroundTextureAtlas::tileSafeMipCount,
+            "runtime ground material mip inventory is incomplete");
+    uint32_t expectedAtlasSize=dense::GroundTextureAtlas::atlasWidth;
+    for(size_t level=0;level<groundAtlas.albedoRoughness.size();++level){
+        const auto&albedoMip=groundAtlas.albedoRoughness[level];
+        const auto&normalMip=groundAtlas.normalHeightCavity[level];
+        require(albedoMip.width==expectedAtlasSize&&albedoMip.height==expectedAtlasSize&&
+                    normalMip.width==expectedAtlasSize&&normalMip.height==expectedAtlasSize&&
+                    albedoMip.pixels.size()==static_cast<size_t>(expectedAtlasSize)*expectedAtlasSize&&
+                    normalMip.pixels.size()==static_cast<size_t>(expectedAtlasSize)*expectedAtlasSize,
+                "runtime ground material mip dimensions are invalid");
+        const size_t stride=std::max<size_t>(1,normalMip.pixels.size()/257);
+        for(size_t sample=0;sample<normalMip.pixels.size();sample+=stride){
+            const uint32_t packed=normalMip.pixels[sample];
+            const float nx=((packed&255u)/255.0f)*2-1;
+            const float ny=(((packed>>8)&255u)/255.0f)*2-1;
+            require(nx*nx+ny*ny<=1.02f,
+                    "runtime ground normal contains a non-reconstructable tangent vector");
+        }
+        expectedAtlasSize=std::max(2u,expectedAtlasSize/2);
+    }
+    const auto&coarsestGround=groundAtlas.albedoRoughness.back();
+    require(coarsestGround.width==2&&coarsestGround.height==2&&
+                coarsestGround.pixels[0]!=coarsestGround.pixels[1]&&
+                coarsestGround.pixels[0]!=coarsestGround.pixels[2]&&
+                coarsestGround.pixels[2]!=coarsestGround.pixels[3],
+            "runtime ground atlas bled distinct materials together at its coarsest mip");
+    const auto repeatedGroundAtlas=dense::makeGroundTextureAtlas(0x1234abcdu);
+    for(size_t level=0;level<groundAtlas.albedoRoughness.size();++level){
+        const auto&first=groundAtlas.albedoRoughness[level].pixels;
+        const auto&second=repeatedGroundAtlas.albedoRoughness[level].pixels;
+        require(first.front()==second.front()&&first[first.size()/2]==second[second.size()/2]&&
+                    first.back()==second.back(),
+                "runtime ground material generation is not deterministic");
+    }
+    }
+
     dense::EnvironmentGenerator environmentGenerator;
     const auto environment = environmentGenerator.build(0x1234abcdu);
     const auto environmentCopy = environmentGenerator.build(0x1234abcdu);
@@ -65,8 +106,10 @@ int main() {
             "hill terrain vertex inventory changed unexpectedly");
     require(environment.terrainIndices.size()==(terrainSide-1)*(terrainSide-1)*6,
             "hill terrain index inventory changed unexpectedly");
-    require(environment.grassPatches.size()>=9000&&environment.grassPatches.size()<=18000,
+    require(environment.grassPatches.size()>=400000&&environment.grassPatches.size()<=520000,
             "procedural grass patch inventory escaped its performance budget");
+    require(dense::EnvironmentGenerator::grassHalfExtent>=222.0f,
+            "grass field no longer covers the camera orbit plus maximum long-grass range");
     require(environment.grassPatches.size()==environmentCopy.grassPatches.size(),
             "same environment seed did not reproduce its grass inventory");
     require(environment.detailVertices.size()==environmentCopy.detailVertices.size()&&
@@ -79,7 +122,7 @@ int main() {
             require(std::abs(dense::EnvironmentGenerator::terrainHeight(x,z))<1.0e-5f,
                     "terrain intruded into the oak root-clearance zone");
     require(environment.minimumHeight<-2.6f&&environment.minimumHeight>-4.4f&&
-                environment.maximumHeight>5.0f&&environment.maximumHeight<14.5f,
+                environment.maximumHeight>55.0f&&environment.maximumHeight<155.0f,
             "hill-and-mountain terrain height envelope is implausible");
     for(const auto& vertex:environment.terrainVertices){
         require(finite(vertex.position)&&finite(vertex.normal),
@@ -103,9 +146,9 @@ int main() {
         const uint32_t tallCount=(patch.packed>>16)&255u,tallCode=(patch.packed>>24)&255u;
         const bool tall=tallCount!=0;
         if(tall)++decodedTallPatches;
-        require(blades>=10&&blades<=15&&shortCode>=24&&shortCode<=90,
+        require(blades>=28&&blades<=34&&shortCode>=9&&shortCode<=34,
                 "grass candidate count or short height left the meadow range");
-        require(tall?(tallCount>=3&&tallCount<=5&&tallCount<blades&&tallCode>=90&&
+        require(tall?(tallCount>=18&&tallCount<=24&&tallCount<blades&&tallCode>=90&&
                        tallCode<=255&&tallCode>shortCode):(tallCode==0),
                 "clustered long-grass encoding is invalid");
         const float normalY=std::sqrt(std::max(0.0f,1-patch.normalX*patch.normalX-
@@ -121,22 +164,23 @@ int main() {
     }
     require(decodedTallPatches==environment.tallGrassPatchCount,
             "long-grass summary does not match the packed patch data");
-    require(environment.tallGrassPatchCount>600&&
-                environment.tallGrassPatchCount<environment.grassPatches.size()/2,
+    require(environment.tallGrassPatchCount>environment.grassPatches.size()/2&&
+                environment.tallGrassPatchCount<environment.grassPatches.size()*3/4,
             "clustered long grass is absent or overwhelms the short meadow");
     require(environment.rockCount>=30&&environment.rockCount<=90,
             "rock families escaped their ecological inventory");
-    require(environment.shrubCount>=20&&environment.shrubCount<=110,
+    require(environment.shrubCount>=14&&environment.shrubCount<=24,
             "near/background shrub inventory is implausible");
-    require(environment.backgroundTreeCount>=120&&environment.backgroundTreeCount<=155,
-            "background forest inventory escaped its proxy budget");
+    require(environment.backgroundTreeCount>=17&&environment.backgroundTreeCount<=22,
+            "sparse pasture-tree inventory escaped its proxy budget");
     require(!environment.detailVertices.empty()&&environment.detailIndices.size()/3<100000,
             "scene dressing is empty or exceeded its static triangle budget");
     for(const auto& vertex:environment.detailVertices){
         require(finite(vertex.position)&&finite(vertex.normal)&&
                     std::abs(dense::length(vertex.normal)-1.0f)<.004f,
                 "scene dressing emitted a non-finite or non-unit vertex");
-        require(vertex.material==3.0f||(vertex.material>=4.0f&&vertex.material<4.3f)||
+        require((vertex.material>=3.0f&&vertex.material<3.3f)||
+                    (vertex.material>=4.0f&&vertex.material<4.3f)||
                     vertex.material==5.0f,
                 "scene dressing lost its rock, foliage, or wood material route");
     }
@@ -144,10 +188,10 @@ int main() {
     int mountainSectors=0;
     for(int sector=0;sector<24;++sector){
         const float angle=2*dense::pi*(sector+.5f)/24;float peak=-100;
-        for(float radius=58;radius<=112;radius+=2)
+        for(float radius=920;radius<=1480;radius+=8)
             peak=std::max(peak,dense::EnvironmentGenerator::terrainHeight(
                                    std::cos(angle)*radius,std::sin(angle)*radius));
-        if(peak>3.0f)++mountainSectors;
+        if(peak>48.0f)++mountainSectors;
     }
     require(mountainSectors>=18,"distant mountain range has large missing angular sectors");
 

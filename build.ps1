@@ -10,6 +10,10 @@ if (-not $dxc) { throw 'DirectX Shader Compiler is missing. Install Microsoft.Di
 New-Item -ItemType Directory -Force -Path 'build\shaders' | Out-Null
 & $dxc -T lib_6_6 -HV 2021 -O3 -Fo 'build\shaders\raytracing.dxil' 'shaders\raytracing.hlsl'
 if ($LASTEXITCODE -ne 0) { throw 'DXR shader compilation failed.' }
+& $dxc -T vs_6_6 -E VSMain -HV 2021 -O3 -Fo 'build\shaders\grass_overlay_vs.dxil' 'shaders\grass_overlay.hlsl'
+if ($LASTEXITCODE -ne 0) { throw 'Grass overlay vertex shader compilation failed.' }
+& $dxc -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo 'build\shaders\grass_overlay_ps.dxil' 'shaders\grass_overlay.hlsl'
+if ($LASTEXITCODE -ne 0) { throw 'Grass overlay pixel shader compilation failed.' }
 & $cmake -S . -B build -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" "-DCMAKE_CXX_COMPILER=$compiler" -DCMAKE_BUILD_TYPE=Release
 if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
 & $cmake --build build --parallel

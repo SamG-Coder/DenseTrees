@@ -7,8 +7,10 @@ struct Camera {
     float3 sunDirection; float exposure;
     uint2 resolution; float timeSeconds; float windStrength;
     float4 atmosphere;
+    float4 grassSettings;
+    float4 groundSettings;
 };
-struct RadiancePayload { float3 color; uint depth; };
+struct RadiancePayload { float3 color; uint depth; float primaryT; };
 struct VisibilityPayload { uint visible; };
 struct GrassPatch {
     float minX, minY, minZ;
@@ -23,14 +25,24 @@ StructuredBuffer<Vertex> Vertices : register(t1);
 StructuredBuffer<uint> Indices : register(t2);
 Texture2D<float4> BarkNormal : register(t3);
 StructuredBuffer<GrassPatch> GrassPatches : register(t4);
+Texture2DArray<float4> GroundAlbedoRoughness : register(t5);
+Texture2DArray<float4> GroundNormalHeightCavity : register(t6);
+SamplerState GroundSampler : register(s0);
 RWTexture2D<float4> Output : register(u0);
 RWTexture2D<float4> Accumulation : register(u1);
 ConstantBuffer<Camera> camera : register(b0);
 
-float3 srgbToLinear(float3 c) { return pow(c, 2.2); }
+float3 srgbToLinear(float3 c) { c=saturate(c);return lerp(c/12.92,pow((c+.055)/1.055,2.4),step(.04045,c)); }
 float3 unpackColor(uint packed) { return float3(packed&255,(packed>>8)&255,(packed>>16)&255)/255.0; }
-float3 linearToSrgb(float3 c) { return pow(saturate(c), 1.0 / 2.2); }
+float3 linearToSrgb(float3 c) { c=max(c,0);return lerp(12.92*c,1.055*pow(c,1.0/2.4)-.055,step(.0031308,c)); }
 float3 tonemap(float3 x) { return saturate((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14)); }
+float3 colorGrade(float3 c) {
+    float luminance=dot(c,float3(.2126,.7152,.0722));
+    c=lerp(luminance.xxx,c,1.055);
+    c=(c-.18)*1.015+.18;
+    c=pow(saturate(c),.985)*float3(1.006,1.0,.992);
+    return saturate(c);
+}
 float hash(float2 p) { float3 p3=frac(float3(p.xyx)*.1031);p3+=dot(p3,p3.yzx+33.33);return frac((p3.x+p3.y)*p3.z); }
 uint hashUint(uint x) { x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x; }
 float randomUint(uint x) { return float(hashUint(x)&0x00ffffffu)*(1.0/16777216.0); }
@@ -89,6 +101,14 @@ float4 sampleBarkMip(float2 uv,uint mip) {
     return lerp(low,high,blend.y);
 }
 float4 sampleBarkNormal(float2 uv,float requestedMip) { float lod=clamp(requestedMip,0.0,11.0);uint low=(uint)floor(lod),high=min(low+1,11u);return lerp(sampleBarkMip(uv,low),sampleBarkMip(uv,high),frac(lod)); }
+float4 sampleGroundAlbedo(float2 uv,uint tile,float requestedMip) {
+    return GroundAlbedoRoughness.SampleLevel(GroundSampler,float3(uv,float(tile)),
+                                             clamp(requestedMip,0.0,10.0));
+}
+float4 sampleGroundNormal(float2 uv,uint tile,float requestedMip) {
+    return GroundNormalHeightCavity.SampleLevel(GroundSampler,float3(uv,float(tile)),
+                                                clamp(requestedMip,0.0,10.0));
+}
 float3 cosineHemisphere(float3 n,float2 random) {
     float phi=6.2831853*random.x,r=sqrt(random.y);float3 helper=abs(n.y)<.9?float3(0,1,0):float3(1,0,0);float3 tangent=normalize(cross(helper,n)),bitangent=cross(n,tangent);
     return normalize(tangent*(r*cos(phi))+bitangent*(r*sin(phi))+n*sqrt(1-random.y));
@@ -128,20 +148,49 @@ float3 environmentRadiance(float3 direction) {
     if(d.y<0)color=lerp(float3(.13,.17,.14),color,saturate(1+d.y*7.0));
     return max(color,0);
 }
+float3 clearSkyAirlight(float3 direction) {
+    float3 d=normalize(direction);float up=saturate(d.y),sunHeight=saturate(directionToSun().y);
+    float3 horizon=lerp(float3(.32,.39,.47),float3(.34,.52,.69),sunHeight);
+    float3 zenith=lerp(float3(.055,.075,.16),float3(.035,.16,.43),sunHeight);
+    return lerp(horizon,zenith,pow(up,.58));
+}
+float3 applyAerialPerspective(float3 radiance,float3 hit,float3 rayDirection) {
+    float distanceToHit=distance(camera.eye,hit);
+    float eyeDensity=exp(-max(camera.eye.y,0.0)/120.0);
+    float hitDensity=exp(-max(hit.y,0.0)/120.0);
+    float transmittance=exp(-camera.atmosphere.w*distanceToHit*.5*(eyeDensity+hitDensity));
+    return radiance*transmittance+clearSkyAirlight(rayDirection)*(1-transmittance);
+}
 
 [shader("raygeneration")]
 void RayGen() {
-    uint2 pixel=DispatchRaysIndex().xy;float2 jitter=0;
-    if(camera.maxFrames>1u)jitter=float2(hash(pixel+camera.frameIndex*17),hash(pixel.yx+camera.frameIndex*31))-.5;
-    float2 uv=((float2(pixel)+.5+jitter)/float2(camera.resolution))*2-1;uv.y=-uv.y;
-    RayDesc ray;ray.Origin=camera.eye;ray.Direction=normalize(camera.forward+camera.right*uv.x*camera.aspect*camera.tanHalfFov+camera.up*uv.y*camera.tanHalfFov);ray.TMin=.02;ray.TMax=1000;
-    RadiancePayload payload;payload.color=0;payload.depth=0;TraceRay(Scene,RAY_FLAG_NONE,0x3,0,0,0,ray,payload);
-    float4 previous=Accumulation[pixel];float history=min(float(camera.frameIndex),float(max(camera.maxFrames,1u)-1u));float3 accumulated=(previous.rgb*history+payload.color)/(history+1);
-    Accumulation[pixel]=float4(accumulated,1);Output[pixel]=float4(linearToSrgb(tonemap(accumulated*camera.exposure)),1);
+    uint2 pixel=DispatchRaysIndex().xy;
+    // Grass is composited by the instanced raster pass.  A single primary
+    // sample keeps the path tracer from paying twice for animated geometry;
+    // static frames still converge through the accumulation buffer.
+    uint spatialSamples=1u;float3 frameColor=0;float sceneDepth=2200.0;
+    [loop] for(uint sampleIndex=0;sampleIndex<spatialSamples;++sampleIndex){
+        float2 jitter;
+        if(camera.maxFrames>1u)jitter=float2(hash(pixel+camera.frameIndex*17),hash(pixel.yx+camera.frameIndex*31))-.5;
+        else jitter=0;
+        float2 uv=((float2(pixel)+.5+jitter)/float2(camera.resolution))*2-1;uv.y=-uv.y;
+        RayDesc ray;ray.Origin=camera.eye;ray.Direction=normalize(camera.forward+camera.right*uv.x*camera.aspect*camera.tanHalfFov+camera.up*uv.y*camera.tanHalfFov);ray.TMin=.02;ray.TMax=2200;
+        RadiancePayload payload;payload.color=0;payload.depth=0;payload.primaryT=2200.0;
+        TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,ray,payload);
+        frameColor+=payload.color;
+        sceneDepth=min(sceneDepth,payload.primaryT*max(dot(ray.Direction,camera.forward),.001));
+    }
+    frameColor/=float(spatialSamples);
+    float4 previous=Accumulation[pixel];float history=min(float(camera.frameIndex),float(max(camera.maxFrames,1u)-1u));float3 accumulated=(previous.rgb*history+frameColor)/(history+1);
+    Accumulation[pixel]=float4(accumulated,sceneDepth);
+    Output[pixel]=float4(linearToSrgb(colorGrade(tonemap(accumulated*camera.exposure))),1);
 }
 
 [shader("miss")]
-void RadianceMiss(inout RadiancePayload payload) { payload.color=environmentRadiance(WorldRayDirection()); }
+void RadianceMiss(inout RadiancePayload payload) {
+    payload.color=environmentRadiance(WorldRayDirection());
+    if(payload.depth==0)payload.primaryT=2200.0;
+}
 [shader("miss")]
 void VisibilityMiss(inout VisibilityPayload payload) { payload.visible=1; }
 [shader("closesthit")]
@@ -151,6 +200,7 @@ struct BladeData {
     float3 base;
     float3 normal;
     float3 side;
+    float3 crossSide;
     float3 naturalLean;
     float height;
     float halfWidth;
@@ -159,6 +209,7 @@ struct BladeData {
     float dryness;
     float tall;
     float species;
+    float leanStrength;
 };
 
 BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
@@ -169,7 +220,11 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
     float3 axisX=normalize(float3(1,-blade.normal.x/max(blade.normal.y,.25),0));
     float3 axisZ=normalize(cross(axisX,blade.normal));
     uint seed=hashUint(patch.seed^((bladeIndex+1u)*0x9e3779b9u));
-    uint tallCount=(patch.packed>>16)&255u;
+    uint baseCandidateCount=min(patch.packed&255u,34u);
+    uint baseTallCount=min((patch.packed>>16)&255u,baseCandidateCount);
+    float densityScale=clamp(camera.grassSettings.x,0.0,6.0);
+    uint tallCount=min((uint)ceil(baseTallCount*min(densityScale,1.8)),
+                       (uint)ceil(baseCandidateCount*densityScale));
     blade.tall=bladeIndex<tallCount?1.0:0.0;
     float radius=sqrt(randomUint(seed))*lerp(.245,.065,blade.tall);
     float offsetAngle=randomUint(seed^0x68bc21ebu)*6.2831853;
@@ -179,23 +234,30 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex) {
                       (patch.minZ+patch.maxZ)*.5)
               +axisX*(cos(offsetAngle)*radius+cos(clusterAngle)*clusterRadius)
               +axisZ*(sin(offsetAngle)*radius+sin(clusterAngle)*clusterRadius);
-    float bladeAngle=randomUint(seed^0x02e5be93u)*6.2831853;
+    float patchAngle=randomUint(patch.seed^0x02e5be93u)*6.2831853;
+    float bladeAngle=patchAngle+float(bladeIndex)*2.39996323+
+                     (randomUint(seed^0x68bc21ebu)-.5)*.42;
     blade.side=normalize(axisX*cos(bladeAngle)+axisZ*sin(bladeAngle));
     blade.naturalLean=normalize(cross(blade.side,blade.normal));
+    float crossAngle=lerp(1.20,1.94,randomUint(seed^0x7f4a7c15u));
+    blade.crossSide=normalize(blade.side*cos(crossAngle)+blade.naturalLean*sin(crossAngle));
     blade.species=float(patch.seed%3u);
     float shortMaximum=float((patch.packed>>8)&255u)*.004;
     float tallMaximum=float((patch.packed>>24)&255u)*.004;
     float maximumHeight=lerp(shortMaximum,tallMaximum,blade.tall);
-    blade.height=maximumHeight*lerp(.50,1.0,randomUint(seed^0xa511e9b3u));
-    blade.halfWidth=lerp(lerp(.0032,.0085,randomUint(seed^0x63d83595u)),
-                         lerp(.0058,.0145,randomUint(seed^0x63d83595u)),blade.tall)
+    blade.height=maximumHeight*lerp(.50,1.0,randomUint(seed^0xa511e9b3u))*
+                 clamp(camera.grassSettings.y,.35,2.5);
+    blade.halfWidth=lerp(lerp(.0022,.0048,randomUint(seed^0x63d83595u)),
+                         lerp(.0035,.0085,randomUint(seed^0x63d83595u)),blade.tall)
                    *lerp(.88,1.16,patch.moisture);
     float individualPhase=randomUint(seed^0xb5297a4du)*6.2831853;
     float coherentPhase=randomUint(patch.seed^0xd1b54a35u)*6.2831853;
     blade.phase=lerp(individualPhase,coherentPhase,.78*blade.tall);
     blade.stiffness=lerp(lerp(.36,.88,randomUint(seed^0x1b56c4e9u)),
-                         lerp(.24,.62,randomUint(seed^0x1b56c4e9u)),blade.tall);
+                          lerp(.24,.62,randomUint(seed^0x1b56c4e9u)),blade.tall);
     blade.dryness=randomUint(seed^0xc2b2ae35u);
+    blade.leanStrength=lerp(blade.tall>.5?.07:.025,blade.tall>.5?.18:.13,
+                            randomUint(seed^0x94d049bbu));
     return blade;
 }
 
@@ -219,7 +281,7 @@ float3 bladeCenter(BladeData blade,float along) {
     float flutter=sin(camera.timeSeconds*(6.5+2.5*(1-blade.stiffness))+blade.phase+s*5.0)
                  *blade.height*.013*camera.windStrength*s*s;
     return blade.base+blade.normal*(blade.height*s)
-         +blade.naturalLean*(blade.height*lerp(.055,.10,blade.tall)*shape)
+         +blade.naturalLean*(blade.height*blade.leanStrength*shape)
          +grassWindDirection(blade.normal)*(bend*shape)+blade.side*flutter;
 }
 
@@ -238,13 +300,18 @@ bool rayTriangle(float3 origin,float3 direction,float3 a,float3 b,float3 c,
 [shader("intersection")]
 void GrassIntersection() {
     GrassPatch patch=GrassPatches[PrimitiveIndex()];
-    uint candidateCount=min(patch.packed&255u,16u);
-    uint tallCount=min((patch.packed>>16)&255u,candidateCount);
+    uint baseCandidateCount=min(patch.packed&255u,34u);
+    uint baseTallCount=min((patch.packed>>16)&255u,baseCandidateCount);
+    float densityScale=clamp(camera.grassSettings.x,0.0,6.0);
+    uint candidateCount=min((uint)ceil(baseCandidateCount*densityScale),128u);
+    uint tallCount=min((uint)ceil(baseTallCount*min(densityScale,1.8)),candidateCount);
+    float shortDistance=clamp(camera.grassSettings.z,2.0,128.0);
+    float tallDistance=max(shortDistance,clamp(camera.grassSettings.w,4.0,192.0));
     float patchDistance=distance(camera.eye,float3((patch.minX+patch.maxX)*.5,
                                                    patch.baseY,
                                                    (patch.minZ+patch.maxZ)*.5));
-    if(patchDistance>=36.0||(tallCount==0&&patchDistance>=26.0))return;
-    uint activeCount=patchDistance>=26.0?tallCount:candidateCount;
+    if(patchDistance>=tallDistance||(tallCount==0&&patchDistance>=shortDistance))return;
+    uint activeCount=patchDistance>=shortDistance?tallCount:candidateCount;
     float pixelFootprint=2*patchDistance*camera.tanHalfFov/max(1.0,(float)camera.resolution.y);
     float targetHalfWidth=.55*pixelFootprint;
     bool visibilityRay=(RayFlags()&RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH)!=0;
@@ -252,51 +319,61 @@ void GrassIntersection() {
     float3 rayOrigin=ObjectRayOrigin(),rayDirection=ObjectRayDirection();
     [loop] for(uint bladeIndex=0;bladeIndex<activeCount;++bladeIndex) {
         BladeData blade=makeBlade(patch,bladeIndex);
-        float distanceCoverage=1-smoothstep(blade.tall>.5?20.0:14.0,
-                                            blade.tall>.5?36.0:26.0,patchDistance);
+        float drawDistance=blade.tall>.5?tallDistance:shortDistance;
+        float distanceCoverage=1-smoothstep(drawDistance*.70,drawDistance,patchDistance);
         if(distanceCoverage<=0)continue;
-        float lodDensity=lerp(blade.tall>.5?.46:.27,1.0,
-                              1-smoothstep(8.0,blade.tall>.5?38.0:31.0,patchDistance));
+        float lodDensity=lerp(blade.tall>.5?.62:.68,1.0,
+                              1-smoothstep(3.0,drawDistance,patchDistance));
         uint selection=patch.seed^((bladeIndex+19u)*0x27d4eb2du);
-        if(!(blade.tall>.5&&bladeIndex==0)&&randomUint(selection)>lodDensity)continue;
-        uint2 rayPixel=DispatchRaysIndex().xy;
-        uint coverageSeed=selection^(rayPixel.x*0x85ebca6bu)^(rayPixel.y*0xc2b2ae35u);
-        float coverageThreshold=randomUint(coverageSeed);
-        uint segments=blade.tall>.5?(patchDistance<16.0?3u:2u):
-                                      (patchDistance<10.0?3u:(patchDistance<18.0?2u:1u));
+        if(bladeIndex>=2u&&randomUint(selection)>lodDensity)continue;
+        float coverageThreshold=randomUint(selection^0x165667b1u);
+        bool crossed=blade.tall>.5||((hashUint(selection)&1u)==0u);
+        uint segments=blade.tall>.5?(patchDistance<tallDistance*.56?3u:2u):
+                                      (patchDistance<shortDistance*.46?3u:
+                                       (patchDistance<shortDistance*.72?2u:1u));
         [loop] for(uint segment=0;segment<segments;++segment) {
             float s0=float(segment)/segments,s1=float(segment+1u)/segments;
             float3 p0=bladeCenter(blade,s0),p1=bladeCenter(blade,s1);
-            float seed0=blade.tall*step(.68,blade.dryness)*smoothstep(.68,.76,s0)*(1-smoothstep(.94,1.0,s0));
-            float seed1=blade.tall*step(.68,blade.dryness)*smoothstep(.68,.76,s1)*(1-smoothstep(.94,1.0,s1));
+            float seed0=blade.tall*step(.84,blade.dryness)*smoothstep(.58,.66,s0)*(1-smoothstep(.90,1.0,s0));
+            float seed1=blade.tall*step(.84,blade.dryness)*smoothstep(.58,.66,s1)*(1-smoothstep(.90,1.0,s1));
             float physicalW0=blade.halfWidth*(pow(max(1-s0,.015),.72)+seed0*1.65)+.00015;
             float physicalW1=blade.halfWidth*(pow(max(1-s1,.015),.72)+seed1*1.65)+.00015;
             float widthCap=blade.tall>.5?.043:.018;
             float renderW0=min(max(physicalW0,targetHalfWidth),widthCap);
             float renderW1=min(max(physicalW1,targetHalfWidth),widthCap);
-            float3 left0=p0-blade.side*renderW0,right0=p0+blade.side*renderW0;
-            float3 left1=p1-blade.side*renderW1,right1=p1+blade.side*renderW1;
-            float2 triangleBary;
-            float candidateT=bestT;
-            if(rayTriangle(rayOrigin,rayDirection,left0,right0,left1,RayTMin(),candidateT,
-                           triangleBary)){
-                float across=triangleBary.x;
-                float along=lerp(s0,s1,triangleBary.y);
-                float local=saturate((along-s0)*segments);
-                float coverage=distanceCoverage*saturate(lerp(physicalW0,physicalW1,local)/
-                                                           max(lerp(renderW0,renderW1,local),1e-5));
-                if(coverageThreshold<coverage){bestT=candidateT;bestAttribute.encoded=float2(float(bladeIndex)+.10+.80*across,along);found=true;}
+            uint selectedPlane=0;
+            if(visibilityRay&&crossed){
+                float3 segmentTangent=normalize(p1-p0);
+                float facing0=abs(dot(normalize(cross(blade.side,segmentTangent)),rayDirection));
+                float facing1=abs(dot(normalize(cross(blade.crossSide,segmentTangent)),rayDirection));
+                selectedPlane=facing1>facing0?1u:0u;
             }
-            candidateT=bestT;
-            if(rayTriangle(rayOrigin,rayDirection,right0,right1,left1,RayTMin(),candidateT,
-                           triangleBary)){
-                float across=1-triangleBary.y;
-                float along=s0*(1-triangleBary.x-triangleBary.y)
-                           +s1*(triangleBary.x+triangleBary.y);
-                float local=saturate((along-s0)*segments);
-                float coverage=distanceCoverage*saturate(lerp(physicalW0,physicalW1,local)/
-                                                           max(lerp(renderW0,renderW1,local),1e-5));
-                if(coverageThreshold<coverage){bestT=candidateT;bestAttribute.encoded=float2(float(bladeIndex)+.10+.80*across,along);found=true;}
+            uint planeCount=visibilityRay?1u:(crossed?2u:1u);
+            [loop] for(uint planeStep=0;planeStep<planeCount;++planeStep){
+                uint planeIndex=visibilityRay?selectedPlane:planeStep;
+                float3 ribbonSide=planeIndex==0u?blade.side:blade.crossSide;
+                float3 left0=p0-ribbonSide*renderW0,right0=p0+ribbonSide*renderW0;
+                float3 left1=p1-ribbonSide*renderW1,right1=p1+ribbonSide*renderW1;
+                float2 triangleBary;float candidateT=bestT;
+                if(rayTriangle(rayOrigin,rayDirection,left0,right0,left1,RayTMin(),candidateT,
+                               triangleBary)){
+                    float across=triangleBary.x;
+                    float along=lerp(s0,s1,triangleBary.y);
+                    float local=saturate((along-s0)*segments);
+                    float coverage=distanceCoverage*saturate(lerp(physicalW0,physicalW1,local)/
+                                                               max(lerp(renderW0,renderW1,local),1e-5));
+                    if(coverageThreshold<coverage){bestT=candidateT;bestAttribute.encoded=float2(float(bladeIndex)+.10+.80*across,along+2.0*planeIndex);found=true;}
+                }
+                candidateT=bestT;
+                if(rayTriangle(rayOrigin,rayDirection,right0,right1,left1,RayTMin(),candidateT,
+                               triangleBary)){
+                    float across=1-triangleBary.y;
+                    float along=s0*(1-triangleBary.x-triangleBary.y)+s1*(triangleBary.x+triangleBary.y);
+                    float local=saturate((along-s0)*segments);
+                    float coverage=distanceCoverage*saturate(lerp(physicalW0,physicalW1,local)/
+                                                               max(lerp(renderW0,renderW1,local),1e-5));
+                    if(coverageThreshold<coverage){bestT=candidateT;bestAttribute.encoded=float2(float(bladeIndex)+.10+.80*across,along+2.0*planeIndex);found=true;}
+                }
             }
         }
         if(found&&visibilityRay&&ReportHit(bestT,0,bestAttribute))return;
@@ -306,22 +383,25 @@ void GrassIntersection() {
 
 [shader("closesthit")]
 void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
+    if(payload.depth==0)payload.primaryT=RayTCurrent();
     GrassPatch patch=GrassPatches[PrimitiveIndex()];uint bladeIndex=(uint)floor(attr.encoded.x);
-    BladeData blade=makeBlade(patch,bladeIndex);float along=saturate(attr.encoded.y);
+    BladeData blade=makeBlade(patch,bladeIndex);uint plane=attr.encoded.y>=1.5?1u:0u;
+    float along=saturate(attr.encoded.y-2.0*plane);
     float epsilon=.012;float3 tangent=normalize(bladeCenter(blade,min(1.0,along+epsilon))
                                               -bladeCenter(blade,max(0.0,along-epsilon)));
-    float3 geometricNormal=normalize(cross(blade.side,tangent));
+    float3 ribbonSide=plane==0u?blade.side:blade.crossSide;
+    float3 geometricNormal=normalize(cross(ribbonSide,tangent));
     bool front=dot(geometricNormal,WorldRayDirection())<0;
     float3 n=front?geometricNormal:-geometricNormal;
     float3 hit=WorldRayOrigin()+WorldRayDirection()*RayTCurrent();
-    float dryThreshold=lerp(.16,.055,patch.moisture);
-    float dry=1-smoothstep(dryThreshold-.025,dryThreshold+.025,blade.dryness);
-    float3 green=lerp(float3(.070,.175,.025),float3(.24,.47,.075),
-                      .44+.56*patch.moisture);
-    green*=blade.species<.5?float3(.94,1.07,.82):
-           (blade.species<1.5?float3(1.10,.98,.72):float3(.82,1.02,1.05));
-    green*=lerp(.55,1.12,smoothstep(0,.72,along));
-    float3 straw=float3(.34,.29,.105)*lerp(.72,1.15,along);
+    float dryThreshold=lerp(.82,.94,patch.moisture);
+    float dry=smoothstep(dryThreshold-.03,dryThreshold+.03,blade.dryness);
+    float3 green=lerp(float3(.040,.068,.014),float3(.095,.155,.030),
+                      saturate(.28+.55*patch.moisture));
+    green*=blade.species<.5?float3(.97,1.03,.91):
+           (blade.species<1.5?float3(1.04,.98,.90):float3(.92,1.01,1.02));
+    green*=lerp(.72,1.04,smoothstep(0,.70,along));
+    float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along);
     float3 albedo=lerp(green,straw,dry);
     float3 sun=directionToSun();uint2 pixel=DispatchRaysIndex().xy;
     float2 random=float2(hash(pixel+camera.frameIndex*131),
@@ -333,24 +413,23 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
     VisibilityPayload shadow;shadow.visible=0;RayDesc ray;ray.Origin=hit+n*.004;
     ray.Direction=sun;ray.TMin=.003;ray.TMax=1000;
     TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-             0x3,1,0,1,ray,shadow);
+             0x1,1,0,1,ray,shadow);
     float frontLight=saturate(dot(n,sun)),backLight=saturate(dot(-n,sun));
     float3 ambient=skyIrradiance(n)*(.50+.18*along);
     float3 direct=float3(1.02,.94,.73)*frontLight*shadow.visible*1.18;
-    direct+=albedo*float3(.42,.74,.20)*backLight*shadow.visible*.72;
+    direct+=float3(.42,.74,.20)*backLight*shadow.visible*.72;
     float3 view=normalize(camera.eye-hit),halfVector=normalize(sun+view);
     direct+=pow(saturate(dot(n,halfVector)),22)*.08*shadow.visible;
     float seedHead=blade.tall*smoothstep(.70,.79,along)*(1-smoothstep(.92,1.0,along))
-                  *step(.68,blade.dryness);
+                  *step(.84,blade.dryness);
     albedo=lerp(albedo,float3(.30,.27,.10),seedHead*.46);
     float3 result=albedo*(ambient+direct)*lerp(.58,1.0,smoothstep(0,.22,along));
-    float haze=(1-exp(-distance(camera.eye,hit)*.0045))*
-               lerp(.55,1.0,1-saturate(WorldRayDirection().y));
-    payload.color=lerp(result,environmentRadiance(WorldRayDirection()),haze*.45);
+    payload.color=applyAerialPerspective(result,hit,WorldRayDirection());
 }
 
 [shader("closesthit")]
 void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAttributes attr) {
+    if(payload.depth==0)payload.primaryT=RayTCurrent();
     uint primitive=PrimitiveIndex();uint i0=Indices[primitive*3],i1=Indices[primitive*3+1],i2=Indices[primitive*3+2];
     float3 bary=float3(1-attr.barycentrics.x-attr.barycentrics.y,attr.barycentrics.x,attr.barycentrics.y);
     Vertex a=Vertices[i0],b=Vertices[i1],c=Vertices[i2];float3 geometricNormal=normalize(a.normal*bary.x+b.normal*bary.y+c.normal*bary.z);bool upperFace=dot(geometricNormal,WorldRayDirection())<0;float3 surfaceNormal=upperFace?geometricNormal:-geometricNormal;float3 n=surfaceNormal;float2 uv=a.uv*bary.x+b.uv*bary.y+c.uv*bary.z;
@@ -368,15 +447,103 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             barkCavity=bark.b*lerp(.10,1.0,ageStrength);float plateTone=bark.a,luminance=dot(albedo,float3(.2126,.7152,.0722));float3 oakPlate=lerp(albedo,luminance.xxx,.18+.12*plateTone)*lerp(.86,1.28,plateTone);float3 fissureColor=srgbToLinear(float3(.075,.060,.045));albedo=lerp(oakPlate,fissureColor,smoothstep(.14,.92,barkCavity)*.74);
         }
     }
+    float terrainMoisture=.5,terrainCavity=0,terrainRoughness=.9;
     if(kind>1.5&&kind<2.5){
-        float viewDistance=distance(camera.eye,hit);
-        float frequency=lerp(2.0,.14,smoothstep(8.0,170.0,viewDistance));
-        float sampleStep=.18/frequency;
-        float dx=(fbm((hit.xz+float2(sampleStep,0))*frequency)-
-                  fbm((hit.xz-float2(sampleStep,0))*frequency))/(2*sampleStep);
-        float dz=(fbm((hit.xz+float2(0,sampleStep))*frequency)-
-                  fbm((hit.xz-float2(0,sampleStep))*frequency))/(2*sampleStep);
-        n=normalize(n+float3(-dx*.045,0,-dz*.045)*(1-saturate(1-surfaceNormal.y)));
+        float terrainDistance=distance(camera.eye,hit);
+        float pixelWorld=2*terrainDistance*camera.tanHalfFov/max(1.0,(float)camera.resolution.y);
+        float grazing=rcp(max(abs(dot(surfaceNormal,-WorldRayDirection())),.22));
+        float footprint=min(pixelWorld*grazing,3.0);
+        float fineFootprint=min(pixelWorld*sqrt(grazing),.55);
+        float broad=filteredFbmWorld(hit.xz+float2(37.1,-19.6),.030,footprint);
+        float patch=filteredFbmWorld(hit.xz+float2(-11.4,63.2),.140,footprint);
+        float fine=filteredValueNoise(hit.xz+float2(7.7,21.3),2.3,fineFootprint);
+        float slope=1-saturate(surfaceNormal.y),rootDistance=length(hit.xz);
+        terrainMoisture=saturate(.10+.58*broad+.32*patch-.45*slope);
+        float lushMask=smoothstep(.42,.72,terrainMoisture);
+        float dryDriver=.65*(1-broad)+.35*patch;
+        float dryMask=smoothstep(.64,.82,dryDriver)*(1-.65*lushMask);
+        float3 shadowSward=float3(.028,.050,.012),pasture=float3(.070,.110,.027);
+        float3 lushSward=float3(.098,.154,.036),drySward=float3(.155,.134,.052);
+        float3 meadow=lerp(shadowSward,pasture,smoothstep(.24,.52,terrainMoisture));
+        meadow=lerp(meadow,lushSward,lushMask*.72);
+        meadow=lerp(meadow,drySward,dryMask*.62);
+        meadow*=lerp(.90,1.10,fine);
+
+        float soilMacro=filteredFbmWorld(hit.xz+float2(83,-47),.090,footprint);
+        float soilFine=filteredValueNoise(hit.xz+float2(-31,14),1.7,fineFootprint);
+        float rootCore=1-smoothstep(.72,1.35,rootDistance);
+        float rootFringe=(1-smoothstep(1.10,2.70,rootDistance))*smoothstep(.55,.72,soilMacro);
+        float slopeBare=smoothstep(.075,.23,slope)*smoothstep(.60,.78,soilMacro);
+        float flatBare=smoothstep(.78,.90,.65*soilMacro+.35*soilFine)*(1-smoothstep(.10,.22,slope));
+        float soilStructure=max(rootCore,max(rootFringe*.82,max(slopeBare*.68,flatBare*.62)));
+        float soilMask=smoothstep(.22,.72,soilStructure+(soilFine-.5)*.18);
+        soilMask*=1-smoothstep(150.0,230.0,rootDistance);
+        float soilDryness=smoothstep(.42,.72,1-terrainMoisture);
+        float3 soil=lerp(float3(.042,.024,.010),float3(.105,.061,.024),.30+.48*soilFine);
+        soil=lerp(soil,float3(.160,.101,.041),soilDryness*.42);
+        albedo=lerp(meadow,soil,soilMask);
+
+        float highGround=smoothstep(18.0,92.0,hit.y)*smoothstep(760,1040,rootDistance);
+        float mountainStone=saturate(highGround*(.34+.90*slope)+smoothstep(.28,.62,slope)*.38);
+        float3 distantStone=lerp(float3(.105,.115,.098),float3(.225,.205,.165),fine);
+        albedo=lerp(albedo,distantStone,mountainStone*.80);
+
+        float nearTextureWeight=(payload.depth==0?1.0:0.0)*(1-smoothstep(70.0,110.0,terrainDistance))*(1-mountainStone);
+        if(nearTextureWeight>.001){
+            float2 textureWarp=float2(filteredValueNoise(hit.xz+float2(12.7,-8.3),.047,footprint),
+                                      filteredValueNoise(hit.xz+float2(-29.1,44.6),.061,footprint))-.5;
+            float2 groundUvA=float2(dot(hit.xz,float2(.963,.269)),dot(hit.xz,float2(.269,-.963)))*.5+textureWarp*.48;
+            float2 groundUvB=float2(dot(hit.xz,float2(.526,-.851)),dot(hit.xz,float2(.851,.526)))*.2681+float2(.37,.19)+textureWarp.yx*.31;
+            float textureFootprint=min(pixelWorld*pow(grazing,.25),.38);
+            float groundLodA=clamp(log2(max(textureFootprint*512.0,1.0))-.85,0.0,10.0);
+            float groundLodB=clamp(log2(max(textureFootprint*274.5,1.0))-.85,0.0,10.0);
+            float normalLodA=max(0.0,groundLodA-1.0),normalLodB=max(0.0,groundLodB-1.0);
+            float grassBlend=.34+.32*smoothstep(.30,.78,terrainMoisture);
+            float4 denseAlbedo=sampleGroundAlbedo(groundUvA,0u,groundLodA);
+            float4 coarseAlbedo=sampleGroundAlbedo(groundUvB,1u,groundLodB);
+            float4 denseNormal=sampleGroundNormal(groundUvA,0u,normalLodA);
+            float4 coarseNormal=sampleGroundNormal(groundUvB,1u,normalLodB);
+            float4 textureAlbedo=lerp(coarseAlbedo,denseAlbedo,grassBlend);
+            float4 textureNormal=lerp(coarseNormal,denseNormal,grassBlend);
+            float4 textureLow=lerp(sampleGroundAlbedo(groundUvB,1u,groundLodB+3.25),
+                                   sampleGroundAlbedo(groundUvA,0u,groundLodA+3.25),grassBlend);
+            float cloverDriver=filteredFbmWorld(hit.xz+float2(-54.2,16.8),.18,footprint);
+            float cloverWeight=smoothstep(.76,.90,cloverDriver)*smoothstep(.48,.72,terrainMoisture)*(1-soilMask)*.58;
+            if(cloverWeight>.01){
+                float4 cloverAlbedo=sampleGroundAlbedo(groundUvB+float2(.31,.17),3u,groundLodB);
+                float4 cloverNormal=sampleGroundNormal(groundUvB+float2(.31,.17),3u,normalLodB);
+                float4 cloverLow=sampleGroundAlbedo(groundUvB+float2(.31,.17),3u,groundLodB+3.25);
+                textureAlbedo=lerp(textureAlbedo,cloverAlbedo,cloverWeight);
+                textureNormal=lerp(textureNormal,cloverNormal,cloverWeight);
+                textureLow=lerp(textureLow,cloverLow,cloverWeight);
+            }
+            if(soilMask>.01){
+                float4 soilAlbedo=sampleGroundAlbedo(groundUvB+float2(.13,.43),2u,groundLodB);
+                float4 soilNormal=sampleGroundNormal(groundUvB+float2(.13,.43),2u,normalLodB);
+                float4 soilLow=sampleGroundAlbedo(groundUvB+float2(.13,.43),2u,groundLodB+3.25);
+                textureAlbedo=lerp(textureAlbedo,soilAlbedo,soilMask);
+                textureNormal=lerp(textureNormal,soilNormal,soilMask);
+                textureLow=lerp(textureLow,soilLow,soilMask);
+            }
+            float3 highFrequency=clamp(textureAlbedo.rgb/max(textureLow.rgb,.012),.68,1.42);
+            highFrequency*=lerp(.94,1.06,textureNormal.b);
+            float materialDetail=saturate(nearTextureWeight*clamp(camera.groundSettings.y,0.0,2.0)*.90);
+            albedo*=lerp(float3(1,1,1),highFrequency,materialDetail);
+            terrainRoughness=textureAlbedo.a;
+            terrainCavity=textureNormal.a*nearTextureWeight*.55;
+            float normalStrength=nearTextureWeight*clamp(camera.groundSettings.x,0.0,2.0)*.92;
+            float2 mapXY=(textureNormal.rg*2-1)*normalStrength;
+            float mapZ=sqrt(saturate(1-dot(mapXY,mapXY)));
+            float3 tangent=normalize(float3(1,-surfaceNormal.x/max(surfaceNormal.y,.12),0));
+            float3 bitangent=normalize(cross(surfaceNormal,tangent));
+            n=normalize(tangent*mapXY.x+bitangent*mapXY.y+surfaceNormal*mapZ);
+        }else{
+            float frequency=lerp(1.4,.12,smoothstep(8.0,190.0,terrainDistance));
+            float sampleStep=.18/frequency;
+            float dx=(fbm((hit.xz+float2(sampleStep,0))*frequency)-fbm((hit.xz-float2(sampleStep,0))*frequency))/(2*sampleStep);
+            float dz=(fbm((hit.xz+float2(0,sampleStep))*frequency)-fbm((hit.xz-float2(0,sampleStep))*frequency))/(2*sampleStep);
+            n=normalize(n+float3(-dx*.035,0,-dz*.035));
+        }
     }
     if(kind>2.5&&kind<3.5){
         float rockVariant=round(frac(material)*10);float epsilon=.014;
@@ -396,39 +563,22 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float grain=valueNoise(float2(uv.x*7.0+uv.y*.15,uv.y*2.1));albedo*=lerp(.72,1.10,grain);
     }
     float3 baseSun=directionToSun(),sunTangent=normalize(cross(abs(baseSun.y)<.9?float3(0,1,0):float3(1,0,0),baseSun)),sunBitangent=cross(baseSun,sunTangent);float diskRadius=sqrt(random.x)*.0065,angle=random.y*6.2831853;float3 sunDir=normalize(baseSun+sunTangent*cos(angle)*diskRadius+sunBitangent*sin(angle)*diskRadius);
-    VisibilityPayload shadow;shadow.visible=0;RayDesc s;s.Origin=hit+(thinFoliage?sunDir:surfaceNormal)*.012;s.Direction=sunDir;s.TMin=.01;s.TMax=1000;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x3,1,0,1,s,shadow);
-    VisibilityPayload ao;ao.visible=1;if(payload.depth==0){ao.visible=0;RayDesc ar;ar.Origin=hit+surfaceNormal*.015;ar.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*47),hash(pixel.yx+camera.frameIndex*71)));ar.TMin=.01;ar.TMax=1.35;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,ar,ao);}
-    float visibility=shadow.visible;float ndl=saturate(dot(n,sunDir));float occlusion=lerp(.76,1.0,float(ao.visible));float3 ambient=skyIrradiance(n)*(.48+.16*saturate(n.y))*occlusion;ambient+=float3(.20,.17,.12)*(.08+.14*saturate(-n.y));float3 direct=float3(1.08,.96,.80)*ndl*visibility*1.28;
+    VisibilityPayload shadow;shadow.visible=0;RayDesc s;s.Origin=hit+(thinFoliage?sunDir:surfaceNormal)*.012;s.Direction=sunDir;s.TMin=.01;s.TMax=2200;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,s,shadow);
+    float visibility=float(shadow.visible);
+    // The old ground path launched three additional soft-shadow rays, AO and
+    // a bounce ray for nearly every screen pixel.  One stochastic sun sample
+    // converges on static frames; terrain cavity/normal maps provide the local
+    // ground occlusion without another traversal.
+    bool terrainSurface=kind>1.5&&kind<2.5;
+    VisibilityPayload ao;ao.visible=1;if(payload.depth==0&&!terrainSurface){ao.visible=0;RayDesc ar;ar.Origin=hit+surfaceNormal*.015;ar.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*47),hash(pixel.yx+camera.frameIndex*71)));ar.TMin=.01;ar.TMax=1.35;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,ar,ao);}
+    float ndl=saturate(dot(n,sunDir));float occlusion=lerp(.76,1.0,float(ao.visible));float3 ambient=skyIrradiance(n)*(.48+.16*saturate(n.y))*occlusion;ambient+=float3(.20,.17,.12)*(.08+.14*saturate(-n.y));float3 direct=float3(1.08,.96,.80)*ndl*visibility*1.28;
     if(kind<.5)ambient*=lerp(1,.68,barkCavity);
     if(kind>1.5&&kind<2.5){
-        float terrainDistance=distance(camera.eye,hit);
-        float pixelWorld=2*terrainDistance*camera.tanHalfFov/max(1.0,(float)camera.resolution.y);
-        float grazing=rcp(max(abs(dot(surfaceNormal,-WorldRayDirection())),.22));
-        float footprint=min(pixelWorld*grazing,2.0);
-        float macro=filteredFbmWorld(hit.xz,.075,footprint),detail=filteredValueNoise(hit.xz,.72,footprint);
-        float slope=1-saturate(surfaceNormal.y),rootDistance=length(hit.xz);
-        float exposedRoots=1-smoothstep(.75,1.65,rootDistance);
-        float soilMask=saturate(smoothstep(.09,.31,slope)+exposedRoots*.82
-                                +smoothstep(.18,.76,detail)*.18);
-        float3 meadow=lerp(float3(.038,.074,.018),float3(.096,.155,.039),
-                           saturate(.28+.62*macro));
-        float3 dryGrass=float3(.20,.19,.075);
-        meadow=lerp(meadow,dryGrass,smoothstep(.74,.95,macro)*.18);
-        float meadowFine=filteredValueNoise(hit.xz,2.8,footprint);
-        meadow*=lerp(.82,1.13,meadowFine);
-        float2 grassAlong=normalize(float2(.82,.57)),grassAcross=float2(-grassAlong.y,grassAlong.x);
-        float2 swardUv=float2(dot(hit.xz,grassAcross)*3.1,dot(hit.xz,grassAlong)*.62);
-        float swardFilter=1-smoothstep(.25,.75,3.1*footprint);
-        float sward=lerp(.5,valueNoise(swardUv),swardFilter);
-        float grassDomain=smoothstep(1.05,1.45,rootDistance);
-        float farWeight=grassDomain*(1-soilMask)*smoothstep(14.0,26.0,terrainDistance);
-        meadow=lerp(meadow,meadow*lerp(.90,1.08,sward),farWeight);
-        float3 soil=lerp(float3(.105,.071,.038),float3(.21,.145,.075),detail);
-        albedo=lerp(meadow,soil,soilMask);
-        float highGround=smoothstep(8.0,34.0,hit.y)*smoothstep(190,285,rootDistance);
-        float mountainStone=saturate(highGround*(.34+.90*slope)+smoothstep(.28,.62,slope)*.38);
-        float3 distantStone=lerp(float3(.16,.17,.145),float3(.28,.265,.22),detail);
-        albedo=lerp(albedo,distantStone,mountainStone*.78);ambient*=lerp(.79,.91,macro);
+        ambient*=lerp(.94,1.02,terrainMoisture)*lerp(1.0,.86,terrainCavity);
+        ambient+=float3(.014,.019,.010);
+        float3 viewDirection=normalize(camera.eye-hit),halfVector=normalize(sunDir+viewDirection);
+        float groundSpecular=pow(saturate(dot(n,halfVector)),lerp(34.0,8.0,terrainRoughness));
+        direct+=groundSpecular*(1-terrainRoughness)*.035*visibility;
     }
     if(kind>.5&&kind<1.5){
         float midrib=exp(-abs(uv.x-.5)*150);float secondary=exp(-abs(frac((uv.y+abs(uv.x-.5)*.72)*6)-.5)*34);float veins=saturate(midrib*.82+secondary*.28);float edge=saturate(length((uv-.5)*float2(1.25,1.0))*2);
@@ -446,8 +596,6 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     if(kind>2.5&&kind<3.5)ambient*=.86;
     if(kind>4.5&&kind<5.5)ambient*=.84;
     float3 result=albedo*(ambient+direct);
-    if(payload.depth==0){RadiancePayload bounce;bounce.color=0;bounce.depth=1;RayDesc br;br.Origin=hit+n*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=6;TraceRay(Scene,RAY_FLAG_NONE,0x3,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}
-    float haze=(1-exp(-distance(camera.eye,hit)*.0038))*
-               lerp(.52,1.0,1-saturate(WorldRayDirection().y));
-    payload.color=lerp(result,environmentRadiance(WorldRayDirection()),haze*.48);
+    if(payload.depth==0&&!terrainSurface){RadiancePayload bounce;bounce.color=0;bounce.depth=1;bounce.primaryT=6;RayDesc br;br.Origin=hit+surfaceNormal*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=6;TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}
+    payload.color=applyAerialPerspective(result,hit,WorldRayDirection());
 }

@@ -54,14 +54,15 @@ void appendTube(EnvironmentMesh& mesh,Vec3 start,Vec3 end,float startRadius,floa
 }
 
 void appendRock(EnvironmentMesh& mesh,Vec3 grade,Vec3 radii,float yaw,uint32_t seed,int type) {
-    const int sides=type==2?12:(type==1?16:18);
-    const int rings=type==2?6:7;
+    const int sides=type==2?18:16;
+    const int rings=type==2?8:7;
     const uint32_t base=static_cast<uint32_t>(mesh.detailVertices.size());
     for(int ring=0;ring<rings;++ring)for(int k=0;k<=sides;++k) {
         const float t=static_cast<float>(ring)/(rings-1);
-        const float level=-.36f+1.10f*t;
+        const float level=-.36f+.96f*t;
         const float profile=clamp(1.03f-std::pow(std::abs((level-.04f)/.82f),1.65f),.24f,1.0f);
-        const float angle=2*pi*k/sides;
+        const float ringPhase=.035f*std::sin(seed*.00011f+ring*1.73f)+(ring&1? .018f:-.018f);
+        const float angle=2*pi*k/sides+ringPhase;
         const float angularNoise=1.0f+(type==2?.17f:.09f)*std::sin(angle*3.0f+seed*.000071f)
                                      +.055f*std::sin(angle*5.0f-seed*.000037f)
                                      +.035f*std::sin(angle*9.0f+ring*.83f+seed*.000019f);
@@ -71,7 +72,7 @@ void appendRock(EnvironmentMesh& mesh,Vec3 grade,Vec3 radii,float yaw,uint32_t s
                    std::sin(angle)*radii.z*profile*angularNoise};
         const Vec3 world=grade+rotateY(local,yaw);
         Vec3 localNormal{local.x/std::max(radii.x*radii.x,.001f),
-                         (level-.04f)/std::max(radii.y*radii.y,.003f),
+                         local.y/std::max(radii.y*radii.y,.003f),
                          local.z/std::max(radii.z*radii.z,.001f)};
         const Vec3 normal=normalize(rotateY(localNormal,yaw));
         const float tone=.82f+.16f*std::sin(angle*2.0f+ring+seed*.000013f);
@@ -85,8 +86,8 @@ void appendRock(EnvironmentMesh& mesh,Vec3 grade,Vec3 radii,float yaw,uint32_t s
         mesh.detailIndices.insert(mesh.detailIndices.end(),{a,c,d,a,d,b});
     }
     const uint32_t top=static_cast<uint32_t>(mesh.detailVertices.size());
-    const Vec3 topLocal{.08f*radii.x*std::sin(seed*.001f),.92f*radii.y,
-                        .07f*radii.z*std::cos(seed*.0013f)};
+    const Vec3 topLocal{.06f*radii.x*std::sin(seed*.001f),.68f*radii.y,
+                        .05f*radii.z*std::cos(seed*.0013f)};
     mesh.detailVertices.push_back({grade+rotateY(topLocal,yaw),{0,1,0},
                                    packColor(.39f,.385f,.34f),3.0f+type*.1f,.5f,1.0f});
     const uint32_t last=base+(rings-1)*(sides+1);
@@ -139,84 +140,9 @@ void appendFoliageClump(EnvironmentMesh& mesh,Vec3 center,Vec3 radii,uint32_t ba
     }
 }
 
-void appendLeaf(EnvironmentMesh& mesh,Vec3 center,Vec3 facing,float length,float width,
-                uint32_t color,float material,float twist) {
-    Vec3 normal=normalize(facing);
-    const Vec3 helper=std::abs(normal.y)<.88f?Vec3{0,1,0}:Vec3{1,0,0};
-    Vec3 side=normalize(cross(helper,normal)),along=normalize(cross(normal,side));
-    const Vec3 rotatedSide=side*std::cos(twist)+along*std::sin(twist);
-    along=along*std::cos(twist)-side*std::sin(twist);side=rotatedSide;
-    const std::array<Vec3,6> shape{
-        along*length,along*(length*.25f)+side*width,along*(-length*.48f)+side*(width*.72f),
-        along*(-length),along*(-length*.48f)-side*(width*.72f),
-        along*(length*.25f)-side*width};
-    const uint32_t base=static_cast<uint32_t>(mesh.detailVertices.size());
-    mesh.detailVertices.push_back({center,normal,color,material,.5f,.5f});
-    for(int k=0;k<6;++k)mesh.detailVertices.push_back({center+shape[k],normal,color,material,
-                                                       .5f+dot(shape[k],side)/(2*width),
-                                                       .5f+dot(shape[k],along)/(2*length)});
-    for(int k=0;k<6;++k)mesh.detailIndices.insert(mesh.detailIndices.end(),
-                                                   {base,base+1+static_cast<uint32_t>(k),
-                                                    base+1+static_cast<uint32_t>((k+1)%6)});
-}
-
-void appendShrub(EnvironmentMesh& mesh,Vec3 base,float radius,float height,int type,Rng& rng) {
-    const int stems=type==1?9:(type==2?7:6);
-    const uint32_t wood=packColor(.18f,.115f,.058f);
-    std::vector<Vec3> terminalTips;
-    terminalTips.reserve(static_cast<size_t>(stems)*2);
-    for(int stem=0;stem<stems;++stem) {
-        const float angle=2*pi*(stem+rng.range(-.22f,.22f))/stems+rng.range(-.25f,.25f);
-        const float reach=radius*rng.range(.48f,1.02f);
-        const float stemHeight=height*rng.range(.62f,1.02f)*(type==2?.72f:1.0f);
-        const Vec3 middle=base+Vec3{std::cos(angle)*reach*.34f,stemHeight*.43f,
-                                    std::sin(angle)*reach*.34f};
-        const Vec3 tip=base+Vec3{std::cos(angle)*reach,stemHeight,
-                                 std::sin(angle)*reach};
-        const float basalRadius=rng.range(.012f,.027f)*(height/.9f);
-        appendTube(mesh,base+Vec3{0,.015f,0},middle,basalRadius,basalRadius*.58f,5,wood,5.0f);
-        appendTube(mesh,middle,tip,basalRadius*.62f,.0035f,5,wood,5.0f);
-        terminalTips.push_back(tip);
-        if(stem%2==0) {
-            const Vec3 branchTip=middle+Vec3{-std::sin(angle)*reach*.30f,stemHeight*.27f,
-                                             std::cos(angle)*reach*.30f};
-            appendTube(mesh,middle,branchTip,basalRadius*.42f,.003f,4,wood,5.0f);
-            terminalTips.push_back(branchTip);
-        }
-    }
-
-    const int leafCount=type==0?36:(type==1?42:32);
-    const uint32_t clumpColor=type==1?packColor(.16f,.44f,.10f):
-                              (type==2?packColor(.145f,.39f,.105f):
-                                       packColor(.17f,.47f,.105f));
-    for(size_t clump=0;clump<terminalTips.size();++clump) {
-        const Vec3 center=terminalTips[clump]+Vec3{rng.range(-.08f,.08f),
-                                                   rng.range(-.05f,.08f),
-                                                   rng.range(-.08f,.08f)};
-        appendFoliageClump(mesh,center,
-                           {radius*rng.range(.12f,.23f),height*rng.range(.10f,.19f),
-                            radius*rng.range(.12f,.22f)},
-                           clumpColor,4.0f+type*.1f,rng.next(),7);
-    }
-    for(int leaf=0;leaf<leafCount;++leaf) {
-        const Vec3 anchor=terminalTips[static_cast<size_t>(leaf)%terminalTips.size()];
-        const float angle=rng.range(0,2*pi),spread=radius*rng.range(.07f,.20f);
-        Vec3 position=anchor+Vec3{std::cos(angle)*spread,rng.range(-.10f,.12f)*height,
-                                  std::sin(angle)*spread};
-        Vec3 facing=normalize(Vec3{std::cos(angle)*.48f,rng.range(.42f,.92f),
-                                   std::sin(angle)*.48f});
-        const float variation=rng.range(.76f,1.13f);
-        const float baseRed=type==1?.17f:.16f,baseGreen=type==1?.45f:(type==2?.40f:.47f);
-        const uint32_t color=packColor(baseRed*variation,baseGreen*variation,
-                                       (type==2?.105f:.095f)*variation);
-        appendLeaf(mesh,position,facing,rng.range(.032f,.064f),rng.range(.018f,.038f),
-                   color,4.0f+type*.1f,rng.range(-pi,pi));
-    }
-}
-
 void appendProxyAxis(EnvironmentMesh& mesh,Vec3 start,Vec3 direction,float axisLength,
                      float radius,int depth,int type,float crownRadius,float treeHeight,
-                     uint32_t foliage,float foliageMaterial,Rng& rng) {
+                     uint32_t foliage,float foliageMaterial,int terminalPadCount,Rng& rng) {
     Vec3 position=start,tangent=normalize(direction);
     constexpr int segments=3;
     for(int segment=0;segment<segments;++segment) {
@@ -237,9 +163,21 @@ void appendProxyAxis(EnvironmentMesh& mesh,Vec3 start,Vec3 direction,float axisL
         const float vertical=type==1?treeHeight*rng.range(.035f,.060f):
                              (type==2?treeHeight*rng.range(.055f,.085f):
                                       treeHeight*rng.range(.070f,.105f));
-        appendFoliageClump(mesh,position+tangent*horizontal*.18f,
-                           {horizontal,vertical,horizontal*rng.range(.78f,1.08f)},
-                           foliage,foliageMaterial,rng.next(),7);
+        const Vec3 helper=std::abs(tangent.y)<.9f?Vec3{0,1,0}:Vec3{1,0,0};
+        const Vec3 side=normalize(cross(helper,tangent)),around=normalize(cross(tangent,side));
+        const float phase=rng.range(0,2*pi);
+        for(int pad=0;pad<terminalPadCount;++pad) {
+            const float padAngle=phase+2*pi*pad/std::max(1,terminalPadCount)+rng.range(-.32f,.32f);
+            const float offsetRadius=pad==0?0.0f:horizontal*rng.range(.38f,.68f);
+            const Vec3 offset=side*(std::cos(padAngle)*offsetRadius)
+                             +around*(std::sin(padAngle)*offsetRadius)
+                             +tangent*horizontal*rng.range(.04f,.24f);
+            appendFoliageClump(mesh,position+offset,
+                               {horizontal*rng.range(.84f,1.12f),
+                                vertical*rng.range(.82f,1.10f),
+                                horizontal*rng.range(.72f,1.10f)},
+                               foliage,foliageMaterial,rng.next(),7);
+        }
         return;
     }
 
@@ -250,9 +188,9 @@ void appendProxyAxis(EnvironmentMesh& mesh,Vec3 start,Vec3 direction,float axisL
     Vec3 continuation=normalize(tangent*.88f+radial*.28f+Vec3{0,type==1?.01f:.08f,0});
     Vec3 lateral=normalize(tangent*.58f+radial*(-.78f)+Vec3{0,type==1?-.035f:.12f,0});
     appendProxyAxis(mesh,position,continuation,axisLength*.58f,radius*.60f,depth-1,type,
-                    crownRadius,treeHeight,foliage,foliageMaterial,rng);
+                    crownRadius,treeHeight,foliage,foliageMaterial,terminalPadCount,rng);
     appendProxyAxis(mesh,position,lateral,axisLength*.50f,radius*.52f,depth-1,type,
-                    crownRadius,treeHeight,foliage,foliageMaterial,rng);
+                    crownRadius,treeHeight,foliage,foliageMaterial,terminalPadCount,rng);
 }
 
 void appendProxyTree(EnvironmentMesh& mesh,Vec3 base,float height,float crownRadius,
@@ -260,6 +198,7 @@ void appendProxyTree(EnvironmentMesh& mesh,Vec3 base,float height,float crownRad
     const uint32_t foliage=type==1?packColor(.13f,.31f,.095f):
                              (type==2?packColor(.16f,.34f,.095f):packColor(.145f,.325f,.085f));
     const float foliageMaterial=4.0f+type*.1f;
+    const int terminalPadCount=detailLevel==0?(type==0?3:2):1;
     const float trunkFraction=type==1?.94f:(type==2?.76f:.58f);
     const int trunkSegments=type==1?7:5;
     std::vector<Vec3> trunkNodes;trunkNodes.reserve(static_cast<size_t>(trunkSegments)+1);
@@ -285,11 +224,12 @@ void appendProxyTree(EnvironmentMesh& mesh,Vec3 base,float height,float crownRad
             const float phase=tier*2.39996f+rng.range(-.24f,.24f);
             for(int branch=0;branch<3;++branch) {
                 const float angle=phase+2*pi*branch/3+rng.range(-.15f,.15f);
-                const float elevation=lerp(-.10f,.22f,static_cast<float>(tier)/(tiers-1));
+                const float tierProgress=static_cast<float>(tier)/(tiers-1);
+                const float elevation=-.10f+.32f*tierProgress;
                 const Vec3 direction=normalize({std::cos(angle),elevation,std::sin(angle)});
                 appendProxyAxis(mesh,trunkNodes[node],direction,crownRadius*.72f*taper,
                                 height*.011f*taper,detailLevel>0?1:0,type,crownRadius,height,foliage,
-                                foliageMaterial,rng);
+                                foliageMaterial,terminalPadCount,rng);
             }
         }
         appendFoliageClump(mesh,trunkNodes.back()+Vec3{0,height*.025f,0},
@@ -309,7 +249,7 @@ void appendProxyTree(EnvironmentMesh& mesh,Vec3 base,float height,float crownRad
             appendProxyAxis(mesh,trunkNodes[node],direction,
                             crownRadius*rng.range(.55f,.76f)*dominance,
                             height*rng.range(.011f,.017f),depth,type,crownRadius,height,
-                            foliage,foliageMaterial,rng);
+                            foliage,foliageMaterial,terminalPadCount,rng);
         }
     }
 }
@@ -362,19 +302,19 @@ float EnvironmentGenerator::terrainHeight(float x,float z) {
     // grid spends its resolution near the oak while retaining a genuinely
     // distant, atmospherically softened mountain silhouette.
     const float angle=std::atan2(z,x);
-    const float ridgeRadius=335.0f+31.0f*std::sin(angle*3+.55f)
-                                   +17.0f*std::sin(angle*5-1.15f)
-                                   +9.0f*std::sin(angle*9+.30f);
-    const float ridgeWidth=43.0f+7.0f*std::sin(angle*4-.40f);
+    const float ridgeRadius=1220.0f+95.0f*std::sin(angle*3+.55f)
+                                    +55.0f*std::sin(angle*5-1.15f)
+                                    +28.0f*std::sin(angle*9+.30f);
+    const float ridgeWidth=145.0f+25.0f*std::sin(angle*4-.40f);
     const float ridgeProfile=std::exp(-((radius-ridgeRadius)*(radius-ridgeRadius))/
                                       (ridgeWidth*ridgeWidth));
     const float peakVariation=clamp(.50f+.24f*std::sin(angle*2-.25f)
                                          +.15f*std::sin(angle*5+1.35f)
                                          +.08f*std::sin(angle*11-.70f),0.0f,1.0f);
-    const float ridgePeaks=32.0f+28.0f*peakVariation;
-    const float foothillDistance=(radius-(ridgeRadius-70.0f))/76.0f;
-    const float foothills=7.0f*std::exp(-foothillDistance*foothillDistance);
-    const float ridgeMask=smoothStep(210,260,radius)*(1-smoothStep(452,478,radius));
+    const float ridgePeaks=62.0f+68.0f*peakVariation;
+    const float foothillDistance=(radius-(ridgeRadius-245.0f))/205.0f;
+    const float foothills=13.0f*std::exp(-foothillDistance*foothillDistance);
+    const float ridgeMask=smoothStep(760,900,radius)*(1-smoothStep(1510,1590,radius));
     const float mountains=ridgeMask*(ridgeProfile*ridgePeaks+foothills);
     return rootMask*(hill+broad+shoulder-shoulderAtOrigin+middleMask*middle+mountains);
 }
@@ -398,7 +338,7 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
     const auto gridCoordinate=[&](int coordinate) {
         const float centered=static_cast<float>(coordinate-(resolution-1)/2)/
                              static_cast<float>((resolution-1)/2);
-        return std::copysign(extent*std::pow(std::abs(centered),1.45f),centered);
+        return std::copysign(extent*std::pow(std::abs(centered),1.78f),centered);
     };
     for(int z=0;z<resolution;++z) {
         const float worldZ=gridCoordinate(z);
@@ -436,7 +376,7 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
                     islandRng.range(0,2*pi)};
     }
 
-    constexpr float cell=.36f;
+    constexpr float cell=.55f;
     const int cells=static_cast<int>(std::floor(2*grassHalfExtent/cell));
     Rng grassRng(seed);
     mesh.grassPatches.reserve(static_cast<size_t>(cells)*cells);
@@ -454,7 +394,9 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
                                     +.07f*std::sin(dx*8.3f-dz*5.2f-island.phase);
             islandStrength=std::max(islandStrength,clamp((ragged-q)*1.7f,0.0f,1.0f));
         }
-        const bool tall=islandStrength>.08f&&grassRng.unit()<(.58f+.34f*islandStrength);
+        // Long grass is a continuous meadow with denser island-like colonies,
+        // rather than a handful of isolated vertical tufts.
+        const bool tall=grassRng.unit()<(.50f+.24f*islandStrength);
         const float canopyShade=1.0f-.26f*(1.0f-smoothStep(5.0f,11.0f,radius));
         const float meadowVariation=.72f+.28f*(.5f+.5f*std::sin(x*.31f+z*.19f));
         const float density=std::min(1.0f,canopyShade*meadowVariation*(tall?1.18f:1.0f));
@@ -464,25 +406,26 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         const Vec3 normal=terrainNormal(x,z);
         const float moisture=clamp(.58f+.20f*std::sin(x*.12f-z*.09f)+
                                    grassRng.range(-.13f,.13f),0,1);
-        const float shortHeight=grassRng.range(.14f,.29f)*(.82f+.25f*moisture);
-        const float tallHeight=tall?grassRng.range(.48f,.94f)*(.86f+.20f*moisture):0.0f;
+        const float shortHeight=grassRng.range(.045f,.120f)*(.88f+.17f*moisture);
+        const float tallHeight=tall?grassRng.range(.42f,.84f)*(.88f+.17f*moisture):0.0f;
         const uint32_t shortCode=static_cast<uint32_t>(clamp(shortHeight/.004f,1,255));
         const uint32_t tallCode=tall?
             static_cast<uint32_t>(clamp(tallHeight/.004f,1,255)):0u;
-        const uint32_t bladeCount=static_cast<uint32_t>(grassRng.range(10.0f,16.0f));
-        const uint32_t tallCount=tall?3u+static_cast<uint32_t>(grassRng.unit()*3.0f):0u;
+        const uint32_t bladeCount=28u+static_cast<uint32_t>(grassRng.unit()*7.0f);
+        const uint32_t tallCount=tall?18u+static_cast<uint32_t>(grassRng.unit()*7.0f):0u;
         const uint32_t packed=(bladeCount&255u)|(shortCode<<8)|(tallCount<<16)|(tallCode<<24);
-        const float maximumHeight=tall?tallHeight:shortHeight;
+        const float maximumHeight=(tall?tallHeight:shortHeight)*2.5f;
         const float slope=std::sqrt(normal.x*normal.x+normal.z*normal.z)/
                           std::max(normal.y,.25f);
-        const float lateralRatio=tall?.547f:.405f;
-        const float maximumWidth=tall?.036f:.0105f;
+        const float lateralRatio=tall?.66f:.52f;
+        const float maximumWidth=tall?.043f:.018f;
+        constexpr float grassBoundsSafety=.012f;
         const float horizontalReach=.245f+maximumHeight*(slope+lateralRatio)+
-                                    maximumWidth+.008f;
+                                    maximumWidth+grassBoundsSafety;
         const float surfaceRise=.245f*slope;
-        const float lowerReach=surfaceRise+maximumWidth*slope+.008f;
+        const float lowerReach=surfaceRise+maximumWidth*slope+grassBoundsSafety;
         const float upperReach=surfaceRise+maximumHeight*(normal.y+lateralRatio*slope)+
-                               maximumWidth*slope+.008f;
+                               maximumWidth*slope+grassBoundsSafety;
         mesh.grassPatches.push_back({x-horizontalReach,baseY-lowerReach,
                                      z-horizontalReach,x+horizontalReach,
                                      baseY+upperReach,z+horizontalReach,
@@ -514,36 +457,20 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         }
     }
 
-    // Near shrubs use actual small leaf polygons; their clumped placement and
-    // three architectures prevent a repeated garden-ornament silhouette.
-    for(int group=0;group<6;++group) {
-        const float groupAngle=detailRng.range(0,2*pi),groupDistance=detailRng.range(5.0f,21.5f);
-        const float gx=std::cos(groupAngle)*groupDistance,gz=std::sin(groupAngle)*groupDistance;
-        const int members=3+static_cast<int>(detailRng.next()%4u);
-        for(int member=0;member<members;++member) {
-            const float angle=detailRng.range(0,2*pi),spread=detailRng.range(.3f,3.2f);
-            const float x=gx+std::cos(angle)*spread,z=gz+std::sin(angle)*spread;
-            const float radiusFromOak=std::sqrt(x*x+z*z);const Vec3 normal=terrainNormal(x,z);
-            if(radiusFromOak<3.2f||radiusFromOak>25||normal.y<.86f)continue;
-            const int type=static_cast<int>(detailRng.next()%3u);
-            const float shrubRadius=type==2?detailRng.range(.75f,1.45f):detailRng.range(.42f,.95f);
-            const float shrubHeight=type==2?detailRng.range(.38f,.72f):detailRng.range(.62f,1.35f);
-            appendShrub(mesh,{x,terrainHeight(x,z),z},shrubRadius,shrubHeight,type,detailRng);
-            ++mesh.shrubCount;
-        }
-    }
+    // Grazing keeps the hero-oak field open.  Shrubs are reserved for the
+    // distant broken hedgerow below, where their scale and silhouette belong.
 
     // Sparse pasture trees establish scale without turning the clearing into
     // a ring of lollipops.  Each distance band uses a cheaper biological LOD;
     // physical size is never reduced merely because an object is farther away.
     struct TreeBand { int target;float inner,outer,spacing;int detail; };
     constexpr std::array<TreeBand,3> treeBands{{
-        {7,56.0f,84.0f,9.0f,2},
-        {11,91.0f,142.0f,12.0f,1},
-        {17,150.0f,225.0f,15.0f,0}
+        {4,245.0f,335.0f,34.0f,2},
+        {6,430.0f,580.0f,46.0f,1},
+        {9,690.0f,880.0f,58.0f,0}
     }};
     std::vector<Vec3> acceptedTrees;
-    acceptedTrees.reserve(35);
+    acceptedTrees.reserve(19);
     for(const auto& band:treeBands) {
         int placed=0,attempts=0;
         while(placed<band.target&&attempts++<900) {
@@ -565,7 +492,9 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
             const uint32_t objectSeed=detailRng.next();Rng objectRng(objectSeed^0x9e3779b9u);
             const uint32_t typeRoll=detailRng.next()%100u;
             const int type=typeRoll<58u?0:(typeRoll<90u?2:1);
-            const float treeHeight=objectRng.range(type==1?5.8f:4.6f,type==1?10.5f:9.2f);
+            const float treeHeight=band.detail==2?objectRng.range(7.0f,10.5f):
+                                   (band.detail==1?objectRng.range(6.2f,9.2f):
+                                                   objectRng.range(5.5f,8.2f));
             const float crownRadius=treeHeight*(type==1?objectRng.range(.18f,.25f):
                                                 objectRng.range(.29f,.43f));
             appendProxyTree(mesh,{x,heightAtBase,z},treeHeight,crownRadius,type,
@@ -578,13 +507,13 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
     // Multi-stem bushes bridge isolated trees into a few broken hedgerow
     // fragments.  Large empty sectors are deliberate and match grazed pasture.
     int backgroundBushes=0,bushAttempts=0;
-    while(backgroundBushes<28&&bushAttempts++<500) {
-        const float angle=detailRng.range(0,2*pi),radius=detailRng.range(31.0f,118.0f);
+    while(backgroundBushes<14&&bushAttempts++<500) {
+        const float angle=detailRng.range(0,2*pi),radius=detailRng.range(315.0f,650.0f);
         const float hedge=.50f+.34f*std::sin(angle*3.0f+radius*.045f)
                               +.18f*std::sin(angle*8.0f-radius*.026f);
         if(detailRng.unit()>clamp(hedge,.10f,.90f))continue;
         const float x=std::cos(angle)*radius,z=std::sin(angle)*radius;
-        if(terrainNormal(x,z).y<(radius<70?.76f:.64f))continue;
+        if(terrainNormal(x,z).y<(radius<300?.72f:.62f))continue;
         const uint32_t objectSeed=detailRng.next();Rng objectRng(objectSeed^0x85ebca6bu);
         appendProxyBush(mesh,{x,terrainHeight(x,z),z},objectRng.range(.48f,1.18f),
                         objectRng.range(.55f,1.28f),objectRng);
