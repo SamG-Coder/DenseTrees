@@ -83,6 +83,10 @@ int main() {
     require(atlas.heightAmplitudeMetres[static_cast<size_t>(GroundMaterialTile::ExposedRockSoil)]>
             atlas.heightAmplitudeMetres[static_cast<size_t>(GroundMaterialTile::MeadowTurf)]*3.0f,
             "rock relief no longer has a physically distinct height scale");
+    require(atlas.heightAmplitudeMetres[static_cast<size_t>(GroundMaterialTile::MeadowTurf)]<=.004f,
+            "meadow normal relief exceeds close-cropped turf scale");
+    require(atlas.heightAmplitudeMetres[static_cast<size_t>(GroundMaterialTile::UplandShortTurf)]<=.0055f,
+            "upland turf relief is large enough to read as folded fabric");
 
     // Grass is now generated from absolute world-grid cells around the camera.
     // This fixed far-field survey is deliberately well beyond the historical

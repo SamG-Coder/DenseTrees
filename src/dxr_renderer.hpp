@@ -18,6 +18,12 @@ struct DebugRenderSettings {
 struct CameraView {
     Vec3 eye{};
     Vec3 forward{0.0f,0.0f,1.0f};
+    // First-person locomotion can expose a lightweight world-space grass
+    // collider.  The raster grass shader evaluates it per blade; no grass
+    // geometry is read back or rewritten on the CPU.
+    Vec3 grassInteractionPosition{};
+    Vec3 grassInteractionVelocity{};
+    bool grassInteractionEnabled = false;
 };
 
 struct PlayerLocalLight {
@@ -25,8 +31,13 @@ struct PlayerLocalLight {
     // The player light is an omnidirectional warm point light by default.
     // Spotlight mode remains available to callers without changing the b0 ABI.
     bool spotlight = false;
-    float intensity = 60.0f;
-    float range = 22.0f;
+    // A small hand-carried lamp.  The shaders use inverse-square falloff, so
+    // the previous value of 60 bleached nearby bark and fluorescently lit the
+    // ground at arm's length.  Four renderer-candela units retain useful
+    // visibility several metres out without driving diffuse albedo into the
+    // tone-mapper's white shoulder.
+    float intensity = 4.0f;
+    float range = 16.0f;
     float innerConeRadians = 0.19198622f; // 11 degrees
     float outerConeRadians = 0.31415927f; // 18 degrees
 };

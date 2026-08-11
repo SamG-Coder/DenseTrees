@@ -45,7 +45,11 @@ struct GroundTextureAtlas {
     std::vector<GroundTextureMip> normalHeightCavity;
 
     // B=0 and B=1 map to -amplitude and +amplitude respectively.
-    std::array<float,tileCount> heightAmplitudeMetres{.010f,.014f,.038f,.016f};
+    // Relief is physical displacement, not a visual-strength knob.  Turf is
+    // a close-cropped millimetre-scale mat; large amplitudes turn its normal
+    // map into a woven tarpaulin under grazing light.  Mineral plates retain
+    // centimetre-scale relief, while moss/silt remains soft and shallow.
+    std::array<float,tileCount> heightAmplitudeMetres{.0035f,.0048f,.028f,.0065f};
 };
 
 struct GroundBiomeInput {

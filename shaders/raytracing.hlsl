@@ -11,6 +11,7 @@ struct Camera {
     uint2 resolution; uint environmentIndexOffset; float localLightOuterCos;
     float4 grassSettings;
     float4 groundSettings;
+    float4 grassInteraction;
 };
 struct RadiancePayload {
     float3 color;
@@ -1235,16 +1236,64 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float material=a.material;float kind=floor(material+.001);
     bool riverSurface=kind>5.5&&kind<6.5;
     bool thinFoliage=(kind>.5&&kind<1.5)||(kind>3.5&&kind<4.5);uint2 pixel=DispatchRaysIndex().xy;float2 random=float2(hash(pixel+camera.frameIndex*13),hash(pixel.yx+camera.frameIndex*29));
-    float barkCavity=0;
+    float barkCavity=0,barkPlateTone=.5;
     if(kind<.5){
         float3 edge1=b.position-a.position,edge2=c.position-a.position;float2 delta1=b.uv-a.uv,delta2=c.uv-a.uv;float determinant=delta1.x*delta2.y-delta1.y*delta2.x;
         if(abs(determinant)>1e-7){
             float inverseDeterminant=1.0/determinant;float3 rawTangent=(edge1*delta2.y-edge2*delta1.y)*inverseDeterminant;float3 rawBitangent=(edge2*delta1.x-edge1*delta2.x)*inverseDeterminant;
             float3 tangent=normalize(rawTangent-surfaceNormal*dot(rawTangent,surfaceNormal));float handedness=dot(cross(tangent,rawBitangent),surfaceNormal)<0?-1.0:1.0;float3 bitangent=normalize(cross(surfaceNormal,tangent))*handedness;
-            float distanceToCamera=distance(camera.eye,hit);float worldFootprint=2*distanceToCamera*camera.tanHalfFov/max(1.0,(float)camera.resolution.y);float grazing=rcp(max(abs(dot(surfaceNormal,-WorldRayDirection())),.20));float texelsPerMetre=max(2048.0/max(length(rawTangent),.01),2048.0*.42/max(length(rawBitangent),.01));float barkMip=clamp(log2(max(worldFootprint*texelsPerMetre*grazing,1.0))-.85+(payload.depth>0?.50:0.0),0.0,11.0);
-            float4 bark=sampleBarkNormal(float2(uv.x,uv.y*.42),barkMip);float physicalRadius=length(rawTangent)*.15915494,ageStrength=smoothstep(.006,.12,physicalRadius);float2 normalXY=(bark.rg*2-1)*lerp(.10,1.0,ageStrength);float normalZ=sqrt(saturate(1-dot(normalXY,normalXY)));float3 tangentNormal=normalize(float3(normalXY,normalZ));
+            float distanceToCamera=distance(camera.eye,hit);float worldFootprint=2*distanceToCamera*camera.tanHalfFov/max(1.0,(float)camera.resolution.y);float grazing=rcp(max(abs(dot(surfaceNormal,-WorldRayDirection())),.20));
+            // Mesh U is exactly one turn around every ring, so sampling U
+            // directly makes bark plates grow and shrink with limb radius.
+            // Both repeat candidates are integers and therefore meet at the
+            // duplicated U=0/1 seam. Cross-fading them keeps the apparent
+            // repeat width close to 1.15 m without a pop while a branch tapers.
+            // Within that repeat the generated metre-space texture contains
+            // nonuniform, wandering fissures and bounded fork/merge events.
+            // V is accumulated branch arc in metres.
+            const float barkRepeatWidthMetres=1.15;
+            const float barkRepeatHeightMetres=2.40;
+            float circumference=max(length(rawTangent),.01);
+            float idealRepeats=max(1.0,circumference/barkRepeatWidthMetres);
+            float repeatLow=floor(idealRepeats),repeatHigh=repeatLow+1.0;
+            float repeatBlend=smoothstep(.16,.84,frac(idealRepeats));
+            float effectiveRepeats=lerp(repeatLow,repeatHigh,repeatBlend);
+            float texelsPerMetreU=2048.0*effectiveRepeats/circumference;
+            float texelsPerMetreV=2048.0/(barkRepeatHeightMetres*
+                max(length(rawBitangent),.01));
+            float texelsPerMetre=max(texelsPerMetreU,texelsPerMetreV);
+            float barkMip=clamp(log2(max(worldFootprint*texelsPerMetre*grazing,1.0))-.85+(payload.depth>0?.50:0.0),0.0,11.0);
+            float barkV=uv.y/barkRepeatHeightMetres;
+            float4 barkLow=sampleBarkNormal(float2(uv.x*repeatLow,barkV),barkMip);
+            float4 barkHigh=sampleBarkNormal(float2(uv.x*repeatHigh,barkV),barkMip);
+            float4 bark=lerp(barkLow,barkHigh,repeatBlend);
+            float physicalRadius=circumference*.15915494,ageStrength=smoothstep(.006,.12,physicalRadius);float2 normalXY=(bark.rg*2-1)*lerp(.06,.64,ageStrength);float normalZ=sqrt(saturate(1-dot(normalXY,normalXY)));float3 tangentNormal=normalize(float3(normalXY,normalZ));
             n=normalize(tangent*tangentNormal.x+bitangent*tangentNormal.y+surfaceNormal*tangentNormal.z);if(dot(n,WorldRayDirection())>0)n=-n;
-            barkCavity=bark.b*lerp(.10,1.0,ageStrength);float plateTone=bark.a,luminance=dot(albedo,float3(.2126,.7152,.0722));float3 oakPlate=lerp(albedo,luminance.xxx,.18+.12*plateTone)*lerp(.86,1.28,plateTone);float3 fissureColor=srgbToLinear(float3(.075,.060,.045));albedo=lerp(oakPlate,fissureColor,smoothstep(.14,.92,barkCavity)*.74);
+            barkCavity=bark.b*lerp(.10,1.0,ageStrength);barkPlateTone=bark.a;
+            float luminance=dot(albedo,float3(.2126,.7152,.0722));
+            // Mesh age tint remains useful, but its old full-range multiplier
+            // made fine limbs nearly black beside tan sunlit scaffold limbs.
+            // Nudge each order toward a narrow physical oak-albedo energy band
+            // before applying plate and cavity variation.
+            float3 oakReference=srgbToLinear(lerp(
+                float3(.202,.198,.190),float3(.235,.228,.215),ageStrength));
+            albedo=lerp(albedo,oakReference,.86);
+            float targetBarkLuminance=lerp(.034,.047,ageStrength);
+            float energyCorrection=clamp(targetBarkLuminance/
+                max(dot(albedo,float3(.2126,.7152,.0722)),.008),.76,1.20);
+            albedo*=lerp(1.0,energyCorrection,.76);
+            luminance=dot(albedo,float3(.2126,.7152,.0722));
+            // Mature oak plates are mostly desaturated grey-brown, with
+            // charcoal fissures and only modest plate-to-plate contrast.  The
+            // previous 1.28 highlight multiplier made wet bark resemble
+            // glossy moulded clay.
+            float3 oakPlate=lerp(albedo,luminance.xxx,.46+.07*barkPlateTone)*
+                            lerp(.87,1.075,barkPlateTone);
+            float weathered=smoothstep(.50,.72,barkPlateTone)*ageStrength;
+            oakPlate=lerp(oakPlate,oakPlate*float3(.93,.97,.91),weathered*.12);
+            float3 fissureColor=srgbToLinear(float3(.027,.024,.021));
+            albedo=lerp(oakPlate,fissureColor,
+                        smoothstep(.10,.78,barkCavity)*.78);
         }
     }
     float terrainMoisture=.5,terrainCavity=0,terrainRoughness=.9,puddleMask=0;
@@ -1259,6 +1308,11 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float terrainRetention=0,terrainSlope=0;
     float materialRoughness=kind<.5?.74:(kind<1.5?.40:(kind<2.5?.90:
                             (kind<3.5?.67:(kind<4.5?.48:.72))));
+    if(kind<.5){
+        // Dry fissured oak is strongly diffuse.  Plate crowns polish only
+        // slightly; cavities stay rough until the global wet-film pass.
+        materialRoughness=clamp(.93-.06*barkPlateTone+.04*barkCavity,.84,.97);
+    }
     if(kind>1.5&&kind<2.5){
         float terrainDistance=distance(camera.eye,hit);
         float pixelWorld=2*terrainDistance*camera.tanHalfFov/max(1.0,(float)camera.resolution.y);
@@ -1360,7 +1414,14 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             terrainCavity=textureNormal.a*nearTextureWeight*.55;
             terrainMicroHeight=textureNormal.b;
             terrainMicroCoverage=nearTextureWeight;
-            float normalStrength=nearTextureWeight*clamp(camera.groundSettings.x,0.0,2.0)*.92;
+            // The atlas stores physical millimetre-scale turf relief.  Keep
+            // its response below the geometric grass silhouette and reserve
+            // stronger normal modulation for genuinely exposed soil.  A
+            // near-unity multiplier here made short turf look like folded
+            // tarpaulin under grazing sun.
+            float turfRelief=lerp(.43,.68,soilMask);
+            float normalStrength=nearTextureWeight*
+                clamp(camera.groundSettings.x,0.0,2.0)*turfRelief;
             float2 mapXY=(textureNormal.rg*2-1)*normalStrength;
             float mapZ=sqrt(saturate(1-dot(mapXY,mapXY)));
             float3 tangent=normalize(float3(1,-surfaceNormal.x/max(surfaceNormal.y,.12),0));
@@ -1608,7 +1669,18 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         if(localNdotL>1e-4){
             float localVisibility=playerLocalLightVisibility(
                 hit,localLight.direction,localLight.distance);
-            direct+=localLight.radiance*localNdotL*localVisibility;
+            float3 localDiffuse=localLight.radiance*localNdotL*localVisibility;
+            if(kind<.5){
+                // The player lamp is intentionally powerful enough to expose
+                // the landscape.  At arm's length its inverse-square value can
+                // otherwise push low-albedo bark through the display shoulder
+                // and turn it flat cream. Bound bark irradiance while keeping
+                // the light's warm chromaticity and exact cast shadow.
+                localDiffuse*=2.05;
+                float localEnergy=dot(localDiffuse,float3(.2126,.7152,.0722));
+                localDiffuse*=min(1.0,1.90/max(localEnergy,1e-4));
+            }
+            direct+=localDiffuse;
         }
     }
     if(riverSurface){
@@ -1618,7 +1690,14 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         ambient*=lerp(.96,.68,riverCentreDepth);
         direct*=lerp(.50,.12,riverCentreDepth);
     }
-    if(kind<.5)ambient*=lerp(1,.68,barkCavity);
+    if(kind<.5){
+        ambient*=lerp(1,.68,barkCavity);
+        // The open-grown oak receives a broad pasture/sky bounce even when
+        // its crown occludes the key light. Without this low-energy neutral
+        // fill, realistic dark bark collapsed to display black between the
+        // lamp cone and sun-facing facets.
+        ambient+=float3(.055,.058,.057)*daylightAmount()*(1-.30*barkCavity);
+    }
     if(kind>1.5&&kind<2.5){
         ambient*=lerp(.94,1.02,terrainMoisture)*lerp(1.0,.86,terrainCavity);
         ambient+=float3(.014,.019,.010);
@@ -1627,8 +1706,20 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         unmodulated+=keyRadiance*groundSpecular*(1-terrainRoughness)*.10*visibility;
     }
     if(kind>.5&&kind<1.5){
-        float midrib=exp(-abs(uv.x-.5)*150);float secondary=exp(-abs(frac((uv.y+abs(uv.x-.5)*.72)*6)-.5)*34);float veins=saturate(midrib*.82+secondary*.28);float edge=saturate(length((uv-.5)*float2(1.25,1.0))*2);
-        float chlorophyll=lerp(1.08,.76,edge)*lerp(1,.58,veins);albedo*=upperFace?float3(.82,1.0,.76):float3(1.05,1.16,.90);albedo=lerp(albedo,float3(.25,.38,.13),veins*.42);
+        float2 leafPoint=uv-.5;
+        float midrib=exp(-abs(leafPoint.x)*145);
+        float veinWarp=(valueNoise(uv*float2(9.7,12.3)+
+                                    float2(hit.x+hit.z,hit.y)*.17)-.5)*.11;
+        float secondary=exp(-abs(frac((uv.y+abs(leafPoint.x)*.68+
+                                       veinWarp)*5.65)-.5)*31);
+        secondary*=smoothstep(.045,.18,abs(leafPoint.x))*(1-smoothstep(.39,.51,abs(leafPoint.x)));
+        float veins=saturate(midrib*.78+secondary*.22);
+        float edge=saturate(length(leafPoint*float2(1.25,1.0))*2);
+        float pigment=valueNoise(uv*float2(17.0,13.0)+hit.xz*.11);
+        float chlorophyll=lerp(1.06,.78,edge)*lerp(1,.68,veins);
+        albedo*=lerp(.90,1.07,pigment);
+        albedo*=upperFace?float3(.88,.98,.80):float3(1.04,1.12,.91);
+        albedo=lerp(albedo,float3(.18,.285,.085),veins*.24);
         float pathLength=(.24+.28*chlorophyll)/max(abs(dot(geometricNormal,sunDir)),.16);float3 absorption=float3(2.55,.72,3.25);float3 transmittance=exp(-absorption*pathLength);float back=saturate(dot(-n,sunDir));unmodulated+=transmittance*keyRadiance*back*visibility*.68;
         float roughness=upperFace?.34:.58;float3 viewDirection=normalize(camera.eye-hit),halfVector=normalize(sunDir+viewDirection);float ndh=saturate(dot(n,halfVector));float fresnel=.022+.978*pow(1-saturate(dot(n,viewDirection)),5);unmodulated+=keyRadiance*fresnel*pow(ndh,lerp(70,18,roughness))*(upperFace?.42:.12);
     }

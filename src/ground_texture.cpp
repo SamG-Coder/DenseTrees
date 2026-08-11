@@ -118,21 +118,42 @@ struct MaterialSample {
     float red{},green{},blue{},roughness{},height{},cavity{};
 };
 
+// A cut stem occupies only its own cellular neighbourhood.  Unlike a global
+// periodic stripe it cannot continue for metres across adjacent texels, so it
+// reads as scattered thatch rather than a woven or brushed normal pattern.
+float cellularStemFragment(const CellularSample& stem,float length,float width,
+                           float presenceThreshold) {
+    const float angle=stem.identity*6.28318530718f;
+    const float cosine=std::cos(angle),sine=std::sin(angle);
+    const float along=stem.localX*cosine+stem.localY*sine;
+    const float across=-stem.localX*sine+stem.localY*cosine;
+    const float longitudinal=1-smoothStep(length*.58f,length,std::abs(along));
+    const float lateral=1-smoothStep(width*.45f,width,std::abs(across));
+    return longitudinal*lateral*smoothStep(presenceThreshold,
+                                            presenceThreshold+.18f,
+                                            stem.identity);
+}
+
 MaterialSample denseTurf(float u,float v,uint32_t seed) {
     const float macro=periodicFbm(u,v,4,5,seed^0x71b52a91u);
     const float fine=periodicFbm(u,v,32,4,seed^0x36d17ab5u);
-    const float warp=(periodicValueNoise(u,v,13,seed^0xad90777du)-.5f)*.16f;
-    const float bladeA=periodicStripe(u,v,113,37,warp,.014f,.032f);
-    const float bladeB=periodicStripe(u,v,-67,149,warp*.73f+.17f,.011f,.027f);
-    const float blades=saturate(bladeA*.72f+bladeB*.48f);
+    const CellularSample mat=periodicCellular(u,v,37,seed^0xad90777du);
+    const CellularSample cutA=periodicCellular(u,v,103,seed^0x3142c7a1u);
+    const CellularSample cutB=periodicCellular(u,v,71,seed^0xf0ad239bu);
+    const float turfClump=(1-smoothStep(.12f,.48f,mat.nearest))*(.72f+.28f*mat.identity);
+    const float fragments=saturate(cellularStemFragment(cutA,.39f,.060f,.40f)+
+                                   cellularStemFragment(cutB,.34f,.052f,.61f)*.70f);
     const float pale=smoothStep(.70f,.94f,periodicValueNoise(u,v,19,seed^0x05f131b7u));
     MaterialSample sample;
-    sample.red=mix(.030f,.070f,macro)+.016f*blades+.018f*pale;
-    sample.green=mix(.088f,.170f,macro)+.034f*blades+.020f*pale;
-    sample.blue=mix(.010f,.033f,fine)+.006f*blades+.006f*pale;
-    sample.roughness=saturate(.94f-.075f*blades-.035f*macro+.025f*(1-fine));
-    sample.height=saturate(.43f+.17f*(macro-.5f)+.16f*(fine-.5f)+.20f*blades);
-    sample.cavity=saturate(.10f+.28f*(1-fine)+.32f*(1-blades)*smoothStep(.35f,.75f,macro));
+    sample.red=mix(.030f,.070f,macro)+.010f*turfClump+.012f*fragments+.018f*pale;
+    sample.green=mix(.088f,.170f,macro)+.020f*turfClump+.026f*fragments+.020f*pale;
+    sample.blue=mix(.010f,.033f,fine)+.004f*turfClump+.005f*fragments+.006f*pale;
+    sample.roughness=saturate(.95f-.030f*turfClump-.045f*fragments-
+                              .025f*macro+.018f*(1-fine));
+    sample.height=saturate(.48f+.090f*(macro-.5f)+.075f*(fine-.5f)+
+                           .070f*turfClump+.045f*fragments);
+    sample.cavity=saturate(.08f+.18f*(1-fine)+.16f*(1-turfClump)*
+                           smoothStep(.35f,.75f,macro));
     return sample;
 }
 
@@ -143,10 +164,11 @@ MaterialSample coarseMeadow(float u,float v,uint32_t seed) {
     const CellularSample tuft=periodicCellular(u,v,23,seed^0x30b4a6c9u);
     const CellularSample stone=periodicCellular(u,v,71,seed^0xc075b31du);
     const float tuftMask=(1-smoothStep(.15f,.49f,tuft.nearest))*(.60f+.40f*tuft.identity);
-    const float warp=(periodicValueNoise(u,v,11,seed^0x4f1bbcddu)-.5f)*.20f;
-    const float stemA=periodicStripe(u,v,73,19,warp,.009f,.022f);
-    const float stemB=periodicStripe(u,v,-37,101,warp*.63f+.31f,.007f,.019f);
-    const float stems=saturate((stemA*.62f+stemB*.44f)*(.34f+.82f*tuftMask));
+    const CellularSample cutA=periodicCellular(u,v,67,seed^0x4f1bbcddu);
+    const CellularSample cutB=periodicCellular(u,v,49,seed^0x75dd81a3u);
+    const float stems=saturate((cellularStemFragment(cutA,.43f,.055f,.34f)*.68f+
+                                cellularStemFragment(cutB,.38f,.050f,.57f)*.48f)*
+                               (.34f+.82f*tuftMask));
     const float exposedGrit=(1-smoothStep(.10f,.25f,stone.nearest))*
                             smoothStep(.70f,.94f,stone.identity)*smoothStep(.50f,.76f,dryPatch);
     const float dryness=smoothStep(.47f,.80f,dryPatch+.13f*(1-macro));
@@ -157,8 +179,8 @@ MaterialSample coarseMeadow(float u,float v,uint32_t seed) {
     sample.green=mix(greenG,dryG,dryness)+.019f*stems+.041f*exposedGrit;
     sample.blue=mix(greenB,dryB,dryness)+.005f*stems+.034f*exposedGrit;
     sample.roughness=saturate(.93f+.025f*dryness-.070f*stems-.090f*exposedGrit);
-    sample.height=saturate(.41f+.13f*(macro-.5f)+.10f*(grit-.5f)+
-                           .15f*tuftMask+.18f*stems+.16f*exposedGrit);
+    sample.height=saturate(.46f+.085f*(macro-.5f)+.070f*(grit-.5f)+
+                           .085f*tuftMask+.055f*stems+.10f*exposedGrit);
     sample.cavity=saturate(.12f+.26f*(1-tuftMask)+.18f*(1-stems)*
                            smoothStep(.42f,.78f,dryPatch));
     return sample;

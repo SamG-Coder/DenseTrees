@@ -28,22 +28,248 @@ float fade(float t){return t*t*t*(t*(t*6-15)+10);}
 float smoothRange(float low,float high,float value){const float t=clamp((value-low)/(high-low),0,1);return t*t*(3-2*t);}
 uint32_t gridHash(int x,int y){uint32_t h=static_cast<uint32_t>(x)*0x8da6b343u^static_cast<uint32_t>(y)*0xd8163841u^0xcb1ab31fu;h^=h>>13;h*=0x85ebca6bu;h^=h>>16;return h;}
 float tileNoise(float u,float v,int cells){const float x=u*cells,y=v*cells;const int ix=static_cast<int>(std::floor(x)),iy=static_cast<int>(std::floor(y));const float fx=fade(x-ix),fy=fade(y-iy);auto sample=[&](int px,int py){px=(px%cells+cells)%cells;py=(py%cells+cells)%cells;return static_cast<float>(gridHash(px,py)>>8)*(1.0f/16777216.0f);};const float a=sample(ix,iy),b=sample(ix+1,iy),c=sample(ix,iy+1),d=sample(ix+1,iy+1);return(a+(b-a)*fx)+((c+(d-c)*fx)-(a+(b-a)*fx))*fy;}
-struct CellularSample{float edge{},value{};};
-CellularSample cellularPlate(float u,float v,int cellsX,int cellsY,uint32_t salt){
-    u-=std::floor(u);v-=std::floor(v);const float gx=u*cellsX,gy=v*cellsY;const int ix=static_cast<int>(std::floor(gx)),iy=static_cast<int>(std::floor(gy));float nearest=1e9f,second=1e9f,bestValue=.5f;
-    for(int oy=-1;oy<=1;++oy)for(int ox=-1;ox<=1;++ox){const int cellX=ix+ox,cellY=iy+oy,wrappedX=(cellX%cellsX+cellsX)%cellsX,wrappedY=(cellY%cellsY+cellsY)%cellsY;const uint32_t h0=gridHash(wrappedX+static_cast<int>(salt*17u),wrappedY-static_cast<int>(salt*11u)),h1=gridHash(wrappedX-static_cast<int>(salt*7u),wrappedY+static_cast<int>(salt*23u));const float jitterX=.12f+.76f*static_cast<float>((h0>>8)&0xffffu)/65535.0f,jitterY=.10f+.80f*static_cast<float>((h1>>8)&0xffffu)/65535.0f;const float dx=cellX+jitterX-gx,dy=cellY+jitterY-gy,distance=dx*dx+dy*dy;if(distance<nearest){second=nearest;nearest=distance;bestValue=static_cast<float>((h0>>24)&255u)/255.0f;}else if(distance<second)second=distance;}
-    return {std::sqrt(second)-std::sqrt(nearest),bestValue};
-}
 std::vector<uint32_t> makeOakBarkNormal(UINT width,UINT height){
-    const size_t count=static_cast<size_t>(width)*height;std::vector<float> heightField(count),cavityField(count),toneField(count);
-    for(UINT y=0;y<height;++y)for(UINT x=0;x<width;++x){
-        const float u=(x+.5f)/width,v=(y+.5f)/height,broad=tileNoise(u,v,5),medium=tileNoise(u,v,19),fine=tileNoise(u,v,93),grain=tileNoise(u,v,191);const float warpedU=u+(broad-.5f)*.034f+(medium-.5f)*.009f,warpedV=v+(broad-.5f)*.026f+(medium-.5f)*.007f;const CellularSample primary=cellularPlate(warpedU,warpedV,42,5,3),secondary=cellularPlate(warpedU+(fine-.5f)*.006f,warpedV,14,30,19);const float primaryFissure=std::pow(1-smoothRange(.035f,.145f,primary.edge),1.18f),secondaryFissure=std::pow(1-smoothRange(.018f,.082f,secondary.edge),1.30f)*(1-primaryFissure*.72f),plate=std::pow(smoothRange(.028f,.29f,primary.edge),.62f),fiber=std::abs(std::sin(2*pi*(u*167+(medium-.5f)*2.4f+(fine-.5f)*.55f)));const size_t index=static_cast<size_t>(y)*width+x;
-        heightField[index]=.0025f*(broad-.5f)+.0045f*plate-.0155f*primaryFissure-.0048f*secondaryFissure*plate+.00115f*(fine-.5f)+.00038f*(grain-.5f)+.00028f*(fiber-.5f);
-        cavityField[index]=clamp(.90f*primaryFissure+.42f*secondaryFissure+.08f*std::max(0.0f,.5f-grain),0,1);
-        toneField[index]=clamp(.50f+.22f*(primary.value-.5f)+.14f*(broad-.5f)+.10f*(medium-.5f)+.06f*(fine-.5f)-.12f*secondaryFissure,0,1);
+    const size_t count=static_cast<size_t>(width)*height;
+    std::vector<float> heightField(count),cavityField(count),toneField(count);
+    std::vector<float> fissures(count),shoulders(count),crossChecks(count);
+    constexpr float physicalWidth=1.15f,physicalHeight=2.40f;
+    const float texelWidth=physicalWidth/width,texelHeight=physicalHeight/height;
+    const auto hash01=[](uint32_t seed){
+        seed^=seed>>16;seed*=0x7feb352du;seed^=seed>>15;
+        seed*=0x846ca68bu;seed^=seed>>16;
+        return static_cast<float>(seed>>8)*(1.0f/16777216.0f);
+    };
+    const auto wrap=[](int value,int extent){
+        value%=extent;return value<0?value+extent:value;
+    };
+    const auto periodic=[](float value){
+        value-=std::floor(value);return value;
+    };
+
+    // Stamp a physical-width vertical sample into a single texel row.  The
+    // wider shoulder is deliberately irregular and shallow; the core is the
+    // only deeply recessed part of the fissure.  This avoids both engraved
+    // hairlines and the broad, inflated grooves of the previous bark.
+    const auto stampRow=[&](float centreU,UINT y,float coreWidth,
+                            float strength,float crossAmount){
+        centreU=periodic(centreU);
+        const float centre=centreU*width-.5f;
+        // The shoulder reaches into a significant fraction of the 2--8 cm
+        // plate spacing.  That gives each plate a raised, chipped crown
+        // instead of leaving a flat clay field between engraved lines.
+        const float outerWidth=coreWidth*2.8f+.0085f;
+        const int radius=static_cast<int>(std::ceil(outerWidth/texelWidth))+1;
+        const int centrePixel=static_cast<int>(std::floor(centre));
+        for(int offset=-radius;offset<=radius;++offset){
+            const float distance=std::abs((centrePixel+offset+.5f)-centre)*texelWidth;
+            if(distance>=outerWidth)continue;
+            const float core=1-smoothRange(coreWidth,coreWidth*1.85f+.0005f,distance);
+            const float shoulder=1-smoothRange(coreWidth*1.35f,outerWidth,distance);
+            const size_t index=static_cast<size_t>(y)*width+
+                               wrap(centrePixel+offset,static_cast<int>(width));
+            fissures[index]=std::max(fissures[index],core*strength);
+            shoulders[index]=std::max(shoulders[index],shoulder*strength);
+            crossChecks[index]=std::max(crossChecks[index],core*crossAmount);
+        }
+    };
+    const auto stampDisc=[&](float centreU,float centreV,float coreWidth,
+                             float strength,float crossAmount){
+        centreU=periodic(centreU);centreV=periodic(centreV);
+        const float centreX=centreU*width-.5f,centreY=centreV*height-.5f;
+        const float outerWidth=coreWidth*2.35f+.0045f;
+        const int radiusX=static_cast<int>(std::ceil(outerWidth/texelWidth))+1;
+        const int radiusY=static_cast<int>(std::ceil(outerWidth/texelHeight))+1;
+        const int pixelX=static_cast<int>(std::floor(centreX));
+        const int pixelY=static_cast<int>(std::floor(centreY));
+        for(int oy=-radiusY;oy<=radiusY;++oy)for(int ox=-radiusX;ox<=radiusX;++ox){
+            const float dx=(pixelX+ox+.5f-centreX)*texelWidth;
+            const float dy=(pixelY+oy+.5f-centreY)*texelHeight;
+            const float distance=std::sqrt(dx*dx+dy*dy);
+            if(distance>=outerWidth)continue;
+            const float core=1-smoothRange(coreWidth,coreWidth*1.72f+.00035f,distance);
+            const float shoulder=1-smoothRange(coreWidth*1.25f,outerWidth,distance);
+            const size_t index=static_cast<size_t>(wrap(pixelY+oy,
+                static_cast<int>(height)))*width+wrap(pixelX+ox,static_cast<int>(width));
+            fissures[index]=std::max(fissures[index],core*strength);
+            shoulders[index]=std::max(shoulders[index],shoulder*strength);
+            crossChecks[index]=std::max(crossChecks[index],core*crossAmount);
+        }
+    };
+
+    struct BarkTrack{float base,width,wander,phase;uint32_t seed;bool persistent;};
+    constexpr int trackCount=27;
+    std::vector<float> gaps(trackCount);float gapSum=0;
+    for(int i=0;i<trackCount;++i){
+        // A broad distribution of spacings is essential: equal phase spacing
+        // immediately reads as a machined comb on cylindrical trunks.
+        const float random=hash01(0x41c64e6du+static_cast<uint32_t>(i)*0x9e3779b9u);
+        gaps[i]=.55f+1.15f*std::pow(random,1.35f);gapSum+=gaps[i];
     }
-    std::vector<uint32_t> pixels(count);auto encode=[](float value){return static_cast<uint32_t>(clamp((value*.5f+.5f)*255.0f,0,255));};const float texelWidth=4.25f/width,texelHeight=2.40f/height;
-    for(UINT y=0;y<height;++y)for(UINT x=0;x<width;++x){const size_t left=static_cast<size_t>(y)*width+(x+width-1)%width,right=static_cast<size_t>(y)*width+(x+1)%width,down=static_cast<size_t>((y+height-1)%height)*width+x,up=static_cast<size_t>((y+1)%height)*width+x,index=static_cast<size_t>(y)*width+x;const float dhdx=(heightField[right]-heightField[left])/(2*texelWidth),dhdy=(heightField[up]-heightField[down])/(2*texelHeight);const float inverse=1/std::sqrt(dhdx*dhdx*.82f*.82f+dhdy*dhdy*.95f*.95f+1);const float nx=-dhdx*.82f*inverse,ny=-dhdy*.95f*inverse;const uint32_t r=encode(nx),g=encode(ny),b=static_cast<uint32_t>(clamp(cavityField[index]*255.0f,0,255)),a=static_cast<uint32_t>(clamp(toneField[index]*255.0f,0,255));pixels[index]=r|(g<<8)|(b<<16)|(a<<24);}
+    std::vector<BarkTrack> tracks;tracks.reserve(trackCount);
+    float cursor=.037f;
+    for(int i=0;i<trackCount;++i){
+        const uint32_t seed=0xa511e9b3u+static_cast<uint32_t>(i)*0x85ebca6bu;
+        const float r0=hash01(seed),r1=hash01(seed^0x68bc21ebu);
+        const float r2=hash01(seed^0x02e5be93u);
+        tracks.push_back({periodic(cursor/gapSum),.00125f+.0046f*r0*r0,
+                          .013f+.024f*r1,.13f+.74f*r2,seed,(i%9)==0});
+        cursor+=gaps[i];
+    }
+
+    const auto trackCentre=[&](const BarkTrack&track,float v){
+        // Periodic value noise gives a wandering path without the obvious
+        // wavelength and mirrored turns of a sinusoid.  Both samples tile in
+        // V, so the runtime texture remains seamless along branch length.
+        const float low=tileNoise(periodic(track.base+track.phase),v,7)-.5f;
+        const float mid=tileNoise(periodic(track.base*.61f+track.phase+.271f),v,23)-.5f;
+        const float jag=tileNoise(periodic(track.base*.37f+track.phase+.613f),v,53)-.5f;
+        const float curl=std::sin(2*pi*(v*(2+(track.seed%3))+
+                                       track.phase+low*.12f));
+        return periodic(track.base+(low*.50f+mid*.34f+jag*.16f)*track.wander/
+                         physicalWidth+curl*.0024f/physicalWidth);
+    };
+
+    for(UINT y=0;y<height;++y){
+        const float v=(y+.5f)/height;
+        for(size_t i=0;i<tracks.size();++i){
+            const BarkTrack&track=tracks[i];
+            const float centre=trackCentre(track,v);
+            const float widthNoise=tileNoise(periodic(track.base+.419f),v,13);
+            const float activityNoise=tileNoise(periodic(track.base*.77f+.193f),v,7);
+            // A second, shorter-period gate prevents the non-primary tracks
+            // from surviving as metre-long etched lines.  Primary fissures
+            // remain connected, but even those taper through quiet sections.
+            const float segmentNoise=tileNoise(
+                periodic(track.base*1.31f+track.phase*.43f+.487f),v,13);
+            const float segmentGate=smoothRange(.28f,.65f,segmentNoise);
+            const float activity=track.persistent?
+                (.24f+.76f*activityNoise)*(.38f+.62f*segmentGate):
+                smoothRange(.26f,.68f,activityNoise)*segmentGate;
+            if(activity>.025f){
+                const float width=track.width*(.62f+(1.55f-.62f)*widthNoise);
+                stampRow(centre,y,width,activity,0);
+            }
+        }
+
+        // Short daughter fissures peel away from a parent and merge back at a
+        // different height.  Only a handful exist per tile: enough to create
+        // natural splits and irregular plate faces without returning to a
+        // closed Voronoi/fish-scale pattern.
+        for(int fork=0;fork<17;++fork){
+            const uint32_t seed=0x7f4a7c15u+static_cast<uint32_t>(fork)*0x9e3779b9u;
+            const BarkTrack&parent=tracks[(fork*5+2)%tracks.size()];
+            const float start=hash01(seed^0x31f14a4du);
+            const float span=.09f+.25f*hash01(seed^0x94d049bbu);
+            const float relative=periodic(v-start);
+            if(relative>=span)continue;
+            const float t=relative/span;
+            const float envelope=std::pow(std::sin(pi*t),.82f);
+            const float side=hash01(seed^0x5bd1e995u)<.5f?-1.0f:1.0f;
+            const float separation=(.012f+.047f*hash01(seed^0x27d4eb2du))*
+                                   envelope/physicalWidth;
+            const float centre=periodic(trackCentre(parent,v)+side*separation+
+                (tileNoise(parent.base+.37f,v,17)-.5f)*.006f/physicalWidth);
+            const float strength=envelope*(.50f+.38f*hash01(seed^0x165667b1u));
+            stampRow(centre,y,parent.width*.72f,strength,0);
+        }
+
+        // Fine high-order fissures are narrow, intermittent and independently
+        // placed.  They supply close-up complexity without adding another
+        // evenly spaced global stripe family.
+        for(int fineTrack=0;fineTrack<31;++fineTrack){
+            const uint32_t seed=0xd1b54a35u+static_cast<uint32_t>(fineTrack)*0x94d049bbu;
+            const float base=hash01(seed);
+            const float gate=tileNoise(periodic(base+.281f),v,13);
+            const float activity=smoothRange(.52f,.72f,gate)*(.22f+.30f*hash01(seed^0x33u));
+            if(activity<=.02f)continue;
+            const float wander=(tileNoise(periodic(base+.417f),v,19)-.5f)*
+                               .025f/physicalWidth;
+            stampRow(base+wander,y,.00065f+.00075f*hash01(seed^0xa5u),
+                     activity,0);
+        }
+    }
+
+    // Build cross-checks as graph edges between neighbouring longitudinal
+    // tracks. Random isolated dashes looked like scratches on clay; these
+    // strokes actually terminate in fissures and therefore form the dense,
+    // interlocking elongated plates visible on mature oak. Nearly half are
+    // blind checks, leaving the network open rather than a regular grid.
+    for(int gap=0;gap<trackCount;++gap){
+        const BarkTrack&left=tracks[gap];
+        const BarkTrack&right=tracks[(gap+1)%trackCount];
+        const uint32_t gapSeed=0x243f6a88u+static_cast<uint32_t>(gap)*0x9e3779b9u;
+        const int checkCount=7+static_cast<int>(hash01(gapSeed^0x51ed270bu)*7);
+        for(int check=0;check<checkCount;++check){
+            const uint32_t seed=gapSeed+static_cast<uint32_t>(check)*0x85ebca6bu;
+            if(hash01(seed^0x7f4a7c15u)<.11f)continue;
+            // Independent positions intentionally permit clusters and long
+            // quiet spans. Stratifying one check per band made the previous
+            // result read as staggered brickwork despite random phases.
+            const float v0=hash01(seed^0x8aed2a6bu);
+            const float verticalDrift=(hash01(seed^0xc2b2ae35u)-.5f)*.018f/
+                                      physicalHeight;
+            const float v1=periodic(v0+verticalDrift);
+            const float leftU=trackCentre(left,v0),rightU=trackCentre(right,v1);
+            const float expectedDelta=periodic(right.base-left.base);
+            float delta=rightU-leftU;
+            delta+=std::round(expectedDelta-delta);
+            const bool blind=hash01(seed^0x27d4eb2fu)<.68f;
+            const bool fromRight=hash01(seed^0x165667b1u)<.5f;
+            const float extent=blind?( .22f+.56f*hash01(seed^0xd3a2646cu)):1.0f;
+            const float width=.00070f+.00185f*hash01(seed^0x94d049bbu);
+            const int steps=std::max(5,static_cast<int>(std::ceil(
+                std::abs(delta)*physicalWidth/texelWidth*.70f)));
+            for(int step=0;step<=steps;++step){
+                const float t=static_cast<float>(step)/steps;
+                const float pathT=fromRight?1-t*extent:t*extent;
+                const float envelope=std::pow(std::sin(pi*clamp(t,.001f,.999f)),.25f);
+                const float bend=std::sin(pi*pathT)*
+                    (hash01(seed^0x5bd1e995u)-.5f)*.010f/physicalWidth;
+                const float u=leftU+delta*pathT+bend;
+                const float v=periodic(v0+(v1-v0)*pathT+
+                    std::sin(pi*pathT)*(hash01(seed^0x31f14a4du)-.5f)*
+                    .008f/physicalHeight);
+                stampDisc(u,v,width,(.40f+.25f*envelope),.57f*envelope);
+            }
+        }
+    }
+
+    for(UINT y=0;y<height;++y)for(UINT x=0;x<width;++x){
+        const float u=(x+.5f)/width,v=(y+.5f)/height;
+        const float broad=tileNoise(u,v,5),medium=tileNoise(u,v,17);
+        const float fine=tileNoise(u,v,67),fineOffset=tileNoise(u+.193f,v-.127f,67);
+        const float chip=tileNoise(u+.071f,v+.219f,43);
+        const float grain=tileNoise(u,v,193);
+        const size_t index=static_cast<size_t>(y)*width+x;
+        const float fissure=clamp(fissures[index],0.0f,1.0f);
+        const float shoulder=clamp(shoulders[index],0.0f,1.0f);
+        const float cross=clamp(crossChecks[index],0.0f,1.0f);
+        const float ridgeCrown=std::pow(clamp(1-shoulder,0.0f,1.0f),.68f)*
+                               (.78f+(1.16f-.78f)*medium);
+        const float pore=std::pow(clamp(.43f-grain,0.0f,1.0f)*1.75f,2.1f);
+        // A shallow, broken two-dimensional microfracture relief roughens the
+        // plate faces. It is height-only: keeping it out of the albedo/tone
+        // channel prevents the white salt-and-pepper sparkle seen under the
+        // local player light.
+        const float microDistance=std::abs(fine-fineOffset);
+        const float microFracture=(1-smoothRange(.018f,.072f,microDistance))*
+                                  smoothRange(.34f,.68f,medium);
+        // Plate faces carry millimetre-scale granular relief of their own.
+        // This is intentionally normal-only (not tone) so close lighting
+        // reveals fractured cork without returning to white speckle.
+        heightField[index]=.0017f*(broad-.5f)+.00125f*(medium-.5f)+
+                           .00108f*(fine-.5f)+.00068f*(chip-.5f)+
+                           .00031f*(grain-.5f)+.0038f*(ridgeCrown-.48f)-.0062f*fissure-
+                           .0020f*shoulder-.0017f*cross-.00038f*pore-
+                           .00042f*microFracture;
+        cavityField[index]=clamp(.82f*fissure+.15f*shoulder+.28f*cross+
+                                  .055f*pore,0.0f,1.0f);
+        toneField[index]=clamp(.34f+.078f*(broad-.5f)+.062f*(medium-.5f)+
+                                .060f*(ridgeCrown-.5f)-.095f*fissure-
+                                .036f*cross,0.0f,1.0f);
+    }
+    std::vector<uint32_t> pixels(count);auto encode=[](float value){return static_cast<uint32_t>(clamp((value*.5f+.5f)*255.0f,0,255));};
+    for(UINT y=0;y<height;++y)for(UINT x=0;x<width;++x){const size_t left=static_cast<size_t>(y)*width+(x+width-1)%width,right=static_cast<size_t>(y)*width+(x+1)%width,down=static_cast<size_t>((y+height-1)%height)*width+x,up=static_cast<size_t>((y+1)%height)*width+x,index=static_cast<size_t>(y)*width+x;const float dhdx=(heightField[right]-heightField[left])/(2*texelWidth),dhdy=(heightField[up]-heightField[down])/(2*texelHeight);const float inverse=1/std::sqrt(dhdx*dhdx*.48f*.48f+dhdy*dhdy*.62f*.62f+1);const float nx=-dhdx*.48f*inverse,ny=-dhdy*.62f*inverse;const uint32_t r=encode(nx),g=encode(ny),b=static_cast<uint32_t>(clamp(cavityField[index]*255.0f,0,255)),a=static_cast<uint32_t>(clamp(toneField[index]*255.0f,0,255));pixels[index]=r|(g<<8)|(b<<16)|(a<<24);}
     return pixels;
 }
 std::vector<std::vector<uint32_t>> makeNormalMipChain(std::vector<uint32_t> top,UINT width,UINT height,UINT levels){
@@ -80,8 +306,9 @@ struct DxrRenderer::Impl{
     ID3D12Resource*tlas{};ID3D12Resource*blasScratch{};ID3D12Resource*staticBlasScratch{};
     ID3D12Resource*tlasScratch{};ID3D12Resource*instanceBuffer{};
     ID3D12Resource*grassBuffer{};ID3D12Resource*visibleGrassBuffer{};
+    ID3D12Resource*visibleGrassUploadBuffer{};
     ID3D12Resource*grassBlas{};ID3D12Resource*grassBlasScratch{};
-    void*visibleGrassMapped{};
+    void*visibleGrassMapped{};bool visibleGrassGpuReady{};
     ID3D12Resource*raygenTable{};ID3D12Resource*missTable{};ID3D12Resource*hitTable{};
     UINT vertexCount{},indexCount{},treeVertexCount{},treeIndexCount{},grassPatchCount{};
     float treeHeight=1.0f;bool treeWindWasActive=false;
@@ -98,7 +325,7 @@ struct DxrRenderer::Impl{
     float grassStreamCenterZ=std::numeric_limits<float>::quiet_NaN();
     float grassStreamRadius{};
 
-    ~Impl(){wait();if(cameraBuffer&&cameraMapped)cameraBuffer->Unmap(0,nullptr);if(environmentBuffer&&environmentMapped)environmentBuffer->Unmap(0,nullptr);if(visibleGrassBuffer&&visibleGrassMapped)visibleGrassBuffer->Unmap(0,nullptr);release(hitTable);release(missTable);release(raygenTable);release(instanceBuffer);release(tlasScratch);release(grassBlasScratch);release(staticBlasScratch);release(blasScratch);release(tlas);release(grassBlas);release(staticBlas);release(blas);release(visibleGrassBuffer);release(grassBuffer);release(indexBuffer);release(baseTreeVertexBuffer);release(vertexBuffer);release(environmentBuffer);release(cameraBuffer);release(groundNormal);release(groundAlbedo);release(barkNormal);release(grassDepth);release(accumulation);release(output);release(treeWindPipeline);release(treeWindRoot);release(grassPipeline);release(grassRoot);release(stateProps);release(state);release(root);for(auto&b:backBuffers)release(b);release(gpuHeap);release(dsvHeap);release(rtvHeap);release(list);release(allocator);release(fence);release(queue);release(swap);release(device);release(factory);if(fenceEvent)CloseHandle(fenceEvent);}
+    ~Impl(){wait();if(cameraBuffer&&cameraMapped)cameraBuffer->Unmap(0,nullptr);if(environmentBuffer&&environmentMapped)environmentBuffer->Unmap(0,nullptr);if(visibleGrassUploadBuffer&&visibleGrassMapped)visibleGrassUploadBuffer->Unmap(0,nullptr);release(hitTable);release(missTable);release(raygenTable);release(instanceBuffer);release(tlasScratch);release(grassBlasScratch);release(staticBlasScratch);release(blasScratch);release(tlas);release(grassBlas);release(staticBlas);release(blas);release(visibleGrassBuffer);release(visibleGrassUploadBuffer);release(grassBuffer);release(indexBuffer);release(baseTreeVertexBuffer);release(vertexBuffer);release(environmentBuffer);release(cameraBuffer);release(groundNormal);release(groundAlbedo);release(barkNormal);release(grassDepth);release(accumulation);release(output);release(treeWindPipeline);release(treeWindRoot);release(grassPipeline);release(grassRoot);release(stateProps);release(state);release(root);for(auto&b:backBuffers)release(b);release(gpuHeap);release(dsvHeap);release(rtvHeap);release(list);release(allocator);release(fence);release(queue);release(swap);release(device);release(factory);if(fenceEvent)CloseHandle(fenceEvent);}
     bool fail(HRESULT hr,const wchar_t*message){wchar_t text[320];wsprintfW(text,L"%s (HRESULT 0x%08X)",message,static_cast<unsigned>(hr));lastError=text;return false;}
     void wait(){if(!queue||!fence)return;const UINT64 value=++fenceValue;if(SUCCEEDED(queue->Signal(fence,value))&&fence->GetCompletedValue()<value){fence->SetEventOnCompletion(value,fenceEvent);WaitForSingleObject(fenceEvent,INFINITE);}}
     bool begin(){wait();if(FAILED(allocator->Reset()))return false;if(FAILED(list->Reset(allocator,nullptr)))return false;return true;}
@@ -265,6 +492,8 @@ struct DxrRenderer::Impl{
         const float shortDistance=clamp(settings.shortGrassDrawDistance,2.0f,128.0f);
         const float tallDistance=std::max(shortDistance,
             clamp(settings.tallGrassDrawDistance,4.0f,192.0f));
+        const float shortTransitionDistance=std::min(tallDistance,
+            std::max(shortDistance+5.0f,shortDistance*1.18f));
         const float streamDeltaX=eye.x-grassStreamCenterX;
         const float streamDeltaZ=eye.z-grassStreamCenterZ;
         const float streamDelta=std::sqrt(streamDeltaX*streamDeltaX+
@@ -275,7 +504,7 @@ struct DxrRenderer::Impl{
         }
         for(const GrassPatchGpu&patch:streamedGrassPatches){
             const bool tall=((patch.packed>>16)&255u)!=0;
-            const float drawDistance=tall?tallDistance:shortDistance;
+            const float drawDistance=tall?tallDistance:shortTransitionDistance;
             const Vec3 center{(patch.minX+patch.maxX)*.5f,patch.baseY,
                               (patch.minZ+patch.maxZ)*.5f};
             const Vec3 delta=center-eye;
@@ -284,13 +513,24 @@ struct DxrRenderer::Impl{
             const float radiusY=std::max(patch.maxY-patch.baseY,
                                          patch.baseY-patch.minY);
             const float radiusZ=(patch.maxZ-patch.minZ)*.5f;
-            const float radius=std::sqrt(radiusX*radiusX+radiusY*radiusY+radiusZ*radiusZ);
+            // Grass interaction can displace a tall blade beyond its authored
+            // patch AABB. Include that maximum bend in the frustum sphere so
+            // walking/look direction cannot cull the displaced ribbon at a
+            // screen edge and appear to add or remove a whole patch.
+            const float interactionCullMargin=2.25f*
+                clamp(settings.bladeHeightScale,.35f,2.5f);
+            const float radius=std::sqrt(radiusX*radiusX+radiusY*radiusY+
+                                         radiusZ*radiusZ)+interactionCullMargin;
             const float viewDepth=dot(delta,forward);
             if(viewDepth+radius<=.02f)continue;
             const float projectedDepth=std::max(viewDepth,.02f);
             if(std::abs(dot(delta,right))>projectedDepth*tanHalf*aspect+radius)continue;
             if(std::abs(dot(delta,up))>projectedDepth*tanHalf+radius)continue;
-            if(dot(delta,delta)<shortDistance*shortDistance){
+            // Keep the full near-instance stride through the short-blade
+            // crossfade. At its outer edge only the deterministic tall prefix
+            // remains, so switching to the cheaper far stride cannot pop an
+            // entire ring of short blades while the player walks.
+            if(dot(delta,delta)<shortTransitionDistance*shortTransitionDistance){
                 if(nearCount+farCount>=grassPatchCount)break;
                 visible[nearCount++]=patch;
             }else if(tall){
@@ -299,6 +539,34 @@ struct DxrRenderer::Impl{
             }
         }
         return {nearCount,farCount};
+    }
+    bool recordVisibleGrassUpload(bool grassEnabled){
+        const UINT visibleCount=visibleNearGrassPatchCount+visibleFarGrassPatchCount;
+        if(!grassEnabled||visibleCount==0)return true;
+        if(!visibleGrassUploadBuffer||!visibleGrassBuffer||!visibleGrassMapped)return false;
+        if(visibleGrassGpuReady){
+            auto toCopy=transition(visibleGrassBuffer,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            list->ResourceBarrier(1,&toCopy);
+        }
+        const UINT64 patchBytes=sizeof(GrassPatchGpu);
+        if(visibleNearGrassPatchCount){
+            const UINT64 nearBytes=static_cast<UINT64>(visibleNearGrassPatchCount)*patchBytes;
+            list->CopyBufferRegion(visibleGrassBuffer,0,visibleGrassUploadBuffer,0,nearBytes);
+        }
+        if(visibleFarGrassPatchCount){
+            const UINT64 farOffset=static_cast<UINT64>(
+                grassPatchCount-visibleFarGrassPatchCount)*patchBytes;
+            const UINT64 farBytes=static_cast<UINT64>(visibleFarGrassPatchCount)*patchBytes;
+            list->CopyBufferRegion(visibleGrassBuffer,farOffset,
+                                   visibleGrassUploadBuffer,farOffset,farBytes);
+        }
+        auto toVertex=transition(visibleGrassBuffer,D3D12_RESOURCE_STATE_COPY_DEST,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1,&toVertex);
+        visibleGrassGpuReady=true;
+        return true;
     }
     bool createBackBuffers(){D3D12_CPU_DESCRIPTOR_HANDLE handle=rtvHeap->GetCPUDescriptorHandleForHeapStart();for(UINT n=0;n<2;++n){HRESULT hr=swap->GetBuffer(n,__uuidof(ID3D12Resource),reinterpret_cast<void**>(&backBuffers[n]));if(FAILED(hr))return fail(hr,L"DXR swap-chain buffer creation failed");device->CreateRenderTargetView(backBuffers[n],nullptr,handle);handle.ptr+=rtvSize;}return true;}
     bool createOutputs(){release(output);release(accumulation);release(grassDepth);D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=width;d.Height=height;d.DepthOrArraySize=1;d.MipLevels=1;d.SampleDesc.Count=1;d.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;auto h=heap(D3D12_HEAP_TYPE_DEFAULT);
@@ -365,7 +633,7 @@ struct DxrRenderer::Impl{
         hr=device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),__uuidof(ID3D12RootSignature),reinterpret_cast<void**>(&grassRoot));release(blob);release(errors);if(FAILED(hr))return fail(hr,L"Grass root-signature creation failed");
         const auto vertexShader=loadShader(L"grass_overlay_vs.dxil"),pixelShader=loadShader(L"grass_overlay_ps.dxil");if(vertexShader.empty()||pixelShader.empty()){lastError=L"Compiled grass overlay shaders were not found beside the build output.";return false;}
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};desc.pRootSignature=grassRoot;desc.VS={vertexShader.data(),vertexShader.size()};desc.PS={pixelShader.data(),pixelShader.size()};
-        auto&target=desc.BlendState.RenderTarget[0];target.BlendEnable=FALSE;target.LogicOpEnable=FALSE;target.SrcBlend=D3D12_BLEND_ONE;target.DestBlend=D3D12_BLEND_ZERO;target.BlendOp=D3D12_BLEND_OP_ADD;target.SrcBlendAlpha=D3D12_BLEND_ONE;target.DestBlendAlpha=D3D12_BLEND_ZERO;target.BlendOpAlpha=D3D12_BLEND_OP_ADD;target.LogicOp=D3D12_LOGIC_OP_NOOP;target.RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+        auto&target=desc.BlendState.RenderTarget[0];target.BlendEnable=TRUE;target.LogicOpEnable=FALSE;target.SrcBlend=D3D12_BLEND_SRC_ALPHA;target.DestBlend=D3D12_BLEND_INV_SRC_ALPHA;target.BlendOp=D3D12_BLEND_OP_ADD;target.SrcBlendAlpha=D3D12_BLEND_ONE;target.DestBlendAlpha=D3D12_BLEND_ZERO;target.BlendOpAlpha=D3D12_BLEND_OP_ADD;target.LogicOp=D3D12_LOGIC_OP_NOOP;target.RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
         desc.SampleMask=UINT_MAX;desc.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;desc.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;desc.RasterizerState.DepthClipEnable=TRUE;
         desc.DepthStencilState.DepthEnable=TRUE;desc.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ALL;desc.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_LESS_EQUAL;desc.DepthStencilState.StencilEnable=FALSE;
         desc.InputLayout={nullptr,0};desc.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;desc.NumRenderTargets=1;desc.RTVFormats[0]=DXGI_FORMAT_R8G8B8A8_UNORM;desc.DSVFormat=DXGI_FORMAT_D32_FLOAT;desc.SampleDesc.Count=1;
@@ -432,8 +700,10 @@ struct DxrRenderer::Impl{
         wait();release(instanceBuffer);release(tlasScratch);release(grassBlasScratch);
         release(staticBlasScratch);release(blasScratch);release(tlas);release(grassBlas);
         release(staticBlas);release(blas);
-        if(visibleGrassBuffer&&visibleGrassMapped)visibleGrassBuffer->Unmap(0,nullptr);
+        if(visibleGrassUploadBuffer&&visibleGrassMapped)
+            visibleGrassUploadBuffer->Unmap(0,nullptr);
         visibleGrassMapped=nullptr;release(visibleGrassBuffer);
+        release(visibleGrassUploadBuffer);visibleGrassGpuReady=false;
         release(grassBuffer);release(indexBuffer);release(baseTreeVertexBuffer);release(vertexBuffer);
         grassChunkCache.clear();grassStreamEpoch=0;
         grassChunkCache.reserve(1024);
@@ -478,14 +748,18 @@ struct DxrRenderer::Impl{
         grassPatchCount=std::max<UINT>(
             static_cast<UINT>(environment.grassPatches.size()),mapGrassPatchCapacity);
         grassBuffer=uploadDefault(environment.grassPatches);
+        const UINT64 visibleGrassBytes=std::max<UINT64>(
+            static_cast<UINT64>(grassPatchCount)*sizeof(GrassPatchGpu),256);
+        visibleGrassUploadBuffer=makeBuffer(
+            visibleGrassBytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
         visibleGrassBuffer=makeBuffer(
-            std::max<UINT64>(static_cast<UINT64>(grassPatchCount)*sizeof(GrassPatchGpu),256),
-            D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
-        if(visibleGrassBuffer&&
-           FAILED(visibleGrassBuffer->Map(0,nullptr,&visibleGrassMapped))){
-            release(visibleGrassBuffer);visibleGrassMapped=nullptr;
+            visibleGrassBytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST);
+        if(visibleGrassUploadBuffer&&
+           FAILED(visibleGrassUploadBuffer->Map(0,nullptr,&visibleGrassMapped))){
+            release(visibleGrassUploadBuffer);visibleGrassMapped=nullptr;
         }
-        if(!baseTreeVertexBuffer||!vertexBuffer||!indexBuffer||!grassBuffer||!visibleGrassBuffer){
+        if(!baseTreeVertexBuffer||!vertexBuffer||!indexBuffer||!grassBuffer||
+           !visibleGrassBuffer||!visibleGrassUploadBuffer){
             lastError=L"DXR scene geometry upload to GPU-local memory failed.";return false;
         }
 
@@ -660,7 +934,21 @@ void DxrRenderer::render(const CameraView&requestedView,
     localLight.outerConeRadians=std::isfinite(localLight.outerConeRadians)?
         clamp(localLight.outerConeRadians,localLight.innerConeRadians+.001f,1.56f):
         std::max(localLight.innerConeRadians+.001f,.31415927f);
-    const CameraView view{eye,forward};
+    CameraView view=requestedView;
+    view.eye=eye;view.forward=forward;
+    if(!view.grassInteractionEnabled||
+       !finiteVec(view.grassInteractionPosition)||
+       !finiteVec(view.grassInteractionVelocity)){
+        view.grassInteractionEnabled=false;
+        view.grassInteractionPosition={};view.grassInteractionVelocity={};
+    }else{
+        // Defensive cap only; the first-person controller normally supplies
+        // at most its 5.5 m/s sprint velocity.
+        const float interactionSpeed=length(view.grassInteractionVelocity);
+        if(interactionSpeed>15.0f)
+            view.grassInteractionVelocity=
+                view.grassInteractionVelocity*(15.0f/interactionSpeed);
+    }
     const auto changed=[](float a,float b){return std::abs(a-b)>.0001f;};
     const bool viewChanged=!i.haveLastView||
         changed(view.eye.x,i.lastView.eye.x)||changed(view.eye.y,i.lastView.eye.y)||
@@ -718,7 +1006,7 @@ void DxrRenderer::render(const CameraView&requestedView,
         float up[3];UINT maxFrames;
         float exposure,localLightIntensity,localLightRange,localLightInnerCos;
         UINT resolution[2];UINT environmentIndexOffset;float localLightOuterCos;
-        float grassSettings[4];float groundSettings[4];
+        float grassSettings[4];float groundSettings[4];float grassInteraction[4];
     }c{{eye.x,eye.y,eye.z},tanHalf,
        {forward.x,forward.y,forward.z},static_cast<float>(i.width)/i.height,
        {right.x,right.y,right.z},shaderFrame,{up.x,up.y,up.z},temporalFrames,
@@ -727,20 +1015,27 @@ void DxrRenderer::render(const CameraView&requestedView,
         {static_cast<UINT>(i.width),static_cast<UINT>(i.height)},
         i.treeIndexCount,
         localLight.spotlight?std::cos(localLight.outerConeRadians):-1.0f,
-        {settings.grassDensity,settings.bladeHeightScale,settings.shortGrassDrawDistance,
+         {settings.grassDensity,settings.bladeHeightScale,settings.shortGrassDrawDistance,
          settings.tallGrassDrawDistance},
          {settings.groundNormalStrength,settings.groundDetailStrength,
-          static_cast<float>(nearGrassStride),0}};
-    static_assert(sizeof(Camera)==128);
+          static_cast<float>(nearGrassStride),view.grassInteractionEnabled?1.0f:0.0f},
+         {view.grassInteractionPosition.x,view.grassInteractionPosition.z,
+          view.grassInteractionVelocity.x,view.grassInteractionVelocity.z}};
+    static_assert(sizeof(Camera)==144);
     static_assert(offsetof(Camera,localLightIntensity)==68);
     static_assert(offsetof(Camera,resolution)==80);
     static_assert(offsetof(Camera,grassSettings)==96);
+    static_assert(offsetof(Camera,grassInteraction)==128);
     // The mapped constants are single-buffered.  begin() waits for the prior
     // submission before we overwrite them, preventing the previous frame's
     // ray/compute work from observing partially updated camera or wind data.
     if(!i.begin())return;
     std::memcpy(i.cameraMapped,&c,sizeof(c));
     std::memcpy(i.environmentMapped,&environment,sizeof(environment));
+    if(!i.recordVisibleGrassUpload(settings.grassDensity>.001f)){
+        i.lastError=L"GPU-local visible-grass upload failed.";
+        i.list->Close();return;
+    }
     if(!i.recordTreeWind(environment)){
         i.lastError=L"GPU tree-wind deformation or acceleration refit failed.";
         i.list->Close();return;

@@ -510,13 +510,94 @@ int main() {
     for(size_t i=1;i<oakNodes.size();++i){const size_t parent=static_cast<size_t>(oakNodes[i].parent);if(oakNodes[i].axisOrder!=oakNodes[parent].axisOrder)continue;const float score=dense::dot(dense::normalize(oakNodes[i].position-oakNodes[parent].position),oakNodes[parent].direction);if(score>meshContinuationScore[parent]){meshContinuationScore[parent]=score;meshContinuation[parent]=static_cast<int>(i);}}
     size_t biologicalBranchVertexCount = 0;
     size_t biologicalBranchIndexCount = 0;
+    size_t baselineBiologicalBranchIndexCount = 0;
     size_t sampledUvSegments = 0;
+    size_t sampledBuriedCollars = 0;
+    size_t sampledCodominantCollars = 0;
+    size_t sampledSaddleCollars = 0;
+    std::vector<size_t> meshSegmentVertexOffset(oakNodes.size());
+    std::vector<int> meshSegmentRingCount(oakNodes.size());
+    std::vector<int> meshSegmentSides(oakNodes.size());
     for (size_t i = 1; i < oakNodes.size(); ++i) {
         const int sides = oakNodes[i].axisOrder == 0 ? 48 : (oakNodes[i].axisOrder == 1 ? 32 : (oakNodes[i].axisOrder == 2 ? 16 : 8));
         const size_t ringVertices = static_cast<size_t>(sides + 1);
-        const size_t parent=static_cast<size_t>(oakNodes[i].parent);const bool continuation=meshContinuation[parent]==static_cast<int>(i);const float childRatio=oakNodes[i].radius/std::max(oakNodes[parent].radius,.0001f);const bool structuralCollar=!continuation&&oakNodes[i].axisOrder<=2&&childRatio<.72f;const int ringCount=structuralCollar?5:(oakNodes[i].axisOrder<=2?3:2);
+        const size_t parent=static_cast<size_t>(oakNodes[i].parent);const bool continuation=meshContinuation[parent]==static_cast<int>(i);const float childRatio=oakNodes[i].radius/std::max(oakNodes[parent].radius,.0001f);const bool structuralCollar=!continuation&&oakNodes[i].axisOrder<=2;const bool codominantCollar=structuralCollar&&childRatio>=.72f;const int ringCount=codominantCollar?6:(structuralCollar?5:(oakNodes[i].axisOrder<=2?3:2));
+        const bool baselineStructuralCollar=!continuation&&oakNodes[i].axisOrder<=2&&childRatio<.72f;
+        const int baselineRingCount=baselineStructuralCollar?5:(oakNodes[i].axisOrder<=2?3:2);
+        meshSegmentVertexOffset[i]=biologicalBranchVertexCount;
+        meshSegmentRingCount[i]=ringCount;
+        meshSegmentSides[i]=sides;
         require(biologicalBranchVertexCount + ringVertices * ringCount <= oakMesh.branchVertices.size(),
                 "oak branch vertex stream ended inside a biological segment");
+
+        if (structuralCollar && oakNodes[i].radius > .008f) {
+            const auto* start = oakMesh.branchVertices.data() + biologicalBranchVertexCount;
+            const auto* end = start + ringVertices * (ringCount - 1);
+            dense::Vec3 startCenter{}, endCenter{};
+            for (int k = 0; k < sides; ++k) {
+                startCenter += start[k].position;
+                endCenter += end[k].position;
+            }
+            startCenter = startCenter / static_cast<float>(sides);
+            endCenter = endCenter / static_cast<float>(sides);
+            float startRadius = 0, endRadius = 0;
+            for (int k = 0; k < sides; ++k) {
+                startRadius += dense::length(start[k].position - startCenter);
+                endRadius += dense::length(end[k].position - endCenter);
+            }
+            startRadius /= sides;
+            endRadius /= sides;
+            dense::Vec3 supportDirection=oakNodes[parent].direction;
+            if(oakNodes[parent].parent>=0) {
+                supportDirection=dense::normalize(oakNodes[parent].position-
+                    oakNodes[static_cast<size_t>(oakNodes[parent].parent)].position);
+            }
+            float maximumBuriedDistance=0;
+            for(int k=0;k<sides;++k) {
+                const dense::Vec3 offset=start[k].position-oakNodes[parent].position;
+                const dense::Vec3 perpendicular=offset-supportDirection*
+                                                dense::dot(offset,supportDirection);
+                maximumBuriedDistance=std::max(maximumBuriedDistance,
+                                               dense::length(perpendicular));
+            }
+            const auto* collar = start + ringVertices * (ringCount / 2);
+            dense::Vec3 collarCenter{};
+            for (int k = 0; k < sides; ++k) collarCenter += collar[k].position;
+            collarCenter = collarCenter / static_cast<float>(sides);
+            float collarRadiusMinimum = std::numeric_limits<float>::max();
+            float collarRadiusMaximum = 0;
+            float collarRadiusMean = 0;
+            for (int k = 0; k < sides; ++k) {
+                const float radius = dense::length(collar[k].position - collarCenter);
+                collarRadiusMinimum = std::min(collarRadiusMinimum, radius);
+                collarRadiusMaximum = std::max(collarRadiusMaximum, radius);
+                collarRadiusMean += radius;
+            }
+            collarRadiusMean /= sides;
+            const dense::Vec3 daughterDirection = dense::normalize(
+                oakNodes[i].position - oakNodes[parent].position);
+            require(dense::dot(startCenter - oakNodes[parent].position, daughterDirection) < -1.0e-5f,
+                    "structural oak daughter no longer begins below its parent's bark");
+            require(startRadius < endRadius * .74f,
+                    "structural oak daughter regained a full-width glued-on cuff");
+            require(maximumBuriedDistance < oakNodes[parent].radius*.98f,
+                    "structural oak daughter start ring is not wholly inside its supporting pipe");
+            if (oakNodes[parent].parent >= 0) {
+                const dense::Vec3 parentDirection = dense::normalize(
+                    oakNodes[parent].position -
+                    oakNodes[static_cast<size_t>(oakNodes[parent].parent)].position);
+                const float saddleProjection = dense::length(dense::cross(parentDirection,
+                                                                           daughterDirection));
+                if (saddleProjection > .45f) {
+                    require(collarRadiusMaximum - collarRadiusMinimum >
+                                collarRadiusMean * .008f,
+                            "structural oak daughter collar regressed to an isotropic donut");
+                    ++sampledSaddleCollars;
+                }
+            }
+            ++sampledBuriedCollars;
+            sampledCodominantCollars += codominantCollar;
+        }
 
         // Sample all coarse structure and a deterministic cross-section of fine
         // shoots. This checks local arc-length mapping without making the test
@@ -552,8 +633,74 @@ int main() {
         }
         biologicalBranchVertexCount += ringVertices * ringCount;
         biologicalBranchIndexCount += static_cast<size_t>(sides) * (ringCount-1) * 6;
+        baselineBiologicalBranchIndexCount += static_cast<size_t>(sides) *
+                                              (baselineRingCount-1) * 6;
     }
     require(sampledUvSegments > 500, "oak bark UV regression sample is unexpectedly small");
+    require(sampledBuriedCollars > 20,
+            "oak collar regression sample is unexpectedly small");
+    require(sampledCodominantCollars > 0,
+            "oak codominant-fork collar regression sample is unexpectedly empty");
+    require(sampledSaddleCollars > 10,
+            "oak asymmetric-saddle regression sample is unexpectedly small");
+    require(biologicalBranchIndexCount >= baselineBiologicalBranchIndexCount &&
+                biologicalBranchIndexCount - baselineBiologicalBranchIndexCount <=
+                    sampledCodominantCollars * 32u * 3u * 6u,
+            "oak codominant collars exceeded their bounded topology overhead");
+
+    // A major fork must deform the supporting axis itself. Hidden overlap on
+    // the child alone cannot produce the broad load path of a mature oak Y.
+    std::vector<bool> majorJunction(oakNodes.size());
+    for(size_t child=1;child<oakNodes.size();++child) {
+        const size_t junction=static_cast<size_t>(oakNodes[child].parent);
+        const float ratio=oakNodes[child].radius/std::max(oakNodes[junction].radius,.001f);
+        if(meshContinuation[junction]!=static_cast<int>(child)&&oakNodes[child].axisOrder<=1&&
+           oakNodes[child].radius>=.018f&&ratio>=.20f)majorJunction[junction]=true;
+    }
+    size_t sampledParentLoadPaths=0;
+    for(size_t junction=1;junction<oakNodes.size();++junction) {
+        if(!majorJunction[junction])continue;
+        const size_t incomingParent=static_cast<size_t>(oakNodes[junction].parent);
+        if(meshContinuation[incomingParent]!=static_cast<int>(junction))continue;
+        const int sides=meshSegmentSides[junction],ringCount=meshSegmentRingCount[junction];
+        const size_t ringVertices=static_cast<size_t>(sides+1);
+        const auto* ring=oakMesh.branchVertices.data()+meshSegmentVertexOffset[junction]+
+                         ringVertices*static_cast<size_t>(ringCount-1);
+        dense::Vec3 center{};for(int k=0;k<sides;++k)center+=ring[k].position;
+        center=center/static_cast<float>(sides);
+        float minimumRadius=std::numeric_limits<float>::max(),maximumRadius=0,meanRadius=0;
+        for(int k=0;k<sides;++k) {
+            const float radius=dense::length(ring[k].position-center);
+            minimumRadius=std::min(minimumRadius,radius);
+            maximumRadius=std::max(maximumRadius,radius);meanRadius+=radius;
+        }
+        meanRadius/=sides;
+        require(maximumRadius-minimumRadius>meanRadius*.005f,
+                "major oak fork no longer carries an asymmetric load path down the parent");
+        require(meanRadius>oakNodes[junction].radius*1.003f,
+                "major oak fork no longer broadens its supporting bole");
+
+        const int outgoingIndex=meshContinuation[junction];
+        require(outgoingIndex>=0,
+                "major oak fork lost its selected continuation axis");
+        const size_t outgoing=static_cast<size_t>(outgoingIndex);
+        const int outgoingSides=meshSegmentSides[outgoing];
+        const auto* outgoingRing=oakMesh.branchVertices.data()+meshSegmentVertexOffset[outgoing];
+        dense::Vec3 outgoingCenter{};
+        for(int k=0;k<outgoingSides;++k)outgoingCenter+=outgoingRing[k].position;
+        outgoingCenter=outgoingCenter/static_cast<float>(outgoingSides);
+        float outgoingMinimum=std::numeric_limits<float>::max(),outgoingMaximum=0;
+        for(int k=0;k<outgoingSides;++k) {
+            const float radius=dense::length(outgoingRing[k].position-outgoingCenter);
+            outgoingMinimum=std::min(outgoingMinimum,radius);
+            outgoingMaximum=std::max(outgoingMaximum,radius);
+        }
+        require(outgoingMaximum-outgoingMinimum>meanRadius*.005f,
+                "major oak reaction saddle does not continue above the fork");
+        ++sampledParentLoadPaths;
+    }
+    require(sampledParentLoadPaths>5,
+            "oak parent-side reaction-wood regression sample is unexpectedly small");
 
     constexpr size_t rootCount = 7;
     constexpr size_t rootSegments = 12;
@@ -616,9 +763,85 @@ int main() {
     const float rootVerticalSpan = rootMaximum.y - rootMinimum.y;
     require(maximumRootReach > trunkRadius * 2.15f && rootHorizontalSpan > trunkRadius * 4.1f,
             "mesh-only woody roots no longer spread beyond the root collar");
-    require(rootMinimum.y > -.20f && rootMaximum.y < .45f &&
-                rootVerticalSpan < rootHorizontalSpan * .24f,
-            "mesh-only woody roots are no longer broad and shallow at the ground plane");
+    require(rootMinimum.y > -.20f && rootMaximum.y < trunkRadius * 1.35f + .08f &&
+                rootVerticalSpan < rootHorizontalSpan * .30f,
+            "mesh-only oak buttresses are no longer bounded around the ground plane");
+
+    // The seven deterministic mesh ranges are not seven equally visible rays.
+    // A mature open-grown oak should read as a few unequal load-bearing flutes,
+    // with subordinate roots disappearing below grade before they form pointed
+    // surface sausages.  Inspect the actual surface rather than just its box.
+    constexpr size_t rootRingVertices = rootSides + 1;
+    constexpr size_t rootVerticesPerRoot = (rootSegments + 1) * rootRingVertices;
+    std::array<float, rootCount> rootAzimuths{};
+    float shortestRootReach = std::numeric_limits<float>::max();
+    float longestRootReach = 0;
+    size_t dominantVisibleFlutes = 0;
+    for (size_t root = 0; root < rootCount; ++root) {
+        const size_t rootBase = biologicalBranchVertexCount + root * rootVerticesPerRoot;
+        auto ringCenter = [&](size_t segment) {
+            dense::Vec3 center{};
+            const size_t ringBase = rootBase + segment * rootRingVertices;
+            for (size_t k = 0; k < rootSides; ++k)
+                center += oakMesh.branchVertices[ringBase + k].position;
+            return center / static_cast<float>(rootSides);
+        };
+        auto ringTop = [&](size_t segment) {
+            float top = -std::numeric_limits<float>::max();
+            const size_t ringBase = rootBase + segment * rootRingVertices;
+            for (size_t k = 0; k < rootSides; ++k)
+                top = std::max(top, oakMesh.branchVertices[ringBase + k].position.y);
+            return top;
+        };
+        auto ringHorizontalHalfWidth = [&](size_t segment) {
+            const dense::Vec3 center = ringCenter(segment);
+            float halfWidth = 0;
+            const size_t ringBase = rootBase + segment * rootRingVertices;
+            for (size_t k = 0; k < rootSides; ++k) {
+                dense::Vec3 offset = oakMesh.branchVertices[ringBase + k].position - center;
+                offset.y = 0;
+                halfWidth = std::max(halfWidth, dense::length(offset));
+            }
+            return halfWidth;
+        };
+
+        float reach = 0, visibleReach = 0;
+        for (size_t i = 0; i < rootVerticesPerRoot; ++i) {
+            const dense::Vec3 position = oakMesh.branchVertices[rootBase + i].position;
+            const float horizontal = std::sqrt(position.x * position.x + position.z * position.z);
+            reach = std::max(reach, horizontal);
+            if (position.y > .01f) visibleReach = std::max(visibleReach, horizontal);
+        }
+        shortestRootReach = std::min(shortestRootReach, reach);
+        longestRootReach = std::max(longestRootReach, reach);
+        const dense::Vec3 directionSample = ringCenter(4);
+        float azimuth = std::atan2(directionSample.z, directionSample.x);
+        if (azimuth < 0) azimuth += 2.0f * 3.14159265358979323846f;
+        rootAzimuths[root] = azimuth;
+
+        const bool broadBoleWeb = ringTop(0) > trunkRadius * .55f &&
+                                  ringTop(4) > trunkRadius * .25f &&
+                                  ringHorizontalHalfWidth(4) > trunkRadius * .30f;
+        if (visibleReach > trunkRadius * 1.50f && broadBoleWeb) ++dominantVisibleFlutes;
+        require(ringTop(rootSegments - 1) < -.025f && ringTop(rootSegments) < -.08f,
+                "oak root tapered to a visible pointed tip instead of terminating below grade");
+    }
+    require(dominantVisibleFlutes >= 3 && dominantVisibleFlutes <= 5,
+            "oak base no longer has three to five dominant, unequal visible flutes");
+    require(longestRootReach > shortestRootReach * 1.30f,
+            "oak roots became uniformly long and radial again");
+    std::sort(rootAzimuths.begin(), rootAzimuths.end());
+    float minimumRootGap = 2.0f * 3.14159265358979323846f;
+    float maximumRootGap = 0;
+    for (size_t root = 0; root < rootCount; ++root) {
+        const float next = root + 1 < rootCount ? rootAzimuths[root + 1]
+                                                : rootAzimuths[0] + 2.0f * 3.14159265358979323846f;
+        const float gap = next - rootAzimuths[root];
+        minimumRootGap = std::min(minimumRootGap, gap);
+        maximumRootGap = std::max(maximumRootGap, gap);
+    }
+    require(maximumRootGap - minimumRootGap > .30f,
+            "oak root azimuths regressed to a regular seven-point star");
 
     validateTriangles(oakMesh.branchVertices, oakMesh.branchIndices, "oak branch/root mesh");
     validateTriangles(oakMesh.leafVertices, oakMesh.leafIndices, "oak leaf mesh");
@@ -793,7 +1016,10 @@ int main() {
               << "m leaves/shoot="
               << static_cast<double>(oakMesh.leafCount) / leafBearingShoots << " orders="
               << orders[0] << ',' << orders[1] << ',' << orders[2] << ',' << orders[3] << ','
-              << orders[4] << '\n';
+              << orders[4] << " collars=" << sampledBuriedCollars << " codominant="
+              << sampledCodominantCollars << " collarExtraTriangles="
+              << (biologicalBranchIndexCount - baselineBiologicalBranchIndexCount) / 3
+              << " parentLoadPaths=" << sampledParentLoadPaths << '\n';
     std::cout << "nodes=" << a.size() << " branchTriangles=" << mesh.branchIndices.size() / 3
               << " leafTriangles=" << mesh.leafIndices.size() / 3 << '\n';
 }

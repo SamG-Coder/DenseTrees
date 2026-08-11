@@ -10,6 +10,9 @@ struct Camera {
     uint2 resolution; uint environmentIndexOffset; float localLightOuterCos;
     float4 grassSettings;
     float4 groundSettings;
+    // xz: player foot position, zw: horizontal velocity. groundSettings.w is
+    // the explicit first-person interaction gate.
+    float4 grassInteraction;
 };
 
 struct GrassPatch {
@@ -302,7 +305,43 @@ struct BladeMotion {
     float bend;
     float flutterPhase;
     float flutterAmplitude;
+    float3 interactionDirection;
+    float interactionBend;
 };
+
+float3 grassInteractionDirection(BladeData blade,out float response) {
+    response=0;
+    if(camera.groundSettings.w<.5)return float3(0,0,0);
+
+    float2 player=camera.grassInteraction.xy;
+    float2 velocity=camera.grassInteraction.zw;
+    float2 delta=blade.base.xz-player;
+    float distanceToCapsule=length(delta);
+    float speed=length(velocity);
+    float2 travel=speed>.06?velocity/speed:float2(0,0);
+    float2 radial=distanceToCapsule>.025?delta/distanceToCapsule:
+                  (speed>.06?-travel:float2(1,0));
+
+    // A soft capsule around the legs parts nearby blades.  A short swept wake
+    // follows the actual controller velocity, extending recovery over roughly
+    // a quarter second without retaining or updating individual blades.
+    float capsule=1-smoothstep(.30,.82,distanceToCapsule);
+    float wake=0;
+    if(speed>.06) {
+        float longitudinal=dot(delta,travel);
+        float lateral=abs(delta.x*travel.y-delta.y*travel.x);
+        float wakeLength=lerp(.45,1.55,saturate(speed/5.5));
+        float behind=saturate(-longitudinal/wakeLength);
+        float longitudinalWindow=step(longitudinal,0.0)*(1-smoothstep(.62,1.0,behind));
+        float lateralWindow=1-smoothstep(.24,.68,lateral);
+        wake=longitudinalWindow*lateralWindow*saturate(speed/.65)*.72;
+    }
+    response=saturate(max(capsule,wake));
+    float2 push=normalize(radial*max(capsule,.08)+travel*wake*.72+float2(1e-5,0));
+    float3 tangentPush=float3(push.x,0,push.y);
+    tangentPush-=blade.normal*dot(tangentPush,blade.normal);
+    return normalize(tangentPush+float3(1e-6,0,0));
+}
 
 BladeMotion prepareBladeMotion(BladeData blade) {
     BladeMotion motion;
@@ -312,6 +351,11 @@ BladeMotion prepareBladeMotion(BladeData blade) {
     motion.bend=blade.height*g_WindStrength*compliance*grassGust(blade)*waterPinning;
     motion.flutterPhase=g_Time*g_WindSpeed*(6.5+2.5*(1-blade.stiffness))+blade.phase;
     motion.flutterAmplitude=blade.height*.013*g_WindStrength*waterPinning;
+    float interactionResponse;
+    motion.interactionDirection=grassInteractionDirection(blade,interactionResponse);
+    float contactCompliance=lerp(1.10,.82,blade.stiffness)*lerp(.88,1.08,blade.tall);
+    motion.interactionBend=blade.height*interactionResponse*contactCompliance*
+                           waterPinning;
     return motion;
 }
 
@@ -320,7 +364,9 @@ float3 bladeCenter(BladeData blade,BladeMotion motion,float along) {
     float flutter=sin(motion.flutterPhase+s*5.0)*motion.flutterAmplitude*s*s;
     return blade.base+blade.normal*(blade.height*s*blade.verticalScale)
          +blade.naturalLean*(blade.height*blade.leanStrength*shape)
-         +motion.windDirection*(motion.bend*shape)+blade.side*flutter;
+         +motion.windDirection*(motion.bend*shape)
+         +motion.interactionDirection*(motion.interactionBend*shape)
+         +blade.side*flutter;
 }
 
 float3 bladeTangent(BladeData blade,BladeMotion motion,float along) {
@@ -332,6 +378,7 @@ float3 bladeTangent(BladeData blade,BladeMotion motion,float along) {
     return normalize(blade.normal*(blade.height*blade.verticalScale)
          +blade.naturalLean*(blade.height*blade.leanStrength*shapeDerivative)
          +motion.windDirection*(motion.bend*shapeDerivative)
+         +motion.interactionDirection*(motion.interactionBend*shapeDerivative)
          +blade.side*flutterDerivative);
 }
 
@@ -339,7 +386,12 @@ float3 cameraFacingSide(float3 center,float3 tangent,float3 fallbackSide) {
     float3 viewDirection=normalize(camera.eye-center);
     float3 side=cross(tangent,viewDirection);
     if(dot(side,side)<1e-6)side=fallbackSide-tangent*dot(fallbackSide,tangent);
-    return normalize(side);
+    side=normalize(side);
+    // Keep the billboard in the same hemisphere as the blade's persistent
+    // biological plane. Without this sign convention a 180-degree yaw flips
+    // triangle winding and the raster top-left rule can make thin blades pop,
+    // even with back-face culling disabled.
+    return dot(side,fallbackSide)<0?-side:side;
 }
 
 float bladePhysicalHalfWidth(BladeData blade,float along) {
@@ -391,17 +443,25 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
     uint tallCount=min((uint)ceil(baseTallCount*min(densityScale,1.8)),candidateCount);
     float shortDistance=clamp(camera.grassSettings.z,2.0,128.0);
     float tallDistance=max(shortDistance,clamp(camera.grassSettings.w,4.0,192.0));
+    float shortTransitionDistance=min(tallDistance,
+        max(shortDistance+5.0,shortDistance*1.18));
     float3 patchCenter=float3((patch.minX+patch.maxX)*.5,patch.baseY,
                               (patch.minZ+patch.maxZ)*.5);
     float patchDistance=distance(camera.eye,patchCenter);
-    if(patchDistance>=tallDistance||(tallCount==0u&&patchDistance>=shortDistance))
+    if(patchDistance>=tallDistance||
+       (tallCount==0u&&patchDistance>=shortTransitionDistance))
         return inactiveVertex();
 
-    uint activeCount=patchDistance>=shortDistance?tallCount:candidateCount;
+    float shortFade=saturate((patchDistance-shortDistance)/
+        max(shortTransitionDistance-shortDistance,.01));
+    float shortPopulation=1-shortFade*shortFade*(3-2*shortFade);
+    uint activeCount=(uint)ceil(lerp((float)tallCount,(float)candidateCount,
+                                    shortPopulation));
     if(bladeIndex>=activeCount)return inactiveVertex();
 
     bool tallBlade=bladeIndex<tallCount;
-    float shortCoverage=1-smoothstep(shortDistance*.70,shortDistance,patchDistance);
+    float shortCoverage=1-smoothstep(shortDistance*.82,shortTransitionDistance,
+                                     patchDistance);
     float tallCoverage=1-smoothstep(tallDistance*.70,tallDistance,patchDistance);
     float distanceCoverage=tallBlade?tallCoverage:shortCoverage;
     float shortLodDensity=lerp(.68,1.0,1-smoothstep(3.0,shortDistance,patchDistance));
@@ -490,16 +550,14 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float edgeDistance=1-abs(input.bladeCoordinates.x);
     float edgeWidth=max(fwidth(input.bladeCoordinates.x),1e-4);
     float edgeCoverage=saturate(edgeDistance/edgeWidth+.5);
-    // Preserve the airy optical coverage of the original ray-traced meadow.
-    // More generated blades add geometric detail, not an opaque green wall.
+    // Let the physical gaps between ribbons provide the meadow transparency.
+    // Per-pixel stochastic rejection turned shadowed grass into black/yellow
+    // salt-and-pepper noise.  A conservative analytic edge keeps narrow tips
+    // anti-aliased without punching random holes through every blade.
     float densityScale=max(camera.grassSettings.x,.001);
-    float densityCompensation=pow(min(1.0,3.0/densityScale),.72);
-    float coverage=saturate(input.coverage*edgeCoverage*.58*densityCompensation);
-    // Match the original ray-traced grass coverage: a stable, decorrelated
-    // stochastic test per blade and pixel.  Ordered 4x4 dithering made dense
-    // meadows read as an opaque screen and exposed a visible repeating grid.
-    uint coverageSeed=input.ditherSeed^(pixel.x*0x85ebca6bu)^(pixel.y*0xc2b2ae35u);
-    clip(coverage-randomUint(coverageSeed));
+    float densityCompensation=pow(min(1.0,3.0/densityScale),.36);
+    float coverage=saturate(input.coverage*edgeCoverage*densityCompensation);
+    clip(coverage-.16);
 
     float along=saturate(input.bladeCoordinates.y);
     float dryness=input.bladeParameters.x;
@@ -513,15 +571,17 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     dryness=saturate(dryness+dryColony*.15-lushColony*.08);
     float dryThreshold=lerp(.82,.94,moisture);
     float dry=smoothstep(dryThreshold-.03,dryThreshold+.03,dryness);
-    float3 green=lerp(float3(.040,.068,.014),float3(.095,.155,.030),
+    float3 green=lerp(float3(.035,.056,.022),float3(.070,.112,.040),
                       saturate(.28+.55*moisture));
     green*=1.0+warmCool*float3(.035,.006,-.045);
     green*=lerp(float3(.86,.93,.83),float3(1.10,1.08,.91),fertile);
     green=lerp(green,green*float3(1.10,1.01,.76),dryColony*.22);
     green*=lerp(.72,1.04,smoothstep(0,.70,along));
-    float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along)*
+    float3 straw=float3(.118,.103,.052)*lerp(.82,1.06,along)*
                   lerp(.90,1.10,dryColony);
     float3 albedo=lerp(green,straw,dry);
+    float albedoLuminance=dot(albedo,float3(.2126,.7152,.0722));
+    albedo=lerp(albedoLuminance.xxx,albedo,.78);
     // Puddles weigh down the blade and soak its lower stem.  The tip keeps the
     // atmospheric wetness only, so flattened grass still has readable green
     // detail above the thin water film.
@@ -547,7 +607,8 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float sunVisibility=SceneColor.Load(int3(int2(pixel),0)).a;
     float frontLight=saturate(dot(n,sun));
     float backLight=saturate(dot(-n,sun));
-    float3 ambient=.5*(skyIrradiance(n)+skyIrradiance(-n))*(.50+.18*along);
+    float3 ambient=.5*(skyIrradiance(n)+skyIrradiance(-n))*(.56+.16*along);
+    ambient+=keyRadiance*float3(.020,.026,.012)*(.35+.65*sunVisibility);
     float3 direct=keyRadiance*frontLight*sunVisibility*1.28;
     // Coverage and scene-depth rejection have already run, so inline rays are
     // issued only for surviving grass fragments inside the local-light range.
@@ -559,19 +620,24 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     if(localNdotL>1e-4){
         float localVisibility=playerLocalLightVisibility(
             input.worldPosition,localLight.direction,localLight.distance);
-        direct+=localLight.radiance*localNdotL*localVisibility;
+        direct+=localLight.radiance*localNdotL*localVisibility*.68;
     }
-    float3 unmodulated=keyRadiance*float3(.42,.74,.20)*backLight*
-                        sunVisibility*.72;
+    float3 transmittedTint=lerp(albedo,float3(.10,.14,.035),.32);
+    float3 unmodulated=keyRadiance*transmittedTint*backLight*
+                        sunVisibility*.46;
     float3 halfVector=normalize(sun+view);
     float wetExponent=lerp(22.0,110.0,wetness);
     unmodulated+=keyRadiance*pow(saturate(dot(n,halfVector)),wetExponent)*
-                 lerp(.08,.34,wetness)*sunVisibility;
+                 lerp(.025,.13,wetness)*sunVisibility;
     ambient+=lightningRadiance()*(.18+.10*along);
     float fade=lerp(.72,1.0,smoothstep(0,.22,along));
     float3 result=(albedo*(ambient+direct)+unmodulated)*fade;
     float3 rayDirection=normalize(input.worldPosition-camera.eye);
     result=applyAerialPerspective(result,input.worldPosition,rayDirection);
     float3 displayColor=linearToSrgb(colorGrade(tonemap(result*camera.exposure)));
-    return float4(displayColor,1);
+    // Conventional alpha blending preserves the original airy meadow without
+    // random black pinholes. Depth writing deliberately keeps this to a
+    // single physically nearest ribbon rather than accumulating an opaque
+    // stack of dozens of transparent blades.
+    return float4(displayColor,saturate(coverage*.58));
 }

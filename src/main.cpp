@@ -121,6 +121,7 @@ struct App {
     bool jump = false;
     float pendingYawDelta = 0.0f;
     float pendingPitchDelta = 0.0f;
+    dense::Vec3 grassWakeVelocity{};
     uint32_t generation = 0;
 
     HWND mainWindow{};
@@ -272,6 +273,7 @@ struct App {
         lastCameraUpdate=now;
         if(cameraMode!=CameraMode::FirstPerson) {
             pendingYawDelta=pendingPitchDelta=0.0f;
+            grassWakeVelocity={};
             return;
         }
         dense::FirstPersonCameraInput input{};
@@ -287,12 +289,24 @@ struct App {
         }
         pendingYawDelta=pendingPitchDelta=0.0f;
         firstPersonCamera.update(elapsed,input);
+        // Preserve a short, smoothly recovering wake after the feet leave a
+        // blade.  This is one vector per frame; individual grass remains a
+        // fully GPU-evaluated world-space field.
+        const dense::Vec3 targetVelocity=firstPersonCamera.state().horizontalVelocity;
+        const float wakeResponse=dense::lengthSq(targetVelocity)>.01f?14.0f:3.2f;
+        const float wakeBlend=1-std::exp(-wakeResponse*std::min(elapsed,.10f));
+        grassWakeVelocity=dense::lerp(grassWakeVelocity,targetVelocity,wakeBlend);
     }
 
     dense::CameraView cameraView() const {
         if(cameraMode==CameraMode::FirstPerson) {
             const dense::FirstPersonCameraPose pose=firstPersonCamera.pose();
-            return {pose.eye,pose.forward};
+            const dense::FirstPersonCameraState& state=firstPersonCamera.state();
+            dense::CameraView view{pose.eye,pose.forward};
+            view.grassInteractionPosition=state.footPosition;
+            view.grassInteractionVelocity=grassWakeVelocity;
+            view.grassInteractionEnabled=true;
+            return view;
         }
         const dense::Vec3 target{0,4.1f,0};
         dense::Vec3 eye=target+dense::Vec3{
