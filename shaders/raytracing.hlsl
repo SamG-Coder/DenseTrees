@@ -76,6 +76,32 @@ float filteredFbmWorld(float2 world,float baseFrequency,float footprint) {
     return result;
 }
 
+struct PrecipitationFlux {
+    float eventDensity;
+    float eventRate;
+    float visibility;
+};
+
+// One normalized precipitation law drives screen-space drops and world-space
+// impacts. Density is the expected active-event fraction after the softened
+// hash gate; rate is cycles/second; visibility preserves the previous
+// .040-.145 streak optical-alpha range when multiplied by .145.
+PrecipitationFlux evaluatePrecipitationFlux(float rainIntensity) {
+    float rain=saturate(rainIntensity);
+    PrecipitationFlux flux;
+    flux.eventDensity=rain>.001?lerp(.0075,.30,rain):0;
+    flux.eventRate=lerp(.34,1.16,rain);
+    flux.visibility=rain>.001?lerp(.276,1.0,rain):0;
+    return flux;
+}
+
+float precipitationEventGate(float randomValue,PrecipitationFlux flux) {
+    if(flux.eventDensity<=0)return 0;
+    float softness=min(.10,max(flux.eventDensity*2,1e-4));
+    float threshold=1-flux.eventDensity-softness*.5;
+    return smoothstep(threshold,threshold+softness,randomValue);
+}
+
 float2 safeWindDirection2() {
     float magnitudeSquared=dot(g_WindDirection,g_WindDirection);
     return magnitudeSquared>1e-6?g_WindDirection*rsqrt(magnitudeSquared):
@@ -107,47 +133,118 @@ float2 scrollingWaterSlope(float2 worldPosition,float footprint) {
     return (slopeA+slopeB)*lerp(.58,1.35,saturate(g_WindStrength));
 }
 
-// Analytic expanding rings avoid a texture/descriptor and remain stable in
-// world space. They are evaluated only for primary puddle hits while raining.
-float2 rainRingSlope(float2 worldPosition,float footprint) {
+struct RainImpactSample {
+    float2 slope;
+    float brightCrest;
+    float darkTrough;
+    float crownFoam;
+};
+
+// Analytic expanding impacts avoid a texture/descriptor and remain stable in
+// world space. One evaluation supplies both the normal slope and visible
+// dielectric response, avoiding a second 3x3 hash/ring pass during shading.
+RainImpactSample evaluateRainImpacts(float2 worldPosition,float footprint) {
+    RainImpactSample impact;
+    impact.slope=0;impact.brightCrest=0;
+    impact.darkTrough=0;impact.crownFoam=0;
     float rain=saturate(g_RainIntensity);
     float rippleStrength=saturate(g_WaterRippleStrength);
+    PrecipitationFlux flux=evaluatePrecipitationFlux(rain);
     float detailFade=1-smoothstep(.045,.24,footprint);
-    if(rippleStrength<.004||detailFade<=.001)return 0;
+    if(rippleStrength<.004||detailFade<=.001)return impact;
 
-    const float cellSize=1.30;
+    // EnvironmentCB stores rain*flood coverage. Divide out rain so every
+    // accepted drop has the same physical response; intensity changes only
+    // the birth probability and cadence below.
+    float waterAvailability=saturate(rippleStrength/max(rain,1e-3));
+    float impactVisibility=waterAvailability;
+
+    const float cellSize=.78;
+    const float ringLifetime=.70;
+    const float ringMaximumRadius=.34;
+    const float eventClockRate=1.16;
+    // A fixed candidate clock prevents live ripples from rephasing when rain
+    // intensity changes. Folding the requested cadence into probability keeps
+    // births/second exactly eventDensity*eventRate.
+    PrecipitationFlux birthFlux=flux;
+    birthFlux.eventDensity=saturate(flux.eventDensity*
+        flux.eventRate/eventClockRate);
     int2 baseCell=int2(floor(worldPosition/cellSize));
     float simulationTime=max(g_Time,0.0);
-    float eventRate=lerp(.34,1.16,rain);
     float2 slope=0;
+    float brightCrest=0,darkTrough=0,crownFoam=0;
     [unroll] for(int y=-1;y<=1;++y) {
         [unroll] for(int x=-1;x<=1;++x) {
             float2 cell=float2(baseCell+int2(x,y));
             float seed=hash(cell+float2(71.3,-43.8));
-            float2 jitter=float2(hash(cell+float2(11.7,89.2)),
-                                 hash(cell+float2(-57.1,23.6)));
+            float cyclePosition=simulationTime*eventClockRate+seed;
+            float cycleIndex=floor(cyclePosition);
+            float ageSeconds=frac(cyclePosition)/eventClockRate;
+            if(ageSeconds>=ringLifetime)continue;
+            float age=saturate(ageSeconds/ringLifetime);
+            float2 cycleSalt=float2(cycleIndex*17.17,cycleIndex*-31.73);
+            float cycleSeed=hash(cell+cycleSalt+float2(-13.1,47.7));
+            float eventGate=precipitationEventGate(cycleSeed,birthFlux);
+            // The shared softened gate antialiases screen coverage. Its .5
+            // crossing is exactly randomValue > 1-eventDensity, yielding a
+            // discrete world event with invariant per-drop energy.
+            if(eventGate<.5)continue;
+            float2 jitter=float2(hash(cell+cycleSalt+float2(11.7,89.2)),
+                                 hash(cell+cycleSalt+float2(-57.1,23.6)));
             float2 centre=(cell+.12+.76*jitter)*cellSize;
             float2 delta=worldPosition-centre;
             float radialDistance=length(delta);
-            float age=frac(simulationTime*eventRate+seed);
-            float radius=age*.68;
-            float width=lerp(.018,.038,age);
+            float radius=age*ringMaximumRadius;
+            // Widen sub-pixel rings in world space before fading them out.
+            // This behaves like coverage filtering and avoids sparkling arcs.
+            float width=lerp(.018,.038,age)+min(footprint*.42,.052);
             float signedBand=(radialDistance-radius)/width;
             float band=exp2(-2.65*signedBand*signedBand);
             float decay=(1-age)*(1-age);
             slope+=(radialDistance>1e-4?delta/radialDistance:float2(0,0))*
                    (-signedBand*band*decay);
+            float crestOffset=signedBand-.28;
+            float troughOffset=signedBand+.48;
+            brightCrest+=exp2(-3.55*crestOffset*crestOffset)*decay;
+            darkTrough+=exp2(-3.10*troughOffset*troughOffset)*decay;
+
+            // The very early impact crown is a compact, short-lived glint.
+            // It is not treated as emissive foam; later shading reflects the
+            // actual sky/key/lightning energy through this coverage term.
+            float crownLife=1-smoothstep(.05,.12,ageSeconds);
+            float crownRadius=.012+min(ageSeconds,.12)*.13;
+            float crownWidth=.015+min(footprint*.34,.038);
+            float crownBand=(radialDistance-crownRadius)/crownWidth;
+            crownFoam+=exp2(-4.3*crownBand*crownBand)*crownLife;
         }
     }
-    return slope*(.030*rippleStrength*detailFade);
+    impact.slope=slope*(.030*impactVisibility*detailFade);
+    impact.brightCrest=saturate(brightCrest*.52*impactVisibility*detailFade);
+    impact.darkTrough=saturate(darkTrough*.40*impactVisibility*detailFade);
+    float crownFade=1-smoothstep(.025,.14,footprint);
+    impact.crownFoam=saturate(crownFoam*.72*impactVisibility*crownFade);
+    return impact;
 }
 
-float3 evaluatePuddleNormal(float2 worldPosition,float footprint) {
+struct WaterSurfaceSample {
+    float3 normal;
+    float brightCrest;
+    float darkTrough;
+    float crownFoam;
+};
+
+WaterSurfaceSample evaluatePuddleSurface(float2 worldPosition,float footprint) {
+    RainImpactSample impact=evaluateRainImpacts(worldPosition,footprint);
     float2 slope=scrollingWaterSlope(worldPosition,footprint)+
-                 rainRingSlope(worldPosition,footprint);
+                 impact.slope;
     float magnitude=length(slope);
-    if(magnitude>.16)slope*=.16/magnitude;
-    return normalize(float3(-slope.x,1,-slope.y));
+    if(magnitude>.115)slope*=.115/magnitude;
+    WaterSurfaceSample surface;
+    surface.normal=normalize(float3(-slope.x,1,-slope.y));
+    surface.brightCrest=impact.brightCrest;
+    surface.darkTrough=impact.darkTrough;
+    surface.crownFoam=impact.crownFoam;
+    return surface;
 }
 
 float hash3(float3 p) {
@@ -364,12 +461,20 @@ float3 applyAerialPerspective(float3 radiance,float3 rayOrigin,float3 hit,
     return radiance*transmittance+clearSkyAirlight(rayDirection)*(1-transmittance);
 }
 
-float rainStreakMask(uint2 pixel) {
+// Returns optical alpha, camera-forward depth in metres and a mild per-drop
+// radiance variation.  Layers are evaluated front-to-back in RayGen.
+float3 rainStreakLayer(uint2 pixel,uint layerIndex,PrecipitationFlux flux) {
     // Build precipitation velocity in world space first.  Its vertical
     // component is explicitly negative, so horizontal wind can never make
     // rain rise.  Project that velocity into the camera plane; pixel Y grows
     // downwards, hence the minus sign on camera.up.
-    float fallSpeed=lerp(7.0,10.0,saturate(g_RainIntensity));
+    // Four depth shells put two independent candidate populations inside the
+    // first five metres.  Tighter near spacing increases visible coverage,
+    // while the shared flux still controls the probability of each event.
+    float layerT=float(layerIndex)*(1.0/3.0);
+    float nominalDepth=lerp(2.4,18.0,layerT*layerT);
+    float rateT=saturate((flux.eventRate-.34)/.82);
+    float fallSpeed=lerp(7.0,10.0,rateT);
     float driftSpeed=min(g_WindSpeed*g_WindStrength,12.0);
     float3 velocityWorld=float3(g_WindDirection.x*driftSpeed,-fallSpeed,
                                 g_WindDirection.y*driftSpeed);
@@ -379,22 +484,48 @@ float rainStreakMask(uint2 pixel) {
     // horizontal component still carries the full projected wind drift.
     velocityPixels.y=max(velocityPixels.y,fallSpeed*.18);
     float pixelsPerMetre=camera.resolution.y/
-        (2.0*max(camera.tanHalfFov,1e-3)*8.0);
+        (2.0*max(camera.tanHalfFov,1e-3)*nominalDepth);
     velocityPixels*=pixelsPerMetre;
     float speed=max(length(velocityPixels),1.0);
     float2 along=velocityPixels/speed;
     float2 across=float2(along.y,-along.x);
     float2 pixelCenter=float2(pixel)+.5;
     float2 p=float2(dot(pixelCenter,across),dot(pixelCenter,along));
+    p+=float2(float(layerIndex)*157.3,float(layerIndex)*311.7);
     p.y-=g_Time*speed;
-    float2 cell=floor(p/float2(7.0,46.0));
-    float2 local=frac(p/float2(7.0,46.0));
-    float seed=hash(cell+float2(37,91));
-    float center=hash(cell+float2(11,173));
-    float width=lerp(.045,.14,hash(cell+float2(67,5)));
-    float streakLine=1-smoothstep(width,width*2.2,abs(local.x-center));
-    float segment=smoothstep(.04,.20,local.y)*(1-smoothstep(.72,.98,local.y));
-    return streakLine*segment*smoothstep(.55,1.0,seed);
+    float2 spacing=lerp(float2(8.5,66.0),float2(5.5,40.0),layerT);
+    float2 cell=floor(p/spacing);
+    float2 local=frac(p/spacing);
+    float2 layerOffset=float2(37.0,91.0)+float(layerIndex)*float2(53.0,127.0);
+    float seed=hash(cell+layerOffset);
+    float center=hash(cell+layerOffset.yx+float2(11.0,173.0));
+    float widthPixels=lerp(.38,.78,hash(cell+layerOffset+float2(67.0,5.0)))*
+                      lerp(1.15,.72,layerT);
+    float lateralPixels=abs(local.x-center)*spacing.x;
+    float lateral=lateralPixels/max(widthPixels,.1);
+    // Gaussian optical depth gives the streak a translucent core and a soft
+    // edge instead of an opaque binary filament.
+    float streakLine=exp2(-1.8*lateral*lateral);
+    float segment=smoothstep(.03,.18,local.y)*
+                  (1-smoothstep(.70,.97,local.y));
+    segment*=lerp(.58,1.0,smoothstep(.06,.34,local.y));
+    float occupancy=precipitationEventGate(seed,flux);
+    float depthSeed=hash(cell+layerOffset+float2(211.0,-73.0));
+    float viewDepth=nominalDepth*lerp(.82,1.18,depthSeed);
+    // Drops crossing the near clipping volume lose contrast rather than
+    // becoming broad opaque bars.  Farther layers are denser but optically
+    // weaker per streak.
+    // Keep the nearest layer translucent, but do not fade it out so strongly
+    // that rain disappears at normal first-person viewing distances.
+    float nearFade=smoothstep(.55,2.35,viewDepth);
+    // Preserve roughly the previous three-layer optical-energy budget even
+    // though candidate coverage now comes from four shells.
+    float depthAttenuation=lerp(.80,.50,layerT);
+    float peakAlpha=.145*flux.visibility;
+    float alpha=streakLine*segment*occupancy*nearFade*depthAttenuation*peakAlpha;
+    float radianceVariation=lerp(.74,1.10,
+        hash(cell+layerOffset+float2(-19.0,241.0)));
+    return float3(saturate(alpha),viewDepth,radianceVariation);
 }
 
 [shader("raygeneration")]
@@ -419,16 +550,44 @@ void RayGen() {
         sceneDepth=min(sceneDepth,payload.primaryT*max(dot(ray.Direction,camera.forward),.001));
     }
     frameColor/=float(spatialSamples);
-    float rainStreak=0;
-    if(g_RainIntensity>.001)rainStreak=rainStreakMask(pixel)*g_RainIntensity;
-    frameColor+=rainStreak*(float3(.24,.32,.42)+lightningRadiance()*.16)*.38;
     frameKeyVisibility/=float(spatialSamples);
     float4 previous=Accumulation[pixel];float history=min(float(camera.frameIndex),float(max(camera.maxFrames,1u)-1u));float3 accumulated=(previous.rgb*history+frameColor)/(history+1);
     float accumulatedKeyVisibility=camera.frameIndex==0u?frameKeyVisibility:
         (camera.frameIndex<camera.maxFrames?
             (Output[pixel].a*history+frameKeyVisibility)/(history+1):Output[pixel].a);
     Accumulation[pixel]=float4(accumulated,sceneDepth);
-    Output[pixel]=float4(linearToSrgb(colorGrade(tonemap(accumulated*camera.exposure))),
+    // Rain is dynamic and therefore stays out of the temporal accumulation
+    // buffer.  Composite low optical depth in linear HDR before exposure and
+    // tone mapping, so animated streaks neither leave trails nor clip white.
+    float3 displayRadiance=accumulated;
+    if(g_RainIntensity>.001){
+        PrecipitationFlux precipitation=
+            evaluatePrecipitationFlux(g_RainIntensity);
+        float rainTransmission=1.0;
+        float3 rainScattering=0;
+        float3 rainAirlight=min(clearSkyAirlight(camera.forward)*.55+
+            float3(.018,.026,.038)+lightningRadiance()*.035,float3(1.25,1.25,1.25));
+        [unroll] for(uint layerIndex=0u;layerIndex<4u;++layerIndex){
+            float3 streak=rainStreakLayer(pixel,layerIndex,precipitation);
+            float sceneVisibility=1-smoothstep(sceneDepth-.45,sceneDepth+.45,
+                                                streak.y);
+            float alpha=streak.x*sceneVisibility;
+            // Rare coincident shells must remain transparent.  Convert the
+            // remaining 24% optical budget back into a per-layer alpha before
+            // front-to-back compositing.
+            float remainingOpacity=max(.24-(1-rainTransmission),0.0);
+            alpha=min(alpha,remainingOpacity/max(rainTransmission,1e-4));
+            // A falling drop is a tiny refractive lens.  It should retain the
+            // bright sky even over dark foliage, while remaining partially
+            // transmissive over an already bright background.
+            float3 dropRadiance=max(rainAirlight*streak.z,
+                accumulated*1.22+float3(.016,.022,.030));
+            rainScattering+=rainTransmission*dropRadiance*alpha;
+            rainTransmission*=1-alpha;
+        }
+        displayRadiance=accumulated*rainTransmission+rainScattering;
+    }
+    Output[pixel]=float4(linearToSrgb(colorGrade(tonemap(displayRadiance*camera.exposure))),
                          accumulatedKeyVisibility);
 }
 
@@ -723,6 +882,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float terrainMoisture=.5,terrainCavity=0,terrainRoughness=.9,puddleMask=0;
     float terrainMicroHeight=.5,terrainMicroCoverage=0;
     float3 puddleNormal=float3(0,1,0);
+    float puddleImpactBright=0,puddleImpactDark=0,puddleImpactCrown=0;
     float terrainRetention=0,terrainSlope=0;
     float materialRoughness=kind<.5?.74:(kind<1.5?.40:(kind<2.5?.90:
                             (kind<3.5?.67:(kind<4.5?.48:.72))));
@@ -832,7 +992,10 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             float drainageSuitability=saturate(terrainRetention)*flatSurface;
             bool retainedCandidate=g_PuddleCoverage>.001&&
                                    drainageSuitability>.001;
-            bool lowlandCandidate=g_FloodCoverage>.001&&flatSurface>.001;
+            // Maximum organic boundary lift plus the filtered edge width is
+            // below .18 m, so higher terrain cannot possibly flood this frame.
+            bool lowlandCandidate=g_FloodCoverage>.001&&flatSurface>.001&&
+                                  hit.y<g_WaterTableHeight+.18;
             if(retainedCandidate||lowlandCandidate){
                 float macroEdge=filteredFbmWorld(hit.xz+float2(91.7,-53.4),
                                                   .052,footprint);
@@ -878,8 +1041,14 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
                 // the rising regional water table meet.
                 puddleMask=saturate(retainedMask+lowlandMask-
                                     retainedMask*lowlandMask);
-                if(payload.depth==0&&puddleMask>.002)
-                    puddleNormal=evaluatePuddleNormal(hit.xz,footprint);
+                if(payload.depth==0&&puddleMask>.002){
+                    WaterSurfaceSample waterSurface=evaluatePuddleSurface(hit.xz,
+                                                                          footprint);
+                    puddleNormal=waterSurface.normal;
+                    puddleImpactBright=waterSurface.brightCrest;
+                    puddleImpactDark=waterSurface.darkTrough;
+                    puddleImpactCrown=waterSurface.crownFoam;
+                }
                 n=normalize(lerp(n,puddleNormal,puddleMask));
                 terrainRoughness=lerp(terrainRoughness,
                     lerp(.004,.040,saturate(g_RainIntensity)),puddleMask);
@@ -917,8 +1086,12 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     }
     wetness=max(wetness,puddleMask);
     albedo*=lerp(1.0,.55,wetness);
+    // A rain-ring trough slightly increases optical path length through the
+    // shallow water. Keep this subtle: most of the impact remains reflective.
+    albedo*=1-puddleMask*puddleImpactDark*.045;
     materialRoughness=lerp(materialRoughness,.02,wetness);
-    materialRoughness=lerp(materialRoughness,.001,puddleMask);
+    materialRoughness=lerp(materialRoughness,
+        lerp(.004,.040,saturate(g_RainIntensity)),puddleMask);
 
     // Environment foliage remains in the immutable BLAS, so it receives a
     // small shading flutter.  Instance 0 is the physically deformed oak and
@@ -982,17 +1155,28 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float3 viewDirection=normalize(camera.eye-hit),halfVector=normalize(sunDir+viewDirection);
         float fresnel=.025+.975*pow(1-saturate(dot(n,viewDirection)),5);
         float exponent=lerp(12.0,220.0,1-materialRoughness);
+        float impactBrightness=saturate(puddleImpactBright*.68+
+                                        puddleImpactCrown*.92);
         float wetSpecular=pow(saturate(dot(n,halfVector)),exponent)*
                            lerp(.04,.52,wetness)*(1-materialRoughness);
+        wetSpecular*=1+impactBrightness*.65;
         unmodulated+=keyRadiance*wetSpecular*visibility*(.35+.65*fresnel);
         unmodulated+=lightningRadiance()*fresnel*wetness*.18;
+        if(puddleMask>.002&&impactBrightness>.001){
+            // Impact crests and the short-lived crown reflect incident
+            // environment light; they are deliberately not emissive white.
+            float3 reflectedEnergy=skyIrradiance(puddleNormal)*.24+
+                keyRadiance*(.08+.14*visibility)+lightningRadiance()*.30;
+            unmodulated+=reflectedEnergy*impactBrightness*puddleMask*
+                         (.014+.060*fresnel);
+        }
     }
     float3 result=albedo*(ambient+direct)+unmodulated;
     if(payload.depth==0&&puddleMask>.05){
         float3 viewDirection=normalize(camera.eye-hit);
         float waterFresnel=.0204+.9796*
             pow(1-saturate(dot(puddleNormal,viewDirection)),5);
-        RadiancePayload reflection;reflection.color=0;reflection.depth=1;
+        RadiancePayload reflection;reflection.color=result;reflection.depth=1;
         reflection.primaryT=2200;reflection.primaryKeyVisibility=1;
         // The bounded wave normal supplies distortion. Blend back toward a
         // nearly level reflection whenever that distortion approaches the
@@ -1008,9 +1192,18 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         RayDesc reflectedRay;reflectedRay.Origin=hit+puddleNormal*.020;
         reflectedRay.Direction=reflectionDirection;
         reflectedRay.TMin=.014;reflectedRay.TMax=2200;
-        TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,reflectedRay,reflection);
         float reflectionWeight=puddleMask*waterFresnel*
             lerp(.88,1.0,smoothstep(.18,.82,puddleMask));
+        float impactReflection=clamp(1+puddleImpactBright*.045+
+            puddleImpactCrown*.035-puddleImpactDark*.025,.96,1.08);
+        reflectionWeight=saturate(reflectionWeight*impactReflection);
+        // Near-normal Fresnel contributions do not justify a full traversal.
+        // Preserve the physical sky term cheaply; use an exact DXR reflection
+        // once the contribution is large enough to reveal scene geometry.
+        if(reflectionWeight>.022)
+            TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,reflectedRay,reflection);
+        else if(reflectionWeight>.004)
+            reflection.color=environmentRadiance(reflectionDirection);
         result=lerp(result,reflection.color,reflectionWeight);
     }
     if(payload.depth==0&&!terrainSurface){RadiancePayload bounce;bounce.color=0;bounce.depth=1;bounce.primaryT=6;bounce.primaryKeyVisibility=1;RayDesc br;br.Origin=hit+surfaceNormal*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=6;TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}
