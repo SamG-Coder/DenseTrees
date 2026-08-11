@@ -1,4 +1,5 @@
 #include "environment.hpp"
+#include "ground_texture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -8,7 +9,8 @@
 namespace dense {
 namespace {
 
-constexpr float terrainGridExponent=1.78f;
+constexpr float terrainGridExponent=2.05f;
+constexpr float tributaryConfluenceZ=520.0f;
 
 float smoothStep(float low,float high,float value) {
     const float t=clamp((value-low)/(high-low),0.0f,1.0f);
@@ -37,6 +39,19 @@ float meadowValueNoise(float x,float z) {
     return (a+(b-a)*blendX)+((c+(d-c)*blendX)-(a+(b-a)*blendX))*blendZ;
 }
 
+float mapFbm(float x,float z) {
+    float sum=0,amplitude=.56f,normalization=0;
+    for(int octave=0;octave<5;++octave) {
+        sum+=amplitude*meadowValueNoise(x,z);
+        normalization+=amplitude;
+        const float nextX=x*1.91f-z*.37f+19.7f;
+        z=x*.31f+z*1.83f-27.1f;
+        x=nextX;
+        amplitude*=.51f;
+    }
+    return sum/normalization;
+}
+
 struct MeadowColourFields {
     float fertility;
     float dryColony;
@@ -55,11 +70,6 @@ MeadowColourFields meadowColourFields(float x,float z) {
     const float lush=smoothStep(.60f,.84f,.58f*broad+.42f*subclump);
     const float warmCool=clamp((colony-.5f)*1.4f+(broad-.5f)*.6f,-1.0f,1.0f);
     return {fertility,dry,lush,warmCool};
-}
-
-float gaussian(float x,float z,float cx,float cz,float rx,float rz) {
-    const float dx=(x-cx)/rx,dz=(z-cz)/rz;
-    return std::exp(-(dx*dx+dz*dz));
 }
 
 uint32_t packColor(float r,float g,float b) {
@@ -203,19 +213,29 @@ void appendProxyAxis(EnvironmentMesh& mesh,Vec3 start,Vec3 direction,float axisL
     if(depth==0) {
         const float horizontal=type==1?crownRadius*rng.range(.10f,.17f):
                                (type==2?crownRadius*rng.range(.14f,.21f):
-                                        crownRadius*rng.range(.18f,.25f));
+                                        crownRadius*rng.range(.14f,.20f));
         const float vertical=type==1?treeHeight*rng.range(.035f,.060f):
                              (type==2?treeHeight*rng.range(.055f,.085f):
-                                      treeHeight*rng.range(.070f,.105f));
+                                      treeHeight*rng.range(.045f,.075f));
         const Vec3 helper=std::abs(tangent.y)<.9f?Vec3{0,1,0}:Vec3{1,0,0};
         const Vec3 side=normalize(cross(helper,tangent)),around=normalize(cross(tangent,side));
         const float phase=rng.range(0,2*pi);
         for(int pad=0;pad<terminalPadCount;++pad) {
             const float padAngle=phase+2*pi*pad/std::max(1,terminalPadCount)+rng.range(-.32f,.32f);
-            const float offsetRadius=pad==0?0.0f:horizontal*rng.range(.38f,.68f);
+            // Oak foliage occupies the last several growth units, not a ball
+            // pinned to the end of a naked stick.  Trail overlapping pads
+            // backwards along the axis and stagger them around it.  This
+            // preserves crown windows while removing the proxy "lollipop"
+            // silhouette at medium and distant LODs.
+            const float padProgress=terminalPadCount>1?
+                static_cast<float>(pad)/(terminalPadCount-1):0.0f;
+            const float offsetRadius=pad==0?horizontal*rng.range(.05f,.18f):
+                                            horizontal*rng.range(.30f,.62f);
+            const float along=pad==0?horizontal*rng.range(.05f,.18f):
+                                     -horizontal*(.22f+.58f*padProgress);
             const Vec3 offset=side*(std::cos(padAngle)*offsetRadius)
                              +around*(std::sin(padAngle)*offsetRadius)
-                             +tangent*horizontal*rng.range(.04f,.24f);
+                             +tangent*along;
             appendFoliageClump(mesh,position+offset,
                                {horizontal*rng.range(.84f,1.12f),
                                 vertical*rng.range(.82f,1.10f),
@@ -298,69 +318,347 @@ void appendProxyTree(EnvironmentMesh& mesh,Vec3 base,float height,float crownRad
     }
 }
 
-void appendProxyBush(EnvironmentMesh& mesh,Vec3 base,float radius,float height,Rng& rng) {
-    const uint32_t wood=packColor(.105f,.068f,.038f),foliage=packColor(.14f,.315f,.08f);
-    const int stems=5+static_cast<int>(rng.next()%3u);
+// Map-scale foliage is intentionally not a reduced copy of the hero tree.
+// Five overlapping, branch-aligned pads preserve the broken oak silhouette at
+// kilometre distances for a fraction of the geometry of the medium LOD.  The
+// elongated pads trail back over their supporting limbs, avoiding both round
+// lollipop crowns and the radial spoke pattern of generic billboard trees.
+void appendFarCrownPad(EnvironmentMesh& mesh,Vec3 center,Vec3 majorDirection,
+                       float majorRadius,float minorRadius,float verticalRadius,
+                       int type,Rng& rng) {
+    const Vec3 flatDirection{majorDirection.x,0,majorDirection.z};
+    const Vec3 major=lengthSq(flatDirection)>.0001f?normalize(flatDirection):Vec3{1,0,0};
+    const Vec3 minor{-major.z,0,major.x};
+    constexpr int sides=6;
+    const uint32_t foliage=type==1?packColor(.105f,.255f,.075f):
+                             (type==2?packColor(.165f,.285f,.070f):
+                                      packColor(.120f,.285f,.072f));
+    const float material=4.0f+type*.1f;
+    const uint32_t bottom=static_cast<uint32_t>(mesh.detailVertices.size());
+    mesh.detailVertices.push_back({center+Vec3{0,-verticalRadius,0},{0,-1,0},
+                                   foliage,material,.5f,0});
+    constexpr std::array<float,2> latitude{-.34f,.38f};
+    const uint32_t firstRing=static_cast<uint32_t>(mesh.detailVertices.size());
+    const float phase=rng.range(-.26f,.26f);
+    for(size_t ring=0;ring<latitude.size();++ring)for(int side=0;side<sides;++side) {
+        const float angle=2*pi*side/sides+phase;
+        const float y=latitude[ring];
+        const float profile=std::sqrt(std::max(0.0f,1-y*y));
+        const float irregular=.87f+rng.range(-.055f,.075f)+
+            .075f*std::sin(angle*3.0f+ring*1.7f+type*.8f);
+        const Vec3 local=major*(std::cos(angle)*majorRadius*profile*irregular)+
+                         minor*(std::sin(angle)*minorRadius*profile*irregular)+
+                         Vec3{0,y*verticalRadius,0};
+        const Vec3 normal=normalize(major*(std::cos(angle)/std::max(majorRadius,.01f))+
+                                    minor*(std::sin(angle)/std::max(minorRadius,.01f))+
+                                    Vec3{0,y/std::max(verticalRadius,.01f),0});
+        const float tint=rng.range(.82f,1.11f);
+        const float red=(foliage&255)/255.0f,green=((foliage>>8)&255)/255.0f;
+        const float blue=((foliage>>16)&255)/255.0f;
+        mesh.detailVertices.push_back({center+local,normal,
+            packColor(red*tint,green*tint,blue*tint),material,
+            static_cast<float>(side)/sides,(y+1)*.5f});
+    }
+    const uint32_t top=static_cast<uint32_t>(mesh.detailVertices.size());
+    mesh.detailVertices.push_back({center+Vec3{0,verticalRadius,0},{0,1,0},foliage,
+                                   material,.5f,1});
+    for(int side=0;side<sides;++side) {
+        const uint32_t next=static_cast<uint32_t>((side+1)%sides);
+        mesh.detailIndices.insert(mesh.detailIndices.end(),
+            {bottom,firstRing+next,firstRing+static_cast<uint32_t>(side)});
+        const uint32_t a=firstRing+static_cast<uint32_t>(side),b=firstRing+next;
+        const uint32_t c=a+sides,d=b+sides;
+        mesh.detailIndices.insert(mesh.detailIndices.end(),{a,c,d,a,d,b});
+        mesh.detailIndices.insert(mesh.detailIndices.end(),{c,d,top});
+    }
+}
+
+void appendFarTree(EnvironmentMesh& mesh,Vec3 base,Vec3 gradeNormal,float height,
+                   float crownRadius,int type,Rng& rng) {
+    const uint32_t wood=packColor(.085f,.052f,.028f);
+    const float dominant=rng.range(0,2*pi);
+    const Vec3 leanDirection{std::cos(dominant),0,std::sin(dominant)};
+    const Vec3 gradeBias{gradeNormal.x*.10f,0,gradeNormal.z*.10f};
+    const Vec3 lower=base+Vec3{0,height*.34f,0}+leanDirection*(height*rng.range(.015f,.045f));
+    const Vec3 fork=base+Vec3{0,height*.61f,0}+
+                    leanDirection*(height*rng.range(.045f,.095f))+gradeBias*height;
+    appendTube(mesh,base,lower,height*.041f,height*.031f,4,wood,5.0f);
+    appendTube(mesh,lower,fork,height*.031f,height*.021f,4,wood,5.0f);
+
+    std::array<Vec3,4> padCenters{};
+    std::array<Vec3,4> padDirections{};
+    for(int limb=0;limb<4;++limb) {
+        // Golden-angle progression plus a dominant-side bias produces unequal
+        // reiterations instead of evenly spaced radial arms.
+        const float angle=dominant+limb*2.3999632f+rng.range(-.32f,.32f);
+        const float broadness=type==1?.74f:(type==2?.86f:1.0f);
+        const float limbLength=crownRadius*broadness*rng.range(.67f,1.02f)*
+            (limb==0?1.13f:(limb==3?.82f:1.0f));
+        const float rise=type==1?rng.range(.34f,.60f):rng.range(.16f,.42f);
+        const Vec3 direction=normalize({std::cos(angle),rise,std::sin(angle)});
+        const Vec3 sideways{-direction.z,0,direction.x};
+        const Vec3 origin=(limb<2?lower:fork)+Vec3{0,height*(.025f*limb),0};
+        const Vec3 middle=origin+direction*(limbLength*.48f)+
+                          sideways*(limbLength*rng.range(-.075f,.075f));
+        const Vec3 tip=middle+direction*(limbLength*.52f)+
+                       sideways*(limbLength*rng.range(-.09f,.09f));
+        const float radius=height*rng.range(.0085f,.0125f)*(limb<2?1.12f:.92f);
+        appendTube(mesh,origin,middle,radius,radius*.64f,3,wood,5.0f);
+        appendTube(mesh,middle,tip,radius*.64f,radius*.24f,3,wood,5.0f);
+        padCenters[limb]=middle+(tip-middle)*rng.range(.47f,.68f);
+        padDirections[limb]=tip-origin;
+    }
+
+    const float verticalScale=type==1?.115f:(type==2?.135f:.125f);
+    for(int limb=0;limb<4;++limb) {
+        const float size=(limb==0?1.08f:(limb==3?.87f:1.0f));
+        appendFarCrownPad(mesh,padCenters[limb],padDirections[limb],
+            crownRadius*rng.range(.28f,.38f)*size,
+            crownRadius*rng.range(.17f,.25f)*size,
+            height*rng.range(verticalScale*.76f,verticalScale*1.08f)*size,
+            type,rng);
+    }
+    // An off-centre interior mass fuses the four scaffold reiterations while
+    // retaining one deliberate crown window on the non-dominant side.
+    const Vec3 crownDirection{std::cos(dominant+.42f),0,std::sin(dominant+.42f)};
+    const Vec3 crownCenter=fork+Vec3{0,height*rng.range(.105f,.19f),0}+
+                           crownDirection*(crownRadius*rng.range(.04f,.14f));
+    appendFarCrownPad(mesh,crownCenter,crownDirection,
+        crownRadius*rng.range(.30f,.42f),crownRadius*rng.range(.20f,.29f),
+        height*rng.range(.10f,.15f),type,rng);
+}
+
+void appendProxyBush(EnvironmentMesh& mesh,Vec3 base,float radius,float height,int variant,
+                     Rng& rng) {
+    const uint32_t wood=packColor(.105f,.068f,.038f);
+    const uint32_t foliage=variant==1?packColor(.115f,.285f,.075f):
+                             (variant==2?packColor(.19f,.315f,.072f):
+                                         packColor(.125f,.305f,.080f));
+    const int stems=(variant==1?7:5)+static_cast<int>(rng.next()%3u);
     for(int stem=0;stem<stems;++stem) {
         const float angle=2*pi*stem/stems+rng.range(-.22f,.22f);
-        const Vec3 middle=base+Vec3{std::cos(angle)*radius*.28f,height*.43f,
-                                    std::sin(angle)*radius*.28f};
+        const float lean=rng.range(.22f,.38f);
+        const Vec3 middle=base+Vec3{std::cos(angle)*radius*lean,height*rng.range(.35f,.49f),
+                                    std::sin(angle)*radius*lean};
         const Vec3 tip=base+Vec3{std::cos(angle)*radius*rng.range(.68f,1.0f),
                                  height*rng.range(.68f,1.0f),
                                  std::sin(angle)*radius*rng.range(.68f,1.0f)};
         appendTube(mesh,base,middle,height*.018f,height*.010f,4,wood,5.0f);
         appendTube(mesh,middle,tip,height*.010f,.003f,4,wood,5.0f);
+        if((stem&1)==0||variant==1) {
+            const Vec3 inner=middle+(tip-middle)*rng.range(.18f,.42f);
+            appendFoliageClump(mesh,inner,
+                               {radius*rng.range(.21f,.34f),height*rng.range(.12f,.19f),
+                                radius*rng.range(.19f,.32f)},
+                               foliage,4.2f,rng.next(),5);
+        }
         appendFoliageClump(mesh,tip,{radius*rng.range(.18f,.28f),height*rng.range(.14f,.22f),
                                     radius*rng.range(.17f,.27f)},
-                           foliage,4.2f,rng.next(),6);
+                           foliage,4.2f,rng.next(),5);
     }
 }
 
 struct GrassIsland { float x,z,rx,rz,phase; };
 
+struct PopulationSite {
+    float height{};
+    Vec3 normal{0,1,0};
+    float slope{};
+    float riverBankDistance{10000.0f};
+    float floodplainInfluence{};
+    float exposure{};
+    GroundBiomeWeights biome{};
+    bool channelClear{true};
+};
+
+PopulationSite populationSite(float x,float z) {
+    PopulationSite site;
+    site.height=EnvironmentGenerator::terrainHeight(x,z);
+    site.normal=EnvironmentGenerator::terrainNormal(x,z);
+    site.slope=std::sqrt(site.normal.x*site.normal.x+site.normal.z*site.normal.z)/
+               std::max(site.normal.y,.08f);
+
+    const float mainLateral=std::abs(x-EnvironmentGenerator::riverCenterX(z));
+    const float mainWidth=EnvironmentGenerator::riverHalfWidth(z);
+    const float mainBank=std::max(0.0f,mainLateral-mainWidth);
+
+    const float joinX=EnvironmentGenerator::riverCenterX(tributaryConfluenceZ);
+    const float tributaryActive=smoothStep(-2960.0f,-2760.0f,x)*
+        (1.0f-smoothStep(joinX-45.0f,joinX+18.0f,x));
+    const float tributaryLateral=std::abs(z-EnvironmentGenerator::tributaryCenterZ(x));
+    const float tributaryWidth=EnvironmentGenerator::tributaryHalfWidth(x);
+    const float tributaryBank=tributaryActive>.001f?
+        std::max(0.0f,tributaryLateral-tributaryWidth):10000.0f;
+
+    site.riverBankDistance=std::min(mainBank,tributaryBank);
+    const float broadWet=mapFbm(x*.0017f+113.0f,z*.0017f-67.0f);
+    const float riverMoisture=1.0f-smoothStep(18.0f,285.0f,site.riverBankDistance);
+    const float moisture=clamp(.27f+.58f*riverMoisture+.24f*(broadWet-.35f)-
+                               .12f*smoothStep(.22f,.75f,site.slope),0.0f,1.0f);
+    site.floodplainInfluence=riverMoisture;
+    site.exposure=clamp(.55f*mapFbm(x*.0028f-79.0f,z*.0028f+37.0f)+
+                        .45f*mapFbm(x*.0091f+17.0f,z*.0091f-131.0f),0.0f,1.0f);
+    site.biome=groundBiomeWeights({site.height,site.slope,site.riverBankDistance,
+                                    moisture,site.exposure});
+    site.channelClear=mainLateral>mainWidth+20.0f&&
+        (tributaryActive<.05f||tributaryLateral>tributaryWidth+20.0f);
+    return site;
+}
+
 } // namespace
+
+float EnvironmentGenerator::riverCenterX(float z) {
+    return 330.0f+110.0f*std::sin(z/610.0f+.40f)
+                 +45.0f*std::sin(z/185.0f-1.0f);
+}
+
+float EnvironmentGenerator::riverHalfWidth(float z) {
+    return 34.0f+5.0f*std::sin(z/430.0f+.8f)
+                +3.0f*std::sin(z/137.0f-1.3f);
+}
+
+float EnvironmentGenerator::riverBedHeight(float z) {
+    // 2.4 metres of fall per kilometre.  This remains strictly downhill even
+    // through the mountain pass and is deliberately independent of noise.
+    return -6.40f-.00240f*z;
+}
+
+float EnvironmentGenerator::riverSurfaceHeight(float z) {
+    return riverBedHeight(z)+.72f;
+}
+
+float EnvironmentGenerator::tributaryCenterZ(float x) {
+    const float joinX=riverCenterX(tributaryConfluenceZ);
+    const float upstream=joinX-x;
+    const float developed=smoothStep(0.0f,360.0f,std::max(0.0f,upstream));
+    return tributaryConfluenceZ+.105f*upstream+
+           82.0f*std::sin(upstream*.0021f)*developed;
+}
+
+float EnvironmentGenerator::tributaryHalfWidth(float x) {
+    const float joinX=riverCenterX(tributaryConfluenceZ);
+    const float upstream=joinX-x;
+    return 18.0f+2.8f*std::sin(upstream/310.0f+.45f)
+                +1.8f*std::sin(upstream/103.0f-1.1f);
+}
+
+float EnvironmentGenerator::tributarySurfaceHeight(float x) {
+    const float joinX=riverCenterX(tributaryConfluenceZ);
+    return riverSurfaceHeight(tributaryConfluenceZ)+.00310f*(joinX-x);
+}
+
+float EnvironmentGenerator::tributaryBedHeight(float x) {
+    return tributarySurfaceHeight(x)-.48f;
+}
 
 float EnvironmentGenerator::terrainHeight(float x,float z) {
     const float radius=std::sqrt(x*x+z*z);
     const float rootMask=smoothStep(1.65f,4.6f,radius);
-    const float ellipticalRadiusSq=x*x*.82f+z*z*1.16f;
-    const float hill=-3.25f*(1.0f-std::exp(-ellipticalRadiusSq/235.0f));
+    const float ellipticalRadiusSq=x*x*.84f+z*z*1.12f;
+    const float heroKnoll=-2.75f*(1.0f-std::exp(-ellipticalRadiusSq/275.0f));
 
-    const float broad=.24f*std::sin(x*.105f+.45f)*std::cos(z*.083f-.80f)
-                     +.13f*std::sin((x+z)*.047f+1.70f)
-                     +.08f*std::cos((x-z)*.071f-.20f);
-    const float shoulder=.38f*gaussian(x,z,-8,5,std::sqrt(120.0f),std::sqrt(210.0f));
-    const float shoulderAtOrigin=.38f*gaussian(0,0,-8,5,std::sqrt(120.0f),std::sqrt(210.0f));
+    // Continental-scale fields establish broad watersheds.  Frequencies are
+    // in hundreds of metres, eliminating the repeating test-map ripples.
+    const float continental=(mapFbm(x*.00043f+17.1f,z*.00043f-9.7f)-.5f)*8.5f;
+    const float rolling=(mapFbm(x*.00165f-31.4f,z*.00165f+24.8f)-.5f)*2.2f;
+    const float meadowMicro=(mapFbm(x*.032f+7.0f,z*.032f-43.0f)-.5f)*.42f+
+                            (mapFbm(x*.085f-63.0f,z*.085f+11.0f)-.5f)*.12f;
+    const float pastureMask=1.0f-smoothStep(1350.0f,2050.0f,radius);
+    float terrain=heroKnoll+(continental*.34f+rolling)*smoothStep(7.0f,34.0f,radius)
+                 *(.55f+.45f*pastureMask)+
+                 meadowMicro*(1.0f-smoothStep(620.0f,940.0f,radius));
 
-    // Unequal overlapping landforms form a readable middle distance instead
-    // of a single mathematical dome.
-    const float middleMask=smoothStep(10,18,radius)*(1-smoothStep(63,74,radius));
-    const float middle=2.15f*gaussian(x,z,-23,27,19,13)
-                      +1.55f*gaussian(x,z,25,32,23,15)
-                      +2.55f*gaussian(x,z,7,48,25,16)
-                      +1.75f*gaussian(x,z,-39,-18,17,24)
-                      +1.35f*gaussian(x,z,37,-25,21,18)
-                      +.95f*gaussian(x,z,3,-40,28,15);
+    // A rock escarpment breaks the western middle distance and creates a real
+    // ridge/gorge relationship with the tributary instead of decorative
+    // radial hills.  Its broad Gaussian profile remains heightfield-safe.
+    const float escarpmentAxis=x+1320.0f-.20f*z;
+    const float escarpmentAlong=z+180.0f;
+    const float escarpmentEnvelope=smoothStep(-1550.0f,-1120.0f,escarpmentAlong)*
+                                    (1.0f-smoothStep(1150.0f,1530.0f,escarpmentAlong));
+    const float escarpmentProfile=std::exp(-(escarpmentAxis*escarpmentAxis)/(185.0f*185.0f));
+    const float rockyBands=.88f+.10f*std::sin((x+z*.24f)*.015f)+
+                                  .05f*std::sin((x-z*.41f)*.041f);
+    terrain+=38.0f*escarpmentEnvelope*escarpmentProfile*rockyBands;
 
-    // A warped annular range remains visible while orbiting.  The non-uniform
-    // grid spends its resolution near the oak while retaining a genuinely
-    // distant, atmospherically softened mountain silhouette.
-    const float angle=std::atan2(z,x);
-    const float ridgeRadius=1220.0f+95.0f*std::sin(angle*3+.55f)
-                                    +55.0f*std::sin(angle*5-1.15f)
-                                    +28.0f*std::sin(angle*9+.30f);
-    const float ridgeWidth=145.0f+25.0f*std::sin(angle*4-.40f);
-    const float ridgeProfile=std::exp(-((radius-ridgeRadius)*(radius-ridgeRadius))/
-                                      (ridgeWidth*ridgeWidth));
-    const float peakVariation=clamp(.50f+.24f*std::sin(angle*2-.25f)
-                                         +.15f*std::sin(angle*5+1.35f)
-                                         +.08f*std::sin(angle*11-.70f),0.0f,1.0f);
-    const float ridgePeaks=62.0f+68.0f*peakVariation;
-    const float foothillDistance=(radius-(ridgeRadius-245.0f))/205.0f;
-    const float foothills=13.0f*std::exp(-foothillDistance*foothillDistance);
-    const float ridgeMask=smoothStep(760,900,radius)*(1-smoothStep(1510,1590,radius));
-    const float mountains=ridgeMask*(ridgeProfile*ridgePeaks+foothills);
-    return rootMask*(hill+broad+shoulder-shoulderAtOrigin+middleMask*middle+mountains);
+    // The map is bounded by a distant, irregular horseshoe range with an open
+    // southern river outlet.  These chains sit 2.2--3.0 km from the oak,
+    // roughly twice the former test-map distance.
+    const float northCenter=2520.0f+175.0f*std::sin(x/690.0f+.25f)
+                                   +70.0f*std::sin(x/247.0f-1.1f);
+    const float northD=z-northCenter;
+    const float northProfile=std::exp(-(northD*northD)/(340.0f*340.0f));
+    const float northEnvelope=1.0f-smoothStep(2750.0f,3200.0f,std::abs(x));
+    const float northPeakField=mapFbm(x*.00105f+73.0f,z*.00105f-41.0f);
+    const float northRange=northProfile*northEnvelope*(150.0f+155.0f*northPeakField)*
+                           (.91f+.09f*std::sin(x*.0085f+z*.0017f));
+
+    const float westCenter=-2670.0f+145.0f*std::sin(z/610.0f-.5f);
+    const float westD=x-westCenter;
+    const float westProfile=std::exp(-(westD*westD)/(315.0f*315.0f));
+    const float westEnvelope=smoothStep(-2550.0f,-2050.0f,z)*
+                             (1.0f-smoothStep(2450.0f,2940.0f,z));
+    const float westRange=westProfile*westEnvelope*
+        (125.0f+135.0f*mapFbm(x*.00114f-16.0f,z*.00114f+88.0f));
+
+    const float eastCenter=2780.0f+120.0f*std::sin(z/720.0f+.9f);
+    const float eastD=x-eastCenter;
+    const float eastProfile=std::exp(-(eastD*eastD)/(360.0f*360.0f));
+    const float eastEnvelope=smoothStep(-2200.0f,-1660.0f,z)*
+                             (1.0f-smoothStep(2180.0f,2760.0f,z));
+    const float eastRange=eastProfile*eastEnvelope*
+        (100.0f+115.0f*mapFbm(x*.00102f+137.0f,z*.00102f-62.0f));
+    terrain+=std::max({northRange,westRange,eastRange});
+
+    const float northFoothillD=z-(northCenter-480.0f);
+    terrain+=28.0f*std::exp(-(northFoothillD*northFoothillD)/(610.0f*610.0f))*
+             northEnvelope*(.55f+.45f*mapFbm(x*.0017f+9.0f,z*.0017f+117.0f));
+
+    // Tributary valley first, then the main valley.  Applying the main river
+    // last guarantees a clean, deeper confluence.  Valley and floodplain
+    // targets only lower terrain; channel centres are authored elevations.
+    const float joinX=riverCenterX(tributaryConfluenceZ);
+    const float tributaryLateral=std::abs(z-tributaryCenterZ(x));
+    const float tributaryWidth=tributaryHalfWidth(x);
+    const float tributaryActive=smoothStep(-2960.0f,-2760.0f,x)*
+                                 (1.0f-smoothStep(joinX-45.0f,joinX+18.0f,x));
+    const float tributaryFloodWidth=115.0f+22.0f*std::sin((joinX-x)/470.0f);
+    const float tributaryValley=tributaryActive*
+        (1.0f-smoothStep(tributaryFloodWidth,tributaryFloodWidth+300.0f,
+                         tributaryLateral));
+    const float tributaryValleyTarget=tributarySurfaceHeight(x)+2.0f+
+        3.4f*std::pow(clamp(tributaryLateral/(tributaryFloodWidth+1.0f),0.0f,1.0f),1.45f);
+    terrain=terrain+(std::min(terrain,tributaryValleyTarget)-terrain)*tributaryValley*.78f;
+    const float tributaryFlood=tributaryActive*
+        (1.0f-smoothStep(tributaryFloodWidth*.72f,tributaryFloodWidth,
+                         tributaryLateral));
+    const float tributaryFloodTarget=tributarySurfaceHeight(x)+.72f+
+        1.25f*std::pow(tributaryLateral/(tributaryFloodWidth+1.0f),1.7f);
+    terrain=terrain+(std::min(terrain,tributaryFloodTarget)-terrain)*tributaryFlood;
+    const float tributaryChannel=tributaryActive*
+        (1.0f-smoothStep(tributaryWidth*.76f,tributaryWidth,tributaryLateral));
+    const float tributaryChannelTarget=tributaryBedHeight(x)+.16f*
+        std::pow(tributaryLateral/(tributaryWidth+1.0f),2.0f);
+    terrain=terrain+(tributaryChannelTarget-terrain)*tributaryChannel;
+
+    const float mainLateral=std::abs(x-riverCenterX(z));
+    const float mainWidth=riverHalfWidth(z);
+    const float floodWidth=205.0f+42.0f*std::sin(z/760.0f+.3f)
+                                  +20.0f*std::sin(z/233.0f-1.0f);
+    const float mainValley=1.0f-smoothStep(floodWidth,floodWidth+430.0f,mainLateral);
+    const float mainValleyTarget=riverSurfaceHeight(z)+2.7f+
+        4.6f*std::pow(clamp(mainLateral/(floodWidth+1.0f),0.0f,1.0f),1.5f);
+    terrain=terrain+(std::min(terrain,mainValleyTarget)-terrain)*mainValley*.80f;
+    const float mainFloodplain=1.0f-smoothStep(floodWidth*.72f,floodWidth,mainLateral);
+    const float floodplainTexture=(mapFbm(x*.008f+53.0f,z*.008f-71.0f)-.5f)*.14f;
+    const float mainFloodTarget=riverSurfaceHeight(z)+1.05f+floodplainTexture+
+        1.45f*std::pow(mainLateral/(floodWidth+1.0f),1.8f);
+    terrain=terrain+(std::min(terrain,mainFloodTarget)-terrain)*mainFloodplain;
+    const float mainChannel=1.0f-smoothStep(mainWidth*.76f,mainWidth,mainLateral);
+    const float mainChannelTarget=riverBedHeight(z)+.18f*
+        std::pow(mainLateral/(mainWidth+1.0f),2.0f);
+    terrain=terrain+(mainChannelTarget-terrain)*mainChannel;
+
+    return rootMask*terrain;
 }
 
 Vec3 EnvironmentGenerator::terrainNormal(float x,float z) {
@@ -444,8 +742,21 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
     for(int z=0;z<resolution;++z)for(int x=0;x<resolution;++x) {
         const size_t index=gridIndex(x,z);const Vec3 normal=normalGrid[index];
         const float worldX=gridCoordinates[x],worldZ=gridCoordinates[z];
+        const float mainDistance=std::abs(worldX-riverCenterX(worldZ));
+        const float mainChannel=1.0f-smoothStep(riverHalfWidth(worldZ)*.72f,
+                                                riverHalfWidth(worldZ)*1.10f,
+                                                mainDistance);
+        const float tributaryJoinX=riverCenterX(tributaryConfluenceZ);
+        const float tributaryActive=smoothStep(-2960.0f,-2760.0f,worldX)*
+            (1.0f-smoothStep(tributaryJoinX-45.0f,tributaryJoinX+18.0f,worldX));
+        const float tributaryDistance=std::abs(worldZ-tributaryCenterZ(worldX));
+        const float tributaryChannel=tributaryActive*
+            (1.0f-smoothStep(tributaryHalfWidth(worldX)*.70f,
+                             tributaryHalfWidth(worldX)*1.10f,tributaryDistance));
+        const float mappedChannelRetention=std::max(mainChannel,tributaryChannel)*
+            smoothStep(.990268f,.997564f,normal.y);
         if(std::sqrt(worldX*worldX+worldZ*worldZ)>grassHalfExtent){
-            waterRetention[index]=0;continue;
+            waterRetention[index]=mappedChannelRetention;continue;
         }
         const float height=heightGrid[index];float minimumRim=std::numeric_limits<float>::max();
         float meanSix=0,meanSixteen=0;
@@ -469,16 +780,31 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
             .75f*smoothStep(.04f,.32f,sixteenMetrePosition));
         const float notRidge=1-smoothStep(.02f,.18f,
                                           std::max(0.0f,-sixteenMetrePosition));
-        waterRetention[index]=clamp(flat*depth*(.65f+.35f*concavity)*notRidge,0.0f,1.0f);
+        waterRetention[index]=clamp(std::max(flat*depth*(.65f+.35f*concavity)*notRidge,
+                                              mappedChannelRetention),0.0f,1.0f);
     }
     for(int z=0;z<resolution;++z) {
         const float worldZ=gridCoordinates[z];
         for(int x=0;x<resolution;++x) {
             const float worldX=gridCoordinates[x];const size_t index=gridIndex(x,z);
             const float y=heightGrid[index];const Vec3 normal=normalGrid[index];
-            const float variation=.5f+.5f*std::sin(worldX*.071f+worldZ*.053f);
-            uint32_t color=packColor(.20f+.035f*variation,.315f+.045f*variation,
-                                     .135f+.022f*variation);
+            const float broadColour=mapFbm(worldX*.0042f+12.0f,worldZ*.0042f-37.0f);
+            const float fineColour=mapFbm(worldX*.013f-81.0f,worldZ*.013f+26.0f);
+            const float mainDistance=std::abs(worldX-riverCenterX(worldZ));
+            const float floodplain=1.0f-smoothStep(120.0f,285.0f,mainDistance);
+            const float altitudeRock=smoothStep(32.0f,128.0f,y);
+            const float slopeRock=smoothStep(.08f,.32f,1.0f-normal.y);
+            const float rock=clamp(std::max(altitudeRock*.72f,slopeRock),0.0f,1.0f);
+            const Vec3 meadow{.175f+.050f*broadColour+.018f*fineColour,
+                              .285f+.072f*broadColour+.025f*fineColour,
+                              .115f+.030f*broadColour};
+            const Vec3 wetMeadow{meadow.x*.72f,meadow.y*.84f,meadow.z*.78f};
+            const Vec3 pasture=meadow+(wetMeadow-meadow)*floodplain*.58f;
+            const float rockTone=.72f+.24f*mapFbm(worldX*.008f+91.0f,
+                                                  worldZ*.008f-13.0f);
+            const Vec3 stone{.31f*rockTone,.295f*rockTone,.265f*rockTone};
+            const Vec3 vertexColour=pasture+(stone-pasture)*rock;
+            uint32_t color=packColor(vertexColour.x,vertexColour.y,vertexColour.z);
             const uint32_t retentionByte=static_cast<uint32_t>(
                 clamp(waterRetention[index]*255.0f+0.5f,0.0f,255.0f));
             color=(color&0x00ffffffu)|(retentionByte<<24);
@@ -494,6 +820,70 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         if(((x+z)&1)==0)mesh.terrainIndices.insert(mesh.terrainIndices.end(),{a,c,d,a,d,b});
         else mesh.terrainIndices.insert(mesh.terrainIndices.end(),{a,c,b,b,c,d});
     }
+
+    // A small independent water mesh keeps the river visible even in dry
+    // weather.  It follows the same deterministic hydrology contract as the
+    // terrain carve.  Indices deliberately remain local to riverVertices so
+    // the renderer can build a dedicated opaque/reflection BLAS for kind 6.
+    const uint32_t riverColor=packColor(.075f,.19f,.235f);
+    const auto appendStrip=[&](int longitudinalSegments,int crossSegments,
+                               auto crossSection) {
+        const uint32_t base=static_cast<uint32_t>(mesh.riverVertices.size());
+        for(int segment=0;segment<=longitudinalSegments;++segment) {
+            const auto section=crossSection(static_cast<float>(segment)/longitudinalSegments);
+            const Vec3 tangent=normalize(section[1]);
+            const Vec3 lateral=normalize(section[2]);
+            const Vec3 normal=normalize(cross(tangent,lateral));
+            for(int across=0;across<=crossSegments;++across) {
+                const float u=static_cast<float>(across)/crossSegments;
+                const float offset=(u*2.0f-1.0f)*section[3].x;
+                Vec3 position=section[0]+lateral*offset;
+                const TerrainSurfaceSample ground=sampleTerrainSurface(position.x,position.z);
+                position.y=std::max(position.y,ground.position.y+.035f);
+                mesh.riverVertices.push_back({position,normal,riverColor,
+                                               6.0f,u,section[3].y});
+            }
+        }
+        const uint32_t stride=static_cast<uint32_t>(crossSegments+1);
+        for(int segment=0;segment<longitudinalSegments;++segment)
+            for(int across=0;across<crossSegments;++across) {
+                const uint32_t a=base+static_cast<uint32_t>(segment)*stride+across;
+                const uint32_t b=a+1,c=a+stride,d=c+1;
+                mesh.riverIndices.insert(mesh.riverIndices.end(),{a,c,d,a,d,b});
+            }
+    };
+
+    constexpr int mainSegments=196,mainCrossSegments=6;
+    appendStrip(mainSegments,mainCrossSegments,[&](float t) {
+        const float z=-2940.0f+t*5880.0f;
+        constexpr float derivativeStep=1.0f;
+        const float dx=(riverCenterX(z+derivativeStep)-riverCenterX(z-derivativeStep))*.5f;
+        const float dy=(riverSurfaceHeight(z+derivativeStep)-
+                        riverSurfaceHeight(z-derivativeStep))*.5f;
+        const Vec3 tangent{dx,dy,1.0f};
+        const Vec3 lateral{1.0f,0.0f,-dx};
+        return std::array<Vec3,4>{{
+            {riverCenterX(z),riverSurfaceHeight(z),z},tangent,lateral,
+            {riverHalfWidth(z)*.76f,t,0}
+        }};
+    });
+
+    constexpr int tributarySegments=112,tributaryCrossSegments=5;
+    const float joinX=riverCenterX(tributaryConfluenceZ);
+    appendStrip(tributarySegments,tributaryCrossSegments,[&](float t) {
+        const float x=-2860.0f+t*(joinX+2860.0f);
+        constexpr float derivativeStep=1.0f;
+        const float dz=(tributaryCenterZ(x+derivativeStep)-
+                        tributaryCenterZ(x-derivativeStep))*.5f;
+        const float dy=(tributarySurfaceHeight(x+derivativeStep)-
+                        tributarySurfaceHeight(x-derivativeStep))*.5f;
+        const Vec3 tangent{1.0f,dy,dz};
+        const Vec3 lateral{dz,0.0f,-1.0f};
+        return std::array<Vec3,4>{{
+            {x,tributarySurfaceHeight(x),tributaryCenterZ(x)},tangent,lateral,
+            {tributaryHalfWidth(x)*.72f,t,0}
+        }};
+    });
 
     // Sample the exact emitted terrain triangle rather than bilinearly
     // filtering across its alternating diagonals.  Grass and the DXR terrain
@@ -603,90 +993,356 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
     }
 
     Rng detailRng(seed^0xc8013ea4u);
-    // Stones occur in loose families rather than a uniform scatter.
-    for(int group=0;group<9;++group) {
-        const float groupAngle=detailRng.range(0,2*pi),groupDistance=detailRng.range(4.0f,29.0f);
-        const Vec3 groupCenter{std::cos(groupAngle)*groupDistance,0,
-                               std::sin(groupAngle)*groupDistance};
-        const int members=4+static_cast<int>(detailRng.next()%6u);
+    // Rock families follow exposed geology.  Three modest foreground groups
+    // establish material scale; larger fractured groups then pick mineral or
+    // short-upland sites, especially along the authored western escarpment.
+    // The hero trunk and both water corridors remain physically clear.
+    constexpr int rockGroupTarget=10;
+    for(int group=0;group<rockGroupTarget;++group) {
+        Vec3 groupCenter{};bool foundCenter=false;
+        for(int attempt=0;attempt<420&&!foundCenter;++attempt) {
+            float x=0,z=0;
+            if(group<3) {
+                const float angle=detailRng.range(0,2*pi);
+                const float distance=detailRng.range(10.0f,47.0f);
+                x=std::cos(angle)*distance;z=std::sin(angle)*distance;
+            } else if(group<8) {
+                x=detailRng.range(-1510.0f,-1120.0f);
+                z=detailRng.range(-1080.0f,1180.0f);
+            } else {
+                x=detailRng.range(-1450.0f,1450.0f);
+                z=detailRng.range(-1250.0f,1350.0f);
+            }
+            const float radius=std::sqrt(x*x+z*z);
+            if(radius<6.0f)continue;
+            const PopulationSite site=populationSite(x,z);
+            const float mineral=site.biome.material[static_cast<size_t>(
+                GroundMaterialTile::ExposedRockSoil)];
+            const float upland=site.biome.material[static_cast<size_t>(
+                GroundMaterialTile::UplandShortTurf)];
+            const float suitability=group<3?.72f:clamp(.05f+mineral+upland*.34f,0.0f,1.0f);
+            if(!site.channelClear||site.normal.y<(group<3?.78f:.44f)||
+               detailRng.unit()>suitability)continue;
+            groupCenter={x,site.height,z};foundCenter=true;
+        }
+        if(!foundCenter)continue;
+
+        const int members=group<3?5+static_cast<int>(detailRng.next()%4u):
+                                    6+static_cast<int>(detailRng.next()%4u);
+        const float familySpread=group<3?detailRng.range(2.2f,5.2f):
+                                         detailRng.range(5.5f,13.0f);
         for(int member=0;member<members;++member) {
-            const float angle=detailRng.range(0,2*pi),spread=detailRng.range(.2f,3.6f);
-            const float x=groupCenter.x+std::cos(angle)*spread,z=groupCenter.z+std::sin(angle)*spread;
-            const float r=std::sqrt(x*x+z*z);const Vec3 normal=terrainNormal(x,z);
-            if(r<2.1f||r>32||normal.y<.80f)continue;
-            const uint32_t rockRoll=detailRng.next()%5u;
-            const int type=rockRoll==4u?2:static_cast<int>(rockRoll&1u);
-            const float scale=type==2?detailRng.range(.48f,.98f):detailRng.range(.14f,.55f);
-            Vec3 radii{scale*detailRng.range(.78f,1.35f),
-                       scale*(type==1?detailRng.range(.22f,.42f):detailRng.range(.52f,.92f)),
-                       scale*detailRng.range(.68f,1.24f)};
-            appendRock(mesh,{x,terrainHeight(x,z),z},radii,detailRng.range(0,2*pi),
+            const float angle=detailRng.range(0,2*pi);
+            const float spread=familySpread*std::sqrt(detailRng.unit());
+            const float x=groupCenter.x+std::cos(angle)*spread;
+            const float z=groupCenter.z+std::sin(angle)*spread;
+            const float radius=std::sqrt(x*x+z*z);const PopulationSite site=populationSite(x,z);
+            if(radius<6.0f||!site.channelClear||site.normal.y<(group<3?.74f:.40f))continue;
+            const uint32_t rockRoll=detailRng.next()%7u;
+            const int type=(group>=3&&rockRoll>=4u)?2:static_cast<int>(rockRoll&1u);
+            const float scale=group<3?
+                (type==2?detailRng.range(.48f,1.05f):detailRng.range(.15f,.58f)):
+                (type==2?detailRng.range(.85f,2.15f):detailRng.range(.38f,1.25f));
+            Vec3 radii{scale*detailRng.range(.78f,1.42f),
+                       scale*(type==1?detailRng.range(.20f,.43f):
+                                      detailRng.range(.47f,.88f)),
+                       scale*detailRng.range(.66f,1.28f)};
+            appendRock(mesh,{x,site.height,z},radii,detailRng.range(0,2*pi),
                        detailRng.next(),type);
             ++mesh.rockCount;
         }
     }
 
-    // Grazing keeps the hero-oak field open.  Shrubs are reserved for the
-    // distant broken hedgerow below, where their scale and silhouette belong.
-
-    // Sparse pasture trees establish scale without turning the clearing into
-    // a ring of lollipops.  Each distance band uses a cheaper biological LOD;
-    // physical size is never reduced merely because an object is farther away.
-    struct TreeBand { int target;float inner,outer,spacing;int detail; };
-    constexpr std::array<TreeBand,3> treeBands{{
-        {4,245.0f,335.0f,34.0f,2},
-        {6,430.0f,580.0f,46.0f,1},
-        {9,690.0f,880.0f,58.0f,0}
+    // The remaining dressing is assembled as unequal habitat groves instead
+    // of radial bands.  Type 0 repeats the hero oak's low, spreading scaffold
+    // with a much cheaper crown representation; its real-world dimensions do
+    // not shrink at distance.  Banks support damp broadleaf pockets, while an
+    // exposed western grove admits a small secondary-species component.
+    enum class GroveHabitat { Meadow,Riparian,Upland };
+    struct Grove { float x,z,rx,rz;int target;GroveHabitat habitat; };
+    const float southRiverZ=-820.0f,northRiverZ=790.0f,tributaryX=-930.0f;
+    const std::array<Grove,7> groves{{
+        {-510.0f,-520.0f,92.0f,68.0f,3,GroveHabitat::Meadow},
+        {735.0f,-430.0f,108.0f,72.0f,3,GroveHabitat::Meadow},
+        {riverCenterX(southRiverZ)-riverHalfWidth(southRiverZ)-82.0f,southRiverZ,
+             62.0f,96.0f,3,GroveHabitat::Riparian},
+        {riverCenterX(northRiverZ)+riverHalfWidth(northRiverZ)+88.0f,northRiverZ,
+             70.0f,105.0f,3,GroveHabitat::Riparian},
+        {tributaryX,tributaryCenterZ(tributaryX)-tributaryHalfWidth(tributaryX)-62.0f,
+             112.0f,55.0f,3,GroveHabitat::Riparian},
+        {-1260.0f,160.0f,105.0f,155.0f,3,GroveHabitat::Upland},
+        {1010.0f,1010.0f,135.0f,105.0f,3,GroveHabitat::Meadow}
     }};
-    std::vector<Vec3> acceptedTrees;
-    acceptedTrees.reserve(19);
-    for(const auto& band:treeBands) {
+    struct TreeCandidate { Vec3 base;GroveHabitat habitat;uint32_t seed; };
+    std::vector<TreeCandidate> treeCandidates;
+    treeCandidates.reserve(21);
+    auto treeCrowded=[&](float x,float z,float spacing) {
+        for(const auto& existing:treeCandidates) {
+            const float dx=x-existing.base.x,dz=z-existing.base.z;
+            if(dx*dx+dz*dz<spacing*spacing)return true;
+        }
+        return false;
+    };
+    for(const Grove& grove:groves) {
         int placed=0,attempts=0;
-        while(placed<band.target&&attempts++<900) {
-            const float angle=detailRng.range(0,2*pi),radius=detailRng.range(band.inner,band.outer);
-            const float grove=.43f+.31f*std::sin(angle*3.0f+radius*.034f)
-                                   +.23f*std::sin(angle*7.0f-radius*.021f);
-            if(detailRng.unit()>clamp(grove,.10f,.88f))continue;
-            const float x=std::cos(angle)*radius,z=std::sin(angle)*radius;
-            bool crowded=false;
-            for(const Vec3& existing:acceptedTrees) {
-                const float dx=x-existing.x,dz=z-existing.z;
-                if(dx*dx+dz*dz<band.spacing*band.spacing){crowded=true;break;}
-            }
-            if(crowded)continue;
-            const Vec3 normal=terrainNormal(x,z);const float heightAtBase=terrainHeight(x,z);
-            if(normal.y<(band.detail==2?.82f:(band.detail==1?.70f:.58f))||heightAtBase>14.0f)
-                continue;
-
-            const uint32_t objectSeed=detailRng.next();Rng objectRng(objectSeed^0x9e3779b9u);
-            const uint32_t typeRoll=detailRng.next()%100u;
-            const int type=typeRoll<58u?0:(typeRoll<90u?2:1);
-            const float treeHeight=band.detail==2?objectRng.range(7.0f,10.5f):
-                                   (band.detail==1?objectRng.range(6.2f,9.2f):
-                                                   objectRng.range(5.5f,8.2f));
-            const float crownRadius=treeHeight*(type==1?objectRng.range(.18f,.25f):
-                                                objectRng.range(.29f,.43f));
-            appendProxyTree(mesh,{x,heightAtBase,z},treeHeight,crownRadius,type,
-                            band.detail,objectRng);
-            acceptedTrees.push_back({x,heightAtBase,z});
-            ++placed;++mesh.backgroundTreeCount;
+        while(placed<grove.target&&attempts++<520) {
+            const float angle=detailRng.range(0,2*pi);
+            const float radial=std::sqrt(detailRng.unit());
+            const float x=grove.x+std::cos(angle)*grove.rx*radial;
+            const float z=grove.z+std::sin(angle)*grove.rz*radial;
+            const float heroRadius=std::sqrt(x*x+z*z);
+            if(heroRadius<90.0f||treeCrowded(x,z,29.0f))continue;
+            const PopulationSite site=populationSite(x,z);
+            if(!site.channelClear||site.normal.y<.61f||site.height>125.0f)continue;
+            const float mineral=site.biome.material[static_cast<size_t>(
+                GroundMaterialTile::ExposedRockSoil)];
+            const float upland=site.biome.material[static_cast<size_t>(
+                GroundMaterialTile::UplandShortTurf)];
+            if(grove.habitat==GroveHabitat::Riparian&&site.floodplainInfluence<.30f)continue;
+            if(grove.habitat==GroveHabitat::Upland&&upland+mineral<.10f)continue;
+            // Low-frequency canopy opportunities leave deliberate open gaps
+            // inside a grove instead of producing plantation-like spacing.
+            const float opportunity=.46f+.38f*mapFbm(x*.0041f+51.0f,z*.0041f-29.0f);
+            if(detailRng.unit()>opportunity)continue;
+            treeCandidates.push_back({{x,site.height,z},grove.habitat,detailRng.next()});
+            ++placed;
         }
     }
+    // A permissive deterministic fallback protects the proxy inventory if a
+    // future terrain seed turns one authored grove into a steep or wet site.
+    for(int attempts=0;treeCandidates.size()<21&&attempts<1600;++attempts) {
+        const float x=detailRng.range(-1420.0f,1420.0f);
+        const float z=detailRng.range(-1280.0f,1380.0f);
+        if(std::sqrt(x*x+z*z)<150.0f||treeCrowded(x,z,34.0f))continue;
+        const PopulationSite site=populationSite(x,z);
+        if(!site.channelClear||site.normal.y<.68f||site.height>92.0f)continue;
+        const GroveHabitat habitat=site.floodplainInfluence>.34f?
+            GroveHabitat::Riparian:GroveHabitat::Meadow;
+        treeCandidates.push_back({{x,site.height,z},habitat,detailRng.next()});
+    }
+    std::sort(treeCandidates.begin(),treeCandidates.end(),[](const auto& a,const auto& b) {
+        return a.base.x*a.base.x+a.base.z*a.base.z<b.base.x*b.base.x+b.base.z*b.base.z;
+    });
+    for(size_t index=0;index<treeCandidates.size();++index) {
+        const TreeCandidate& candidate=treeCandidates[index];
+        Rng objectRng(candidate.seed^0x9e3779b9u);
+        const uint32_t typeRoll=objectRng.next()%100u;
+        int type=0;
+        if(candidate.habitat==GroveHabitat::Upland)
+            type=typeRoll<67u?0:(typeRoll<88u?2:1);
+        else if(candidate.habitat==GroveHabitat::Riparian)
+            type=typeRoll<76u?0:2;
+        else type=typeRoll<84u?0:(typeRoll<97u?2:1);
+        const float treeHeight=type==0?objectRng.range(13.5f,20.0f):
+                               (type==1?objectRng.range(15.0f,22.0f):
+                                        objectRng.range(10.5f,16.5f));
+        const float crownRadius=treeHeight*(type==0?objectRng.range(.48f,.62f):
+                                  (type==1?objectRng.range(.20f,.28f):
+                                           objectRng.range(.38f,.52f)));
+        const int detail=index<4?2:(index<10?1:0);
+        appendProxyTree(mesh,candidate.base,treeHeight,crownRadius,type,detail,objectRng);
+        ++mesh.backgroundTreeCount;
+    }
 
-    // Multi-stem bushes bridge isolated trees into a few broken hedgerow
-    // fragments.  Large empty sectors are deliberate and match grazed pasture.
-    int backgroundBushes=0,bushAttempts=0;
-    while(backgroundBushes<14&&bushAttempts++<500) {
-        const float angle=detailRng.range(0,2*pi),radius=detailRng.range(315.0f,650.0f);
-        const float hedge=.50f+.34f*std::sin(angle*3.0f+radius*.045f)
-                              +.18f*std::sin(angle*8.0f-radius*.026f);
-        if(detailRng.unit()>clamp(hedge,.10f,.90f))continue;
-        const float x=std::cos(angle)*radius,z=std::sin(angle)*radius;
-        if(terrainNormal(x,z).y<(radius<300?.72f:.62f))continue;
-        const uint32_t objectSeed=detailRng.next();Rng objectRng(objectSeed^0x85ebca6bu);
-        appendProxyBush(mesh,{x,terrainHeight(x,z),z},objectRng.range(.48f,1.18f),
-                        objectRng.range(.55f,1.28f),objectRng);
-        ++backgroundBushes;++mesh.shrubCount;
+    // The landmark groves above intentionally stay sparse and readable near
+    // the oak.  A separate map-scale LOD establishes wooded river corridors
+    // and lower foothills.  Authored, unequal clusters follow landscape axes;
+    // they are not a radial ring around the camera and leave the central
+    // meadow open.  Cluster RNG and object RNG are independent from detailRng
+    // so changing this inventory cannot reshuffle rocks or shrubs.
+    struct DistantCluster {
+        float x,z,rx,rz,rotation;
+        int target;
+        GroveHabitat habitat;
+    };
+    const auto mainBankX=[&](float z,float side,float offset) {
+        return riverCenterX(z)+side*(riverHalfWidth(z)+offset);
+    };
+    const auto tributaryBankZ=[&](float x,float side,float offset) {
+        return tributaryCenterZ(x)+side*(tributaryHalfWidth(x)+offset);
+    };
+    const std::array<DistantCluster,22> distantClusters{{
+        {mainBankX(-2400,-1,132),-2400,118,205,-.12f,12,GroveHabitat::Riparian},
+        {mainBankX(-2000, 1,145),-2000,145,185, .18f,13,GroveHabitat::Riparian},
+        {mainBankX(-1460,-1,150),-1460,132,190,-.20f,12,GroveHabitat::Riparian},
+        {mainBankX(-1050, 1,155),-1050,148,178, .16f,12,GroveHabitat::Riparian},
+        {mainBankX( 1050,-1,145), 1050,138,190,-.14f,13,GroveHabitat::Riparian},
+        {mainBankX( 1450, 1,158), 1450,145,205, .12f,13,GroveHabitat::Riparian},
+        {mainBankX( 2000,-1,148), 2000,135,180,-.18f,12,GroveHabitat::Riparian},
+        {mainBankX( 2380, 1,138), 2380,128,165, .14f,11,GroveHabitat::Riparian},
+
+        {-2470,tributaryBankZ(-2470,-1,86),190,105,.08f,11,GroveHabitat::Riparian},
+        {-2110,tributaryBankZ(-2110, 1,92),185,112,-.06f,11,GroveHabitat::Riparian},
+        {-1730,tributaryBankZ(-1730,-1,88),180,102,.10f,12,GroveHabitat::Riparian},
+        {-1350,tributaryBankZ(-1350, 1,96),172,108,-.08f,11,GroveHabitat::Riparian},
+        { -930,tributaryBankZ( -930,-1,90),155,96,.12f,10,GroveHabitat::Riparian},
+
+        {-1900,1540,250,180, .24f,15,GroveHabitat::Upland},
+        {-1260,1840,270,170,-.12f,15,GroveHabitat::Upland},
+        { -500,1990,250,155, .18f,14,GroveHabitat::Upland},
+        {  300,1940,235,165,-.16f,13,GroveHabitat::Upland},
+        { 1080,1830,275,175, .22f,15,GroveHabitat::Upland},
+        { 1780,1550,250,170,-.20f,13,GroveHabitat::Upland},
+        { 2290,1150,215,155, .16f,10,GroveHabitat::Upland},
+        {-2020,-650,175,245,-.28f, 6,GroveHabitat::Upland},
+        {-2140, 120,185,225, .31f, 6,GroveHabitat::Upland}
+    }};
+    struct DistantTreeCandidate {
+        Vec3 base;
+        Vec3 normal;
+        GroveHabitat habitat;
+        uint32_t seed;
+    };
+    constexpr size_t distantTreeTarget=260;
+    std::vector<DistantTreeCandidate> distantTrees;
+    distantTrees.reserve(distantTreeTarget);
+    auto distantCrowded=[&](float x,float z,float spacing) {
+        for(const auto& existing:distantTrees) {
+            const float dx=x-existing.base.x,dz=z-existing.base.z;
+            if(dx*dx+dz*dz<spacing*spacing)return true;
+        }
+        for(const auto& existing:treeCandidates) {
+            const float dx=x-existing.base.x,dz=z-existing.base.z;
+            if(dx*dx+dz*dz<spacing*spacing*2.25f)return true;
+        }
+        return false;
+    };
+    const auto acceptDistantTree=[&](float x,float z,GroveHabitat habitat,
+                                     uint32_t objectSeed) {
+        const float radius=std::sqrt(x*x+z*z);
+        if(radius<620.0f||std::abs(x)>2990.0f||std::abs(z)>2990.0f||
+           distantCrowded(x,z,17.5f))return false;
+        const PopulationSite site=populationSite(x,z);
+        const TerrainSurfaceSample grade=sampleTerrainSurface(x,z);
+        if(!grade.insideBounds||!site.channelClear||grade.normal.y<.57f||site.height>175.0f)
+            return false;
+        const float upland=site.biome.material[static_cast<size_t>(
+            GroundMaterialTile::UplandShortTurf)];
+        const float mineral=site.biome.material[static_cast<size_t>(
+            GroundMaterialTile::ExposedRockSoil)];
+        if(habitat==GroveHabitat::Riparian) {
+            if(site.floodplainInfluence<.16f||site.riverBankDistance>285.0f)return false;
+        } else if(site.height<3.0f&&upland+mineral<.12f) return false;
+        distantTrees.push_back({{x,grade.position.y,z},grade.normal,habitat,objectSeed});
+        return true;
+    };
+    for(size_t clusterIndex=0;clusterIndex<distantClusters.size();++clusterIndex) {
+        const DistantCluster& cluster=distantClusters[clusterIndex];
+        Rng clusterRng(seed^0xd1b54a35u^
+                       static_cast<uint32_t>(clusterIndex*0x9e3779b9u));
+        int placed=0,attempts=0;
+        while(placed<cluster.target&&attempts++<1800) {
+            const float localX=clusterRng.range(-1.0f,1.0f);
+            const float localZ=clusterRng.range(-1.0f,1.0f);
+            const float q=localX*localX+localZ*localZ;
+            if(q>1.0f)continue;
+            const float c=std::cos(cluster.rotation),s=std::sin(cluster.rotation);
+            const float warpedX=localX*cluster.rx+
+                std::sin(localZ*4.2f+clusterIndex*.71f)*cluster.rx*.08f;
+            const float warpedZ=localZ*cluster.rz+
+                std::sin(localX*3.1f-clusterIndex*.53f)*cluster.rz*.07f;
+            const float x=cluster.x+warpedX*c-warpedZ*s;
+            const float z=cluster.z+warpedX*s+warpedZ*c;
+            // Coherent recruitment gaps split each woodland into copses and
+            // irregular windows instead of filling the ellipse uniformly.
+            const float opportunity=.33f+.67f*mapFbm(x*.0051f+clusterIndex*3.7f,
+                                                      z*.0051f-clusterIndex*2.1f);
+            if(clusterRng.unit()>opportunity)continue;
+            const uint32_t objectSeed=clusterRng.next();
+            if(acceptDistantTree(x,z,cluster.habitat,objectSeed))++placed;
+        }
+    }
+    // Terrain edits should not silently erase the forest contract.  Fill any
+    // rejected cluster slots from the same riparian/foothill habitats, never
+    // from the protected central meadow.
+    Rng distantFallback(seed^0xa24baed5u);
+    for(int attempts=0;distantTrees.size()<distantTreeTarget&&attempts<24000;++attempts) {
+        const bool riparian=(attempts&1)==0;
+        float x,z;
+        GroveHabitat habitat;
+        if(riparian) {
+            z=distantFallback.range(-2720.0f,2720.0f);
+            const float side=(distantFallback.next()&1u)?1.0f:-1.0f;
+            x=mainBankX(z,side,distantFallback.range(70.0f,245.0f));
+            habitat=GroveHabitat::Riparian;
+        } else {
+            x=distantFallback.range(-2450.0f,2450.0f);
+            z=distantFallback.range(1380.0f,2150.0f);
+            habitat=GroveHabitat::Upland;
+        }
+        acceptDistantTree(x,z,habitat,distantFallback.next());
+    }
+    std::sort(distantTrees.begin(),distantTrees.end(),[](const auto& a,const auto& b) {
+        if(a.base.z!=b.base.z)return a.base.z<b.base.z;
+        return a.base.x<b.base.x;
+    });
+    const size_t distantTriangleStart=mesh.detailIndices.size()/3;
+    mesh.distantTreeBases.reserve(distantTrees.size());
+    for(const DistantTreeCandidate& candidate:distantTrees) {
+        Rng objectRng(candidate.seed^0x94d049bbu);
+        const uint32_t typeRoll=objectRng.next()%100u;
+        const int type=candidate.habitat==GroveHabitat::Riparian?
+            (typeRoll<74u?0:(typeRoll<91u?1:2)):(typeRoll<87u?0:2);
+        const float treeHeight=type==0?objectRng.range(12.0f,19.5f):
+                               (type==1?objectRng.range(11.5f,18.5f):
+                                        objectRng.range(8.5f,14.5f));
+        const float crownRadius=treeHeight*(type==0?objectRng.range(.49f,.68f):
+                                  (type==1?objectRng.range(.31f,.45f):
+                                           objectRng.range(.43f,.60f)));
+        appendFarTree(mesh,candidate.base,candidate.normal,treeHeight,crownRadius,type,
+                      objectRng);
+        mesh.distantTreeBases.push_back(candidate.base);
+    }
+    mesh.distantTreeCount=static_cast<uint32_t>(distantTrees.size());
+    mesh.distantTreeTriangleCount=static_cast<uint32_t>(mesh.detailIndices.size()/3-
+                                                        distantTriangleStart);
+
+    // Riparian shrubs grow in broken colonies just beyond the bank, not as a
+    // global scatter.  Overlapping foliage along each multi-stem axis makes a
+    // distant hedge read as a porous plant rather than a row of green spheres.
+    struct ShrubColony { float x,z,rx,rz;int target; };
+    const float shrubSouthZ=-470.0f,shrubNorthZ=420.0f,tributaryShrubX=-1180.0f;
+    const std::array<ShrubColony,5> shrubColonies{{
+        {riverCenterX(shrubSouthZ)-riverHalfWidth(shrubSouthZ)-54.0f,shrubSouthZ,
+             46.0f,80.0f,4},
+        {riverCenterX(shrubNorthZ)+riverHalfWidth(shrubNorthZ)+58.0f,shrubNorthZ,
+             48.0f,74.0f,4},
+        {tributaryShrubX,tributaryCenterZ(tributaryShrubX)+
+             tributaryHalfWidth(tributaryShrubX)+43.0f,78.0f,40.0f,4},
+        {riverCenterX(1080.0f)-riverHalfWidth(1080.0f)-68.0f,1080.0f,
+             58.0f,90.0f,3},
+        {-660.0f,tributaryCenterZ(-660.0f)-tributaryHalfWidth(-660.0f)-48.0f,
+             67.0f,40.0f,3}
+    }};
+    std::vector<Vec3> acceptedShrubs;acceptedShrubs.reserve(18);
+    for(const ShrubColony& colony:shrubColonies) {
+        int placed=0,attempts=0;
+        while(placed<colony.target&&attempts++<460) {
+            const float angle=detailRng.range(0,2*pi),radial=std::sqrt(detailRng.unit());
+            const float x=colony.x+std::cos(angle)*colony.rx*radial;
+            const float z=colony.z+std::sin(angle)*colony.rz*radial;
+            if(std::sqrt(x*x+z*z)<90.0f)continue;
+            const PopulationSite site=populationSite(x,z);
+            if(!site.channelClear||site.normal.y<.70f||site.floodplainInfluence<.28f)continue;
+            bool crowded=false;
+            for(const Vec3& existing:acceptedShrubs) {
+                const float dx=x-existing.x,dz=z-existing.z;
+                if(dx*dx+dz*dz<12.0f){crowded=true;break;}
+            }
+            if(crowded)continue;
+            for(const auto& tree:treeCandidates) {
+                const float dx=x-tree.base.x,dz=z-tree.base.z;
+                if(dx*dx+dz*dz<30.0f){crowded=true;break;}
+            }
+            if(crowded)continue;
+            const uint32_t objectSeed=detailRng.next();Rng objectRng(objectSeed^0x85ebca6bu);
+            const int variant=site.riverBankDistance<32.0f?1:
+                              (objectRng.next()%5u==0u?2:0);
+            appendProxyBush(mesh,{x,site.height,z},objectRng.range(.75f,1.65f),
+                            objectRng.range(.72f,1.58f),variant,objectRng);
+            acceptedShrubs.push_back({x,site.height,z});
+            ++placed;++mesh.shrubCount;
+        }
     }
     return mesh;
 }

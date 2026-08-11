@@ -22,8 +22,10 @@ struct FirstPersonCameraSettings {
     float accelerationResponse{12.0f};
     float brakingResponse{18.0f};
     float heightHalfLife{.075f};
-    // Leaves the default 52 m vegetation range inside the 224 m grass field.
-    float horizontalHalfExtent{170.0f};
+    // The camera may traverse the complete authored map. The controller still
+    // subtracts its capsule radius so every support sample remains inside the
+    // terrain's explicit two-metre edge margin.
+    float horizontalHalfExtent{EnvironmentGenerator::traversalHalfExtent};
 };
 
 struct FirstPersonCameraInput {

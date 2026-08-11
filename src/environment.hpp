@@ -45,6 +45,11 @@ constexpr float grassPatchWaterRetention(uint32_t packedSeed) {
 struct EnvironmentMesh {
     std::vector<MeshVertex> terrainVertices;
     std::vector<uint32_t> terrainIndices;
+    // Persistent sloping water surfaces for the authored main river and its
+    // western tributary.  Indices are local to riverVertices and material 6
+    // is reserved for the renderer's reflective river-water path.
+    std::vector<MeshVertex> riverVertices;
+    std::vector<uint32_t> riverIndices;
     // Static scene dressing shares the triangle BLAS with the oak and terrain.
     // Materials 3, 4 and 5 route rocks, foliage and secondary wood in HLSL.
     std::vector<MeshVertex> detailVertices;
@@ -54,6 +59,13 @@ struct EnvironmentMesh {
     uint32_t rockCount{};
     uint32_t shrubCount{};
     uint32_t backgroundTreeCount{};
+    // The 21 background trees above are medium-detail grove landmarks.  This
+    // second inventory is a deliberately cheaper, map-scale woodland LOD used
+    // beyond the open hero meadow.  Keeping its bases and triangle count makes
+    // deterministic habitat and performance contracts directly testable.
+    std::vector<Vec3> distantTreeBases;
+    uint32_t distantTreeCount{};
+    uint32_t distantTreeTriangleCount{};
     float minimumHeight{};
     float maximumHeight{};
 };
@@ -70,8 +82,16 @@ struct TerrainSurfaceSample {
 
 class EnvironmentGenerator {
 public:
-    static constexpr int terrainResolution = 257;
-    static constexpr float terrainHalfExtent = 1600.0f;
+    // The squared-ish coordinate distribution keeps hero-tree sampling as
+    // dense as the former test field while carrying a complete 6.4 km map.
+    // 321^2 vertices / 204,800 triangles remains a modest static BLAS.
+    static constexpr int terrainResolution = 321;
+    static constexpr float terrainHalfExtent = 3200.0f;
+    // Keep the first-person capsule away from the finite heightfield edge so
+    // all of its support samples remain on authored terrain.
+    static constexpr float traversalEdgeMargin = 2.0f;
+    static constexpr float traversalHalfExtent =
+        terrainHalfExtent - traversalEdgeMargin;
     // Covers the complete 30 m camera orbit plus the 192 m debug range.
     // Visible blades are instanced by the raster overlay, so this broader
     // field no longer bloats the ray-tracing acceleration structure.
@@ -80,6 +100,17 @@ public:
     static float terrainHeight(float x, float z);
     static Vec3 terrainNormal(float x, float z);
     static TerrainSurfaceSample sampleTerrainSurface(float x, float z);
+
+    // Deterministic map contract shared by terrain tests and the renderer's
+    // persistent river pass.  The main river flows toward increasing Z.
+    static float riverCenterX(float z);
+    static float riverHalfWidth(float z);
+    static float riverBedHeight(float z);
+    static float riverSurfaceHeight(float z);
+    static float tributaryCenterZ(float x);
+    static float tributaryHalfWidth(float x);
+    static float tributaryBedHeight(float x);
+    static float tributarySurfaceHeight(float x);
     EnvironmentMesh build(uint32_t seed = 0x6f616b31u) const;
 };
 

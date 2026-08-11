@@ -111,6 +111,26 @@ int main() {
                 near(bounded.state().footPosition.z,0),
             "capsule centre escaped its configured horizontal bounds");
 
+    // Product defaults must follow the full authored world rather than the
+    // former 170 m grass test field, while preserving an explicit terrain-edge
+    // margin for the capsule's support samples.
+    dense::FirstPersonCameraController mapTraversal;
+    require(near(mapTraversal.settings().horizontalHalfExtent,
+                 dense::EnvironmentGenerator::traversalHalfExtent),
+            "first-person default is not wired to the authored map extent");
+    mapTraversal.reset(220.0f,0,0,0);
+    require(near(mapTraversal.state().footPosition.x,220.0f),
+            "first-person traversal is still clamped to the former 170 m field");
+    mapTraversal.reset(dense::EnvironmentGenerator::terrainHalfExtent,0,0,0);
+    const float maximumCentre=dense::EnvironmentGenerator::traversalHalfExtent-
+                              mapTraversal.settings().capsuleRadius;
+    require(mapTraversal.state().footPosition.x<=maximumCentre+1.0e-4f&&
+                mapTraversal.state().footPosition.x>=maximumCentre-1.0e-3f&&
+                mapTraversal.state().footPosition.x<=
+                    dense::EnvironmentGenerator::terrainHalfExtent-
+                    dense::EnvironmentGenerator::traversalEdgeMargin,
+            "first-person traversal did not preserve the terrain-edge margin");
+
     const dense::TerrainSurfaceSampler steepStrip=[](float x,float z) {
         const bool steep=x>.55f;
         const dense::Vec3 normal=steep?dense::normalize(dense::Vec3{-2,1,0}):

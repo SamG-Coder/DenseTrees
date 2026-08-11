@@ -269,9 +269,11 @@ struct DxrRenderer::Impl{
         treeVertices.insert(treeVertices.end(),tree.leafVertices.begin(),tree.leafVertices.end());
         std::vector<MeshVertex>vertices=treeVertices;std::vector<uint32_t>indices;
         vertices.reserve(tree.branchVertices.size()+tree.leafVertices.size()+
-                         environment.terrainVertices.size()+environment.detailVertices.size());
+                         environment.terrainVertices.size()+environment.riverVertices.size()+
+                         environment.detailVertices.size());
         indices.reserve(tree.branchIndices.size()+tree.leafIndices.size()+
-                        environment.terrainIndices.size()+environment.detailIndices.size());
+                        environment.terrainIndices.size()+environment.riverIndices.size()+
+                        environment.detailIndices.size());
         indices=tree.branchIndices;
         const uint32_t leafBase=static_cast<uint32_t>(tree.branchVertices.size());
         for(uint32_t index:tree.leafIndices)indices.push_back(leafBase+index);
@@ -282,6 +284,10 @@ struct DxrRenderer::Impl{
         vertices.insert(vertices.end(),environment.terrainVertices.begin(),
                         environment.terrainVertices.end());
         for(uint32_t index:environment.terrainIndices)indices.push_back(terrainBase+index);
+        const uint32_t riverBase=static_cast<uint32_t>(vertices.size());
+        vertices.insert(vertices.end(),environment.riverVertices.begin(),
+                        environment.riverVertices.end());
+        for(uint32_t index:environment.riverIndices)indices.push_back(riverBase+index);
         const uint32_t detailBase=static_cast<uint32_t>(vertices.size());
         vertices.insert(vertices.end(),environment.detailVertices.begin(),
                         environment.detailVertices.end());

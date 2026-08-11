@@ -137,58 +137,76 @@ MaterialSample denseTurf(float u,float v,uint32_t seed) {
 }
 
 MaterialSample coarseMeadow(float u,float v,uint32_t seed) {
-    const float macro=periodicFbm(u,v,3,5,seed^0xe8a72b6du);
+    const float macro=periodicFbm(u,v,2,6,seed^0xe8a72b6du);
     const float dryPatch=periodicFbm(u,v,7,4,seed^0x94c3d8f1u);
-    const CellularSample tuft=periodicCellular(u,v,19,seed^0x30b4a6c9u);
-    const float tuftMask=(1-smoothStep(.16f,.54f,tuft.nearest))*(.62f+.38f*tuft.identity);
+    const float grit=periodicFbm(u,v,47,3,seed^0x09d31efbu);
+    const CellularSample tuft=periodicCellular(u,v,23,seed^0x30b4a6c9u);
+    const CellularSample stone=periodicCellular(u,v,71,seed^0xc075b31du);
+    const float tuftMask=(1-smoothStep(.15f,.49f,tuft.nearest))*(.60f+.40f*tuft.identity);
     const float warp=(periodicValueNoise(u,v,11,seed^0x4f1bbcddu)-.5f)*.20f;
-    const float stemA=periodicStripe(u,v,59,17,warp,.010f,.024f);
-    const float stemB=periodicStripe(u,v,-31,83,warp*.63f+.31f,.008f,.021f);
-    const float stems=saturate((stemA*.66f+stemB*.48f)*(.42f+.78f*tuftMask));
-    const float dryness=smoothStep(.42f,.78f,dryPatch+.16f*(1-macro));
-    const float greenR=mix(.044f,.082f,macro),greenG=mix(.100f,.182f,macro),greenB=mix(.014f,.038f,macro);
-    const float dryR=mix(.135f,.240f,dryPatch),dryG=mix(.115f,.205f,dryPatch),dryB=mix(.035f,.073f,dryPatch);
+    const float stemA=periodicStripe(u,v,73,19,warp,.009f,.022f);
+    const float stemB=periodicStripe(u,v,-37,101,warp*.63f+.31f,.007f,.019f);
+    const float stems=saturate((stemA*.62f+stemB*.44f)*(.34f+.82f*tuftMask));
+    const float exposedGrit=(1-smoothStep(.10f,.25f,stone.nearest))*
+                            smoothStep(.70f,.94f,stone.identity)*smoothStep(.50f,.76f,dryPatch);
+    const float dryness=smoothStep(.47f,.80f,dryPatch+.13f*(1-macro));
+    const float greenR=mix(.038f,.074f,macro),greenG=mix(.085f,.157f,macro),greenB=mix(.012f,.032f,macro);
+    const float dryR=mix(.112f,.202f,dryPatch),dryG=mix(.096f,.170f,dryPatch),dryB=mix(.030f,.060f,dryPatch);
     MaterialSample sample;
-    sample.red=mix(greenR,dryR,dryness)+.018f*stems;
-    sample.green=mix(greenG,dryG,dryness)+.020f*stems;
-    sample.blue=mix(greenB,dryB,dryness)+.006f*stems;
-    sample.roughness=saturate(.91f+.045f*dryness-.075f*stems-.025f*tuftMask);
-    sample.height=saturate(.40f+.17f*(macro-.5f)+.16f*tuftMask+.21f*stems);
-    sample.cavity=saturate(.14f+.33f*(1-tuftMask)+.22f*(1-stems)*smoothStep(.40f,.76f,dryPatch));
+    sample.red=mix(greenR,dryR,dryness)+.016f*stems+.045f*exposedGrit;
+    sample.green=mix(greenG,dryG,dryness)+.019f*stems+.041f*exposedGrit;
+    sample.blue=mix(greenB,dryB,dryness)+.005f*stems+.034f*exposedGrit;
+    sample.roughness=saturate(.93f+.025f*dryness-.070f*stems-.090f*exposedGrit);
+    sample.height=saturate(.41f+.13f*(macro-.5f)+.10f*(grit-.5f)+
+                           .15f*tuftMask+.18f*stems+.16f*exposedGrit);
+    sample.cavity=saturate(.12f+.26f*(1-tuftMask)+.18f*(1-stems)*
+                           smoothStep(.42f,.78f,dryPatch));
     return sample;
 }
 
 MaterialSample wornSoil(float u,float v,uint32_t seed) {
-    const float macro=periodicFbm(u,v,5,5,seed^0x7c2dd1a9u);
-    const float granules=periodicFbm(u,v,43,4,seed^0xc1f57a3bu);
-    const float moisture=periodicFbm(u,v,3,4,seed^0x21d469efu);
-    const CellularSample primary=periodicCellular(u,v,12,seed^0x991b35c7u);
-    const CellularSample secondary=periodicCellular(u,v,31,seed^0x446af283u);
-    const float crackA=1-smoothStep(.018f,.075f,primary.edge);
-    const float crackB=(1-smoothStep(.012f,.048f,secondary.edge))*(1-.58f*crackA);
-    const float cracks=saturate(crackA+.46f*crackB);
-    float pebble=smoothStep(.84f,.955f,periodicValueNoise(u,v,83,seed^0x14e8b6ddu));
-    pebble*=smoothStep(.16f,.48f,secondary.nearest);
-    const float damp=smoothStep(.38f,.72f,moisture);
-    const float dryR=mix(.135f,.235f,macro),dryG=mix(.077f,.142f,macro),dryB=mix(.034f,.073f,macro);
-    const float wetR=mix(.060f,.110f,macro),wetG=mix(.036f,.071f,macro),wetB=mix(.018f,.038f,macro);
+    const float macro=periodicFbm(u,v,3,6,seed^0x7c2dd1a9u);
+    const float granules=periodicFbm(u,v,61,4,seed^0xc1f57a3bu);
+    const float moisture=periodicFbm(u,v,2,5,seed^0x21d469efu);
+    const CellularSample slabs=periodicCellular(u,v,8,seed^0x991b35c7u);
+    const CellularSample fragments=periodicCellular(u,v,29,seed^0x446af283u);
+    const CellularSample grit=periodicCellular(u,v,89,seed^0x14e8b6ddu);
+    // Broad mineral plates, with a second discontinuous fracture network.
+    // Their scale is tens of centimetres; high-frequency granules stay a few
+    // millimetres and therefore vanish naturally through the mip chain.
+    const float fissureA=1-smoothStep(.018f,.082f,slabs.edge);
+    const float fissureB=(1-smoothStep(.010f,.044f,fragments.edge))*(1-.66f*fissureA);
+    const float fissures=saturate(fissureA+.48f*fissureB);
+    const float slabCrown=(1-smoothStep(.18f,.52f,slabs.nearest))*
+                          (.68f+.32f*slabs.identity);
+    const float fragment=(1-smoothStep(.09f,.24f,fragments.nearest))*
+                         smoothStep(.54f,.90f,fragments.identity);
+    const float paleGrit=(1-smoothStep(.08f,.19f,grit.nearest))*
+                         smoothStep(.73f,.94f,grit.identity);
+    const float damp=smoothStep(.38f,.74f,moisture);
+    const float dryR=mix(.125f,.220f,macro),dryG=mix(.082f,.145f,macro),dryB=mix(.046f,.085f,macro);
+    const float wetR=mix(.050f,.096f,macro),wetG=mix(.038f,.069f,macro),wetB=mix(.025f,.045f,macro);
     MaterialSample sample;
-    sample.red=mix(dryR,wetR,damp)+.075f*pebble;
-    sample.green=mix(dryG,wetG,damp)+.068f*pebble;
-    sample.blue=mix(dryB,wetB,damp)+.058f*pebble;
-    sample.red=mix(sample.red,.025f,cracks*.72f);
-    sample.green=mix(sample.green,.016f,cracks*.72f);
-    sample.blue=mix(sample.blue,.009f,cracks*.72f);
-    sample.roughness=saturate(.90f+.055f*(1-damp)-.11f*pebble-.035f*granules);
-    sample.height=saturate(.50f+.22f*(macro-.5f)+.11f*(granules-.5f)-.23f*cracks+.12f*pebble);
-    sample.cavity=saturate(.10f+.72f*cracks+.14f*(1-granules));
+    sample.red=mix(dryR,wetR,damp)+.036f*slabCrown+.050f*fragment+.080f*paleGrit;
+    sample.green=mix(dryG,wetG,damp)+.033f*slabCrown+.046f*fragment+.074f*paleGrit;
+    sample.blue=mix(dryB,wetB,damp)+.029f*slabCrown+.041f*fragment+.066f*paleGrit;
+    sample.red=mix(sample.red,.020f,fissures*.78f);
+    sample.green=mix(sample.green,.015f,fissures*.78f);
+    sample.blue=mix(sample.blue,.011f,fissures*.78f);
+    sample.roughness=saturate(.91f+.045f*(1-damp)-.12f*slabCrown-
+                              .10f*fragment-.16f*paleGrit-.025f*granules);
+    sample.height=saturate(.47f+.18f*(macro-.5f)+.09f*(granules-.5f)+
+                           .21f*slabCrown+.15f*fragment+.12f*paleGrit-.30f*fissures);
+    sample.cavity=saturate(.08f+.78f*fissures+.12f*(1-granules));
     return sample;
 }
 
 MaterialSample cloverMoss(float u,float v,uint32_t seed) {
-    const float moss=periodicFbm(u,v,8,5,seed^0xa7ef1531u);
+    const float silt=periodicFbm(u,v,2,6,seed^0x771f2ae9u);
+    const float moss=periodicFbm(u,v,7,5,seed^0xa7ef1531u);
     const float velvet=periodicFbm(u,v,52,4,seed^0x2b91c4d7u);
     const CellularSample plant=periodicCellular(u,v,23,seed^0x5a7e0b93u);
+    const CellularSample gravel=periodicCellular(u,v,67,seed^0xc36947a5u);
     static constexpr std::array<float,8> directionsX{1.0f,.70710678f,0,-.70710678f,-1.0f,-.70710678f,0,.70710678f};
     static constexpr std::array<float,8> directionsY{0,.70710678f,1.0f,.70710678f,0,-.70710678f,-1.0f,-.70710678f};
     const int orientation=std::min(7,static_cast<int>(plant.identity*8.0f));
@@ -202,23 +220,33 @@ MaterialSample cloverMoss(float u,float v,uint32_t seed) {
     }
     clover*=smoothStep(.23f,.48f,plant.identity);
     const float leafVein=clover*periodicStripe(u,v,46,-23,plant.identity,.010f,.026f);
-    const float mossLight=smoothStep(.30f,.78f,moss);
+    const float mossLight=smoothStep(.34f,.78f,moss+.10f*(silt-.5f));
+    const float wetSilt=smoothStep(.52f,.82f,silt)*(1-mossLight*.62f);
+    const float riverGrit=(1-smoothStep(.09f,.22f,gravel.nearest))*
+                          smoothStep(.68f,.93f,gravel.identity)*(1-clover);
     MaterialSample sample;
-    sample.red=mix(.022f,.060f,mossLight)+.020f*clover+.012f*leafVein;
-    sample.green=mix(.073f,.164f,mossLight)+.046f*clover+.014f*leafVein;
-    sample.blue=mix(.011f,.040f,velvet)+.008f*clover;
-    sample.roughness=saturate(.93f-.065f*mossLight-.105f*clover+.018f*(1-velvet));
-    sample.height=saturate(.45f+.14f*(moss-.5f)+.08f*(velvet-.5f)+.23f*clover+.055f*leafVein);
-    sample.cavity=saturate(.10f+.27f*(1-velvet)+.26f*(1-clover)*smoothStep(.42f,.72f,moss));
+    sample.red=mix(.018f,.052f,mossLight)+.018f*clover+.010f*leafVein+
+               .050f*riverGrit-.010f*wetSilt;
+    sample.green=mix(.048f,.142f,mossLight)+.040f*clover+.012f*leafVein+
+                 .047f*riverGrit-.012f*wetSilt;
+    sample.blue=mix(.012f,.036f,velvet)+.007f*clover+.043f*riverGrit+
+                .004f*wetSilt;
+    sample.roughness=saturate(.89f-.075f*mossLight-.095f*clover-
+                              .16f*wetSilt-.11f*riverGrit+.018f*(1-velvet));
+    sample.height=saturate(.43f+.13f*(silt-.5f)+.13f*(moss-.5f)+
+                           .07f*(velvet-.5f)+.22f*clover+.050f*leafVein+
+                           .14f*riverGrit-.07f*wetSilt);
+    sample.cavity=saturate(.12f+.24f*(1-velvet)+.22f*(1-clover)*
+                           smoothStep(.42f,.72f,moss)+.12f*wetSilt);
     return sample;
 }
 
 MaterialSample evaluateMaterial(GroundMaterialTile material,float u,float v,uint32_t seed) {
     switch(material) {
-    case GroundMaterialTile::DenseShortTurf:return denseTurf(u,v,seed);
-    case GroundMaterialTile::CoarseMeadow:return coarseMeadow(u,v,seed);
-    case GroundMaterialTile::WornSoil:return wornSoil(u,v,seed);
-    case GroundMaterialTile::CloverMoss:return cloverMoss(u,v,seed);
+    case GroundMaterialTile::MeadowTurf:return denseTurf(u,v,seed);
+    case GroundMaterialTile::UplandShortTurf:return coarseMeadow(u,v,seed);
+    case GroundMaterialTile::ExposedRockSoil:return wornSoil(u,v,seed);
+    case GroundMaterialTile::RiparianMoss:return cloverMoss(u,v,seed);
     }
     return {};
 }
@@ -340,6 +368,46 @@ GroundTextureAtlas makeGroundTextureAtlas(uint32_t seed) {
         atlas.normalHeightCavity.push_back(downsampleNormalIsolated(atlas.normalHeightCavity.back()));
     }
     return atlas;
+}
+
+GroundBiomeWeights groundBiomeWeights(const GroundBiomeInput& input) {
+    const float elevation=std::max(input.elevationMetres,0.0f);
+    const float slope=std::max(input.slopeGradient,0.0f);
+    const float riverDistance=std::max(input.riverDistanceMetres,0.0f);
+    const float moisture=saturate(input.moisture);
+    const float exposure=saturate(input.exposure);
+
+    // A river influences more than its visible water ribbon: damp alluvium and
+    // moss extend onto the low bank, then recede smoothly with slope.  Steep
+    // cut banks remain mineral rather than being painted uniformly green.
+    const float riverInfluence=1-smoothStep(4.0f,22.0f,riverDistance);
+    float riparian=riverInfluence*smoothStep(.38f,.76f,moisture)*
+                    (1-smoothStep(.34f,.72f,slope));
+
+    const float highland=smoothStep(20.0f,78.0f,elevation);
+    const float cliff=smoothStep(.34f,.82f,slope);
+    float mineral=saturate(cliff*mix(.58f,1.0f,exposure)+
+                           highland*smoothStep(.46f,.82f,exposure)*.58f);
+    mineral*=1-riparian*.62f;
+
+    float upland=saturate(highland*(1-cliff*.78f)*(.66f+.34f*(1-moisture))+
+                          smoothStep(.14f,.38f,slope)*(1-cliff)*.30f);
+    upland*=1-riparian*.84f;
+    upland*=1-mineral*.78f;
+
+    float meadow=(.72f+.28f*moisture)*(1-riparian*.88f)*(1-mineral*.92f)*
+                 (1-upland*.72f);
+    // Preserve a little turf in transition zones; it breaks up mathematically
+    // perfect rings when broad erosion noise is supplied by the world map.
+    meadow*=mix(.88f,1.08f,1-exposure);
+
+    GroundBiomeWeights result{{std::max(meadow,.001f),std::max(upland,0.0f),
+                                std::max(mineral,0.0f),std::max(riparian,0.0f)}};
+    float total=0;
+    for(float weight:result.material)total+=weight;
+    const float inverse=1/std::max(total,1.0e-6f);
+    for(float& weight:result.material)weight*=inverse;
+    return result;
 }
 
 } // namespace dense

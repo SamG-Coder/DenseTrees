@@ -36,12 +36,15 @@ add_executable(environment_simulation_tests tests/environment_simulation_tests.c
 target_link_libraries(environment_simulation_tests PRIVATE densetrees_core)
 add_executable(first_person_camera_tests tests/first_person_camera_tests.cpp)
 target_link_libraries(first_person_camera_tests PRIVATE densetrees_core)
+add_executable(ground_texture_tests tests/ground_texture_tests.cpp)
+target_link_libraries(ground_texture_tests PRIVATE densetrees_core)
 enable_testing()
 add_test(NAME procedural_tree_tests COMMAND densetrees_tests)
 add_test(NAME environment_simulation_tests COMMAND environment_simulation_tests)
 add_test(NAME first_person_camera_tests COMMAND first_person_camera_tests)
+add_test(NAME ground_texture_tests COMMAND ground_texture_tests)
 
 set_target_properties(DenseTrees densetrees_tests environment_simulation_tests
-    first_person_camera_tests PROPERTIES
+    first_person_camera_tests ground_texture_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )

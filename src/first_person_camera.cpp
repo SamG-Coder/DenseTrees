@@ -34,7 +34,8 @@ FirstPersonCameraSettings sanitize(FirstPersonCameraSettings value) {
     value.accelerationResponse=positiveFinite(value.accelerationResponse,12.0f,0.0f);
     value.brakingResponse=positiveFinite(value.brakingResponse,18.0f,0.0f);
     value.heightHalfLife=positiveFinite(value.heightHalfLife,.075f,.0001f);
-    value.horizontalHalfExtent=positiveFinite(value.horizontalHalfExtent,170.0f,
+    value.horizontalHalfExtent=positiveFinite(
+        value.horizontalHalfExtent,EnvironmentGenerator::traversalHalfExtent,
                                                value.capsuleRadius+.01f);
     return value;
 }

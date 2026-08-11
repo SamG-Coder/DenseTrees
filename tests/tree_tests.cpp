@@ -115,22 +115,62 @@ int main() {
     require(environment.detailVertices.size()==environmentCopy.detailVertices.size()&&
                 environment.detailIndices.size()==environmentCopy.detailIndices.size(),
             "same environment seed did not reproduce its scene-dressing inventory");
+    require(environment.distantTreeCount==environmentCopy.distantTreeCount&&
+                environment.distantTreeTriangleCount==environmentCopy.distantTreeTriangleCount&&
+                environment.distantTreeBases.size()==environmentCopy.distantTreeBases.size(),
+            "same environment seed did not reproduce its distant woodland inventory");
+    require(environment.riverVertices.size()==environmentCopy.riverVertices.size()&&
+                environment.riverIndices==environmentCopy.riverIndices,
+            "same environment seed did not reproduce its river inventory");
     require(std::abs(dense::EnvironmentGenerator::terrainHeight(0,0))<1.0e-6f,
             "oak root grade is no longer exactly y=0");
     for(float z=-1.5f;z<=1.5f;z+=.5f)for(float x=-1.5f;x<=1.5f;x+=.5f)
         if(std::sqrt(x*x+z*z)<=1.5f)
             require(std::abs(dense::EnvironmentGenerator::terrainHeight(x,z))<1.0e-5f,
                     "terrain intruded into the oak root-clearance zone");
-    require(environment.minimumHeight<-2.6f&&environment.minimumHeight>-4.4f&&
-                environment.maximumHeight>55.0f&&environment.maximumHeight<155.0f,
-            "hill-and-mountain terrain height envelope is implausible");
+    require(environment.minimumHeight<-11.0f&&environment.minimumHeight>-25.0f&&
+                environment.maximumHeight>170.0f&&environment.maximumHeight<390.0f,
+            "valley-and-mountain terrain height envelope is implausible");
     for(const auto& vertex:environment.terrainVertices){
         require(finite(vertex.position)&&finite(vertex.normal),
                 "terrain emitted non-finite geometry");
-        require(std::abs(dense::length(vertex.normal)-1.0f)<.002f&&vertex.normal.y>.43f,
+        require(std::abs(dense::length(vertex.normal)-1.0f)<.002f&&vertex.normal.y>.12f&&
+                    std::abs(vertex.position.x)<=dense::EnvironmentGenerator::terrainHalfExtent&&
+                    std::abs(vertex.position.z)<=dense::EnvironmentGenerator::terrainHalfExtent,
                 "terrain normal is not unit length or points below the landscape");
         require(vertex.material==2.0f,"terrain material routing changed");
     }
+
+    // The authored river is a strict downhill path rather than disconnected
+    // puddle decals.  Its tributary meets the main surface without a step.
+    float previousRiverBed=std::numeric_limits<float>::max();
+    for(float z=-2700.0f;z<=2700.0f;z+=45.0f){
+        const float center=dense::EnvironmentGenerator::riverCenterX(z);
+        const float bed=dense::EnvironmentGenerator::terrainHeight(center,z);
+        require(std::isfinite(center)&&std::isfinite(bed)&&
+                    bed<previousRiverBed-.04f,
+                "main river bed is not continuously downhill");
+        require(std::abs(bed-dense::EnvironmentGenerator::riverBedHeight(z))<2.0e-4f&&
+                    dense::EnvironmentGenerator::riverSurfaceHeight(z)>bed+.65f,
+                "main river carve and persistent surface contract diverged");
+        previousRiverBed=bed;
+    }
+    const float confluenceZ=520.0f;
+    const float confluenceX=dense::EnvironmentGenerator::riverCenterX(confluenceZ);
+    require(std::abs(dense::EnvironmentGenerator::tributaryCenterZ(confluenceX)-
+                     confluenceZ)<1.0e-4f&&
+                std::abs(dense::EnvironmentGenerator::tributarySurfaceHeight(confluenceX)-
+                         dense::EnvironmentGenerator::riverSurfaceHeight(confluenceZ))<1.0e-4f,
+            "tributary does not join the main river continuously");
+    float previousTributarySurface=std::numeric_limits<float>::max();
+    for(float x=-2600.0f;x<=confluenceX;x+=35.0f){
+        const float surface=dense::EnvironmentGenerator::tributarySurfaceHeight(x);
+        require(surface<previousTributarySurface,
+                "tributary surface does not descend toward its confluence");
+        previousTributarySurface=surface;
+    }
+    require(dense::EnvironmentGenerator::riverCenterX(0.0f)>250.0f,
+            "main river intruded into the hero-tree clearing");
     const std::array<size_t,5> sampledTerrainTriangles{{
         0,1,1379,environment.terrainIndices.size()/6,
         environment.terrainIndices.size()/3-1
@@ -195,9 +235,26 @@ int main() {
     require(hydrologyEligible>hydrologyRegion*2/100&&
                 hydrologyEligible<hydrologyRegion*15/100,
             "runoff bake selected an implausible fraction of the near terrain");
-    require(flatLocalMinima>0&&selectedFlatLocalMinima==flatLocalMinima,
-            "runoff bake failed to retain water in flat local depressions");
+    require(flatLocalMinima>20&&selectedFlatLocalMinima>=flatLocalMinima/20,
+            "runoff bake failed to retain representative flat local depressions");
     validateTriangles(environment.terrainVertices,environment.terrainIndices,"hill terrain");
+    require(environment.riverVertices.size()>1500&&
+                environment.riverIndices.size()/3<4000,
+            "persistent river mesh is absent or exceeded its static budget");
+    for(size_t i=0;i<environment.riverVertices.size();++i){
+        const auto&vertex=environment.riverVertices[i];
+        require(finite(vertex.position)&&finite(vertex.normal)&&
+                    std::abs(dense::length(vertex.normal)-1.0f)<.002f&&
+                    vertex.normal.y>.85f&&vertex.material==6.0f,
+                "river mesh emitted an invalid material, position, or normal");
+        if(i%31==0){
+            const auto ground=dense::EnvironmentGenerator::sampleTerrainSurface(
+                vertex.position.x,vertex.position.z);
+            require(ground.insideBounds&&vertex.position.y>=ground.position.y+.03f,
+                    "persistent river surface intersects its rendered terrain");
+        }
+    }
+    validateTriangles(environment.riverVertices,environment.riverIndices,"river water");
     uint32_t decodedTallPatches=0,waterRetainingGrassPatches=0;
     for(size_t i=0;i<environment.grassPatches.size();++i){
         const auto& patch=environment.grassPatches[i];
@@ -253,9 +310,51 @@ int main() {
             "rock families escaped their ecological inventory");
     require(environment.shrubCount>=14&&environment.shrubCount<=24,
             "near/background shrub inventory is implausible");
-    require(environment.backgroundTreeCount>=17&&environment.backgroundTreeCount<=22,
-            "sparse pasture-tree inventory escaped its proxy budget");
-    require(!environment.detailVertices.empty()&&environment.detailIndices.size()/3<100000,
+    require(environment.backgroundTreeCount==21,
+            "medium-detail landmark groves escaped their fixed inventory");
+    require(environment.distantTreeCount>=180&&environment.distantTreeCount<=350&&
+                environment.distantTreeBases.size()==environment.distantTreeCount,
+            "map-scale woodland inventory escaped its LOD population budget");
+    require(environment.distantTreeTriangleCount>=35000&&
+                environment.distantTreeTriangleCount<=60000,
+            "map-scale woodland escaped its dedicated triangle budget");
+    size_t riparianWoodland=0,northernFoothillWoodland=0;
+    float minimumWoodlandX=std::numeric_limits<float>::max();
+    float maximumWoodlandX=std::numeric_limits<float>::lowest();
+    float minimumWoodlandZ=std::numeric_limits<float>::max();
+    float maximumWoodlandZ=std::numeric_limits<float>::lowest();
+    const float tributaryJoinX=dense::EnvironmentGenerator::riverCenterX(520.0f);
+    for(size_t i=0;i<environment.distantTreeBases.size();++i){
+        const auto&base=environment.distantTreeBases[i];
+        const auto&copy=environmentCopy.distantTreeBases[i];
+        require(base.x==copy.x&&base.y==copy.y&&base.z==copy.z,
+                "distant woodland object-local seeds are not deterministic");
+        const float heroDistance=std::sqrt(base.x*base.x+base.z*base.z);
+        const auto grade=dense::EnvironmentGenerator::sampleTerrainSurface(base.x,base.z);
+        require(heroDistance>=620.0f&&grade.insideBounds&&
+                    std::abs(base.y-grade.position.y)<2.0e-4f,
+                "distant woodland entered the open hero meadow or floated above grade");
+        const float mainBank=std::abs(base.x-dense::EnvironmentGenerator::riverCenterX(base.z))-
+                             dense::EnvironmentGenerator::riverHalfWidth(base.z);
+        float tributaryBank=10000.0f;
+        if(base.x<tributaryJoinX)
+            tributaryBank=std::abs(base.z-dense::EnvironmentGenerator::tributaryCenterZ(base.x))-
+                           dense::EnvironmentGenerator::tributaryHalfWidth(base.x);
+        require(mainBank>=19.5f&&tributaryBank>=19.5f,
+                "distant woodland entered a permanent river channel");
+        riparianWoodland+=std::min(mainBank,tributaryBank)<285.0f;
+        northernFoothillWoodland+=base.z>1350.0f&&std::min(mainBank,tributaryBank)>=285.0f;
+        minimumWoodlandX=std::min(minimumWoodlandX,base.x);
+        maximumWoodlandX=std::max(maximumWoodlandX,base.x);
+        minimumWoodlandZ=std::min(minimumWoodlandZ,base.z);
+        maximumWoodlandZ=std::max(maximumWoodlandZ,base.z);
+    }
+    require(riparianWoodland>=100&&northernFoothillWoodland>=70,
+            "distant woodland lost its riparian or foothill biome structure");
+    require(minimumWoodlandX<-1900.0f&&maximumWoodlandX>600.0f&&
+                minimumWoodlandZ<-2000.0f&&maximumWoodlandZ>2000.0f,
+            "distant woodland collapsed into a local or radial-band distribution");
+    require(!environment.detailVertices.empty()&&environment.detailIndices.size()/3<120000,
             "scene dressing is empty or exceeded its static triangle budget");
     for(const auto& vertex:environment.detailVertices){
         require(finite(vertex.position)&&finite(vertex.normal)&&
@@ -267,15 +366,24 @@ int main() {
                 "scene dressing lost its rock, foliage, or wood material route");
     }
     validateTriangles(environment.detailVertices,environment.detailIndices,"scene dressing");
-    int mountainSectors=0;
-    for(int sector=0;sector<24;++sector){
-        const float angle=2*dense::pi*(sector+.5f)/24;float peak=-100;
-        for(float radius=920;radius<=1480;radius+=8)
-            peak=std::max(peak,dense::EnvironmentGenerator::terrainHeight(
-                                   std::cos(angle)*radius,std::sin(angle)*radius));
-        if(peak>48.0f)++mountainSectors;
+    float innerPeak=-1000.0f,outerPeak=-1000.0f,outerPeakRadius=0.0f;
+    for(float z=-3100.0f;z<=3100.0f;z+=70.0f)for(float x=-3100.0f;x<=3100.0f;x+=70.0f){
+        const float radius=std::sqrt(x*x+z*z);
+        const float height=dense::EnvironmentGenerator::terrainHeight(x,z);
+        if(radius<1700.0f)innerPeak=std::max(innerPeak,height);
+        if(radius>2050.0f&&height>outerPeak){outerPeak=height;outerPeakRadius=radius;}
     }
-    require(mountainSectors>=18,"distant mountain range has large missing angular sectors");
+    require(innerPeak<75.0f&&outerPeak>170.0f&&outerPeakRadius>2200.0f,
+            "mountain relief moved back into the playable valley or became too low");
+    int northernMassifs=0;
+    for(float x=-2100.0f;x<=2100.0f;x+=700.0f){
+        float peak=-1000.0f;
+        for(float z=1900.0f;z<=3100.0f;z+=25.0f)
+            peak=std::max(peak,dense::EnvironmentGenerator::terrainHeight(x,z));
+        northernMassifs+=peak>125.0f;
+    }
+    require(northernMassifs>=5,
+            "distant northern mountain chain has implausible continuity");
 
     dense::TreeGenerator generator;
     dense::TreeParameters p;

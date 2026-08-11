@@ -39,6 +39,7 @@ SamplerState GroundSampler : register(s0);
 RWTexture2D<float4> Output : register(u0);
 RWTexture2D<float4> Accumulation : register(u1);
 ConstantBuffer<Camera> camera : register(b0);
+static const float SceneRayMaximum=7200.0;
 
 float3 srgbToLinear(float3 c) { c=saturate(c);return lerp(c/12.92,pow((c+.055)/1.055,2.4),step(.04045,c)); }
 float3 unpackColor(uint packed) { return float3(packed&255,(packed>>8)&255,(packed>>16)&255)/255.0; }
@@ -118,15 +119,20 @@ float2 waterNoiseGradient(float2 p,float epsilon) {
 // Two decorrelated, world-space scrolling fields form a stable small-wave
 // normal. Detail amplitude is footprint-filtered instead of relying on ray
 // differentials, which are unavailable in this DXR closest-hit path.
-float2 scrollingWaterSlope(float2 worldPosition,float footprint) {
+float2 scrollingWaterSlope(float2 worldPosition,float footprint,
+                           float2 flowDirection,float flowSpeed) {
     float2 wind=safeWindDirection2(),crossWind=float2(-wind.y,wind.x);
+    float flowLength=length(flowDirection);
+    float2 flow=flowLength>1e-5?flowDirection/flowLength:float2(0,0);
     float simulationTime=max(g_Time,0.0);
     float coarseFade=1-smoothstep(.28,.90,footprint);
     float fineFade=1-smoothstep(.075,.32,footprint);
     float motion=max(g_WindSpeed,0.0)*saturate(g_WindStrength);
-    float2 uvA=worldPosition*.62+wind*(simulationTime*.038*motion);
+    float2 uvA=worldPosition*.62+wind*(simulationTime*.038*motion)-
+               flow*(simulationTime*max(flowSpeed,0.0)*.62);
     float2 flowB=normalize(crossWind*.87-wind*.49);
-    float2 uvB=worldPosition*1.47+flowB*(simulationTime*.061*motion)+
+    float2 uvB=worldPosition*1.47+flowB*(simulationTime*.061*motion)-
+               flow*(simulationTime*max(flowSpeed,0.0)*1.47)+
                float2(37.2,-19.7);
     float2 slopeA=waterNoiseGradient(uvA,.035)*.62*.037*coarseFade;
     float2 slopeB=waterNoiseGradient(uvB,.045)*1.47*.016*fineFade;
@@ -143,7 +149,8 @@ struct RainImpactSample {
 // Analytic expanding impacts avoid a texture/descriptor and remain stable in
 // world space. One evaluation supplies both the normal slope and visible
 // dielectric response, avoiding a second 3x3 hash/ring pass during shading.
-RainImpactSample evaluateRainImpacts(float2 worldPosition,float footprint) {
+RainImpactSample evaluateRainImpacts(float2 worldPosition,float footprint,
+                                     float explicitWaterAvailability) {
     RainImpactSample impact;
     impact.slope=0;impact.brightCrest=0;
     impact.darkTrough=0;impact.crownFoam=0;
@@ -151,12 +158,14 @@ RainImpactSample evaluateRainImpacts(float2 worldPosition,float footprint) {
     float rippleStrength=saturate(g_WaterRippleStrength);
     PrecipitationFlux flux=evaluatePrecipitationFlux(rain);
     float detailFade=1-smoothstep(.045,.24,footprint);
-    if(rippleStrength<.004||detailFade<=.001)return impact;
+    float waterAvailability=max(
+        saturate(rippleStrength/max(rain,1e-3)),
+        saturate(explicitWaterAvailability));
+    if(rain<.001||waterAvailability<.004||detailFade<=.001)return impact;
 
     // EnvironmentCB stores rain*flood coverage. Divide out rain so every
     // accepted drop has the same physical response; intensity changes only
     // the birth probability and cadence below.
-    float waterAvailability=saturate(rippleStrength/max(rain,1e-3));
     float impactVisibility=waterAvailability;
 
     const float cellSize=.78;
@@ -233,9 +242,13 @@ struct WaterSurfaceSample {
     float crownFoam;
 };
 
-WaterSurfaceSample evaluatePuddleSurface(float2 worldPosition,float footprint) {
-    RainImpactSample impact=evaluateRainImpacts(worldPosition,footprint);
-    float2 slope=scrollingWaterSlope(worldPosition,footprint)+
+WaterSurfaceSample evaluateWaterSurface(float2 worldPosition,float footprint,
+                                        float2 flowDirection,float flowSpeed,
+                                        float explicitWaterAvailability) {
+    RainImpactSample impact=evaluateRainImpacts(worldPosition,footprint,
+                                                explicitWaterAvailability);
+    float2 slope=scrollingWaterSlope(worldPosition,footprint,
+                                     flowDirection,flowSpeed)+
                  impact.slope;
     float magnitude=length(slope);
     if(magnitude>.115)slope*=.115/magnitude;
@@ -290,6 +303,52 @@ float4 sampleGroundNormal(float2 uv,uint tile,float requestedMip) {
     return GroundNormalHeightCavity.SampleLevel(GroundSampler,float3(uv,float(tile)),
                                                 clamp(requestedMip,0.0,10.0));
 }
+struct TriplanarGroundSample {
+    float4 albedo;
+    float4 lowAlbedo;
+    float3 normalGradient;
+    float height;
+    float cavity;
+};
+TriplanarGroundSample sampleGroundTriplanar(float3 worldPosition,float3 geometricNormal,
+                                            uint tile,float albedoMip,float normalMip) {
+    // Power-four weights keep the material stable on broad faces while the
+    // small floor prevents a hard seam where two projections exchange rank.
+    float3 weights=pow(abs(geometricNormal),4.0)+float3(1e-4,1e-4,1e-4);
+    weights/=weights.x+weights.y+weights.z;
+    float3 shifted=worldPosition+float3(3.71,-1.37,5.19)*float(tile+1u);
+    float2 uvX=shifted.zy*.5+float2(.17,.61);
+    float2 uvY=shifted.xz*.5+float2(.31,.13);
+    float2 uvZ=shifted.xy*.5+float2(.73,.47);
+    float4 albedoX=sampleGroundAlbedo(uvX,tile,albedoMip);
+    float4 albedoY=sampleGroundAlbedo(uvY,tile,albedoMip);
+    float4 albedoZ=sampleGroundAlbedo(uvZ,tile,albedoMip);
+    float4 lowX=sampleGroundAlbedo(uvX,tile,albedoMip+3.25);
+    float4 lowY=sampleGroundAlbedo(uvY,tile,albedoMip+3.25);
+    float4 lowZ=sampleGroundAlbedo(uvZ,tile,albedoMip+3.25);
+    float4 normalX=sampleGroundNormal(uvX,tile,normalMip);
+    float4 normalY=sampleGroundNormal(uvY,tile,normalMip);
+    float4 normalZ=sampleGroundNormal(uvZ,tile,normalMip);
+
+    // RG stores the signed slope along each projection's U/V axes.  Convert
+    // those slopes to one world-space differential before removing the normal
+    // component at the call site.  This avoids the stretched XZ-only detail
+    // that previously made upright rocks and cliffs look moulded.
+    float3 gradientX=float3(0,normalX.g*2-1,normalX.r*2-1);
+    float3 gradientY=float3(normalY.r*2-1,0,normalY.g*2-1);
+    float3 gradientZ=float3(normalZ.r*2-1,normalZ.g*2-1,0);
+    TriplanarGroundSample result;
+    result.albedo=albedoX*weights.x+albedoY*weights.y+albedoZ*weights.z;
+    result.lowAlbedo=lowX*weights.x+lowY*weights.y+lowZ*weights.z;
+    result.normalGradient=gradientX*weights.x+gradientY*weights.y+gradientZ*weights.z;
+    result.height=dot(float3(normalX.b,normalY.b,normalZ.b),weights);
+    result.cavity=dot(float3(normalX.a,normalY.a,normalZ.a),weights);
+    return result;
+}
+float3 applyTriplanarGroundNormal(float3 surfaceNormal,float3 gradient,float strength) {
+    gradient-=surfaceNormal*dot(gradient,surfaceNormal);
+    return normalize(surfaceNormal+gradient*strength);
+}
 float3 cosineHemisphere(float3 n,float2 random) {
     float phi=6.2831853*random.x,r=sqrt(random.y);float3 helper=abs(n.y)<.9?float3(0,1,0):float3(1,0,0);float3 tangent=normalize(cross(helper,n)),bitangent=cross(n,tangent);
     return normalize(tangent*(r*cos(phi))+bitangent*(r*sin(phi))+n*sqrt(1-random.y));
@@ -313,6 +372,282 @@ float3 lightningRadiance() {
     return float3(.52,.66,1.0)*g_LightningFlash;
 }
 float daylightAmount() { return smoothstep(-.12,.08,directionToSun().y); }
+
+// The cloud deck is a world-anchored weather field rather than a screen-space
+// decoration. Sky rays and surface lighting integrate the same five samples
+// through a finite slab, so visible cloud bodies and their broad ground
+// shadows cannot drift apart. Randomized multi-lobed ellipsoids are integrated
+// analytically as continuous chords; a few slab probes only discover cells.
+// There are therefore no discrete height slices to read as stacked pancakes.
+static const float CloudBaseHeight=860.0;
+static const float CloudTopHeight=1510.0;
+static const float CloudCellWidth=1600.0;
+static const uint CloudCellProbeSteps=7u;
+static const uint CloudSkyMarchSteps=20u;
+static const uint CloudShadowMarchSteps=5u;
+
+float2 cloudWindOffset() {
+    float2 wind=safeWindDirection2();
+    return wind*(g_Time*max(g_WindSpeed,0.0)*.72);
+}
+
+struct CloudCellShape {
+    float2 center;
+    float2 radius;
+    float angle;
+    float active;
+};
+
+CloudCellShape cloudCellShape(int2 cell) {
+    float2 cellCoordinate=float2(cell);
+    float seed=hash(cellCoordinate+float2(37.1,-19.7));
+    float2 centerUv=.5+(float2(hash(cellCoordinate+float2(11.3,71.9)),
+                               hash(cellCoordinate+float2(-53.7,29.1)))-.5)*.24;
+    float storm=saturate(g_StormIntensity);
+    float radiusScale=lerp(1.0,1.28,storm);
+    CloudCellShape shape;
+    shape.center=(cellCoordinate+centerUv)*CloudCellWidth+cloudWindOffset();
+    shape.radius=float2(lerp(.225,.315,hash(cellCoordinate+float2(5.9,-83.2))),
+                            lerp(.190,.270,hash(cellCoordinate+float2(91.4,13.6))))*
+                 CloudCellWidth*radiusScale;
+    shape.angle=seed*6.2831853;
+    shape.active=smoothstep(lerp(.35,.10,storm),lerp(.52,.25,storm),seed);
+    return shape;
+}
+
+float2 rotateCloudOffset(float2 offset,float angle) {
+    float cosine=cos(angle),sine=sin(angle);
+    return float2(offset.x*cosine-offset.y*sine,
+                  offset.x*sine+offset.y*cosine);
+}
+
+float cloudEllipsoidChord(float3 origin,float3 direction,float3 center,
+                          float3 radius,float angle,float minimumDistance,
+                          float maximumDistance,out float middleDistance) {
+    float2 localOrigin=rotateCloudOffset(origin.xz-center.xz,-angle);
+    float2 localDirection=rotateCloudOffset(direction.xz,-angle);
+    float3 normalizedOrigin=float3(localOrigin.x/radius.x,
+                                   (origin.y-center.y)/radius.y,
+                                   localOrigin.y/radius.z);
+    float3 normalizedDirection=float3(localDirection.x/radius.x,
+                                      direction.y/radius.y,
+                                      localDirection.y/radius.z);
+    float a=dot(normalizedDirection,normalizedDirection);
+    float b=dot(normalizedOrigin,normalizedDirection);
+    float discriminant=b*b-a*(dot(normalizedOrigin,normalizedOrigin)-1);
+    middleDistance=0;
+    if(discriminant<=0||a<=1e-9)return 0;
+    float root=sqrt(discriminant);
+    float nearDistance=max((-b-root)/a,minimumDistance);
+    float farDistance=min((-b+root)/a,maximumDistance);
+    if(farDistance<=nearDistance)return 0;
+    middleDistance=(nearDistance+farDistance)*.5;
+    return farDistance-nearDistance;
+}
+
+struct CloudRayStats {
+    float meanDensity;
+    float maximumDensity;
+    float minimumDensity;
+    float verticalMoment;
+    float slantDepth;
+    float3 middlePosition;
+};
+
+CloudRayStats integrateCloudSlab(float3 origin,float3 rayDirection) {
+    CloudRayStats stats;
+    stats.meanDensity=0;stats.maximumDensity=0;stats.minimumDensity=1;
+    stats.verticalMoment=0;stats.slantDepth=0;stats.middlePosition=0;
+    float3 d=normalize(rayDirection);
+    if(d.y<=.018||origin.y>=CloudTopHeight)return stats;
+
+    float inverseVertical=1.0/max(d.y,.018);
+    float entryDistance=max(CloudBaseHeight-origin.y,0.0)*inverseVertical;
+    float exitDistance=max(CloudTopHeight-origin.y,0.0)*inverseVertical;
+    float slabDistance=max(exitDistance-entryDistance,1e-4);
+    stats.slantDepth=min(slabDistance/(CloudTopHeight-CloudBaseHeight),4.6);
+    float cloudDistance=0,weightedHeight=0,weightedDistance=0;
+    int2 previousCell=int2(2147483647,2147483647);
+    [unroll] for(uint probeIndex=0u;probeIndex<CloudCellProbeSteps;++probeIndex){
+        float probe=(float(probeIndex)+.5)/float(CloudCellProbeSteps);
+        float sampleDistance=lerp(entryDistance,exitDistance,probe);
+        float2 advected=(origin+d*sampleDistance).xz-cloudWindOffset();
+        int2 cell=int2(floor(advected/CloudCellWidth));
+        if(all(cell==previousCell))continue;
+        previousCell=cell;
+        CloudCellShape shape=cloudCellShape(cell);
+        if(shape.active<=.001)continue;
+
+        float thickness=CloudTopHeight-CloudBaseHeight;
+        float3 baseCenter=float3(shape.center.x,CloudBaseHeight+thickness*.34,
+                                 shape.center.y);
+        float2 leftOffset=rotateCloudOffset(float2(-shape.radius.x*.30,
+                                                   shape.radius.y*.08),shape.angle);
+        float2 rightOffset=rotateCloudOffset(float2(shape.radius.x*.31,
+                                                    -shape.radius.y*.10),shape.angle);
+        float3 leftCenter=baseCenter+float3(leftOffset.x,thickness*.22,leftOffset.y);
+        float3 rightCenter=baseCenter+float3(rightOffset.x,thickness*.28,rightOffset.y);
+        float middle0,middle1,middle2;
+        float chord0=cloudEllipsoidChord(origin,d,baseCenter,
+            float3(shape.radius.x,thickness*.35,shape.radius.y),shape.angle,
+            entryDistance,exitDistance,middle0);
+        float chord1=cloudEllipsoidChord(origin,d,leftCenter,
+            float3(shape.radius.x*.72,thickness*.32,shape.radius.y*.70),shape.angle,
+            entryDistance,exitDistance,middle1);
+        float chord2=cloudEllipsoidChord(origin,d,rightCenter,
+            float3(shape.radius.x*.68,thickness*.29,shape.radius.y*.76),shape.angle,
+            entryDistance,exitDistance,middle2);
+        float chord=chord0;float middle=middle0;float centerHeight=.34;
+        if(chord1>chord){chord=chord1;middle=middle1;centerHeight=.56;}
+        if(chord2>chord){chord=chord2;middle=middle2;centerHeight=.62;}
+        chord*=shape.active;
+        cloudDistance+=chord;
+        weightedDistance+=chord*middle;
+        weightedHeight+=chord*centerHeight;
+        stats.maximumDensity=max(stats.maximumDensity,
+            shape.active*saturate(chord/(thickness*.42)));
+    }
+    stats.meanDensity=saturate(cloudDistance/slabDistance);
+    stats.verticalMoment=weightedHeight/max(cloudDistance,1e-4);
+    stats.middlePosition=origin+d*(weightedDistance/max(cloudDistance,1e-4));
+    stats.minimumDensity=0;
+    return stats;
+}
+
+// Production cloud rendering uses a continuous stratified field. The analytic
+// cell experiment above remains compile-time dead code, but is intentionally
+// not used for either visible clouds or their shadows: its lobe silhouettes are
+// too geometric at grazing angles.
+float cloudContinuousDensity3D(float3 worldPosition) {
+    float height=saturate((worldPosition.y-CloudBaseHeight)/
+                          (CloudTopHeight-CloudBaseHeight));
+    if(height<=0||height>=1)return 0;
+    float2 wind=safeWindDirection2();
+    float2 advected=worldPosition.xz-
+        wind*(g_Time*max(g_WindSpeed,0.0)*.72);
+    float2 p=advected*.00138;
+    p+=float2(sin(p.y*1.37+p.x*.31),
+              sin(p.x*1.63-p.y*.27))*.21;
+    float weather=valueNoise(p*.74+float2(11.7,-4.3));
+    float billow=valueNoise3(float3(p*2.28,height*3.65)+
+                             float3(17.3,-9.1,6.4));
+    float storm=saturate(g_StormIntensity);
+    float field=weather*.62+billow*.38-height*.028;
+    float threshold=lerp(.625,.430,storm);
+    float transition=lerp(.145,.095,storm);
+    // A gated high-frequency octave only perturbs the transition band. Cloud
+    // interiors therefore remain optically solid while their perimeter and
+    // top erode into smaller billows instead of a smooth fog-bank silhouette.
+    // Skipping it away from the boundary also bounds the extra cost in clear
+    // sky and in the broad interior of storm decks.
+    float edgeProximity=1-saturate(abs(field-(threshold+transition*.52)) /
+                                    max(transition*1.65,1e-4));
+    float edgeErosion=.5;
+    [branch] if(edgeProximity>.015) {
+        edgeErosion=valueNoise3(float3(p*5.35,height*8.20)+
+                                float3(-31.7,22.9,13.4));
+        field+=(edgeErosion-.52)*lerp(.120,.090,storm)*edgeProximity;
+    }
+    float column=smoothstep(.27,.82,weather);
+    float topLimit=.28+.68*pow(column,.72)+.045*(billow-.5)+
+                   (edgeErosion-.5)*.040*edgeProximity;
+    float bottom=smoothstep(.025+.055*(1-billow),.145,height);
+    float top=1-smoothstep(topLimit-.115,topLimit+.045,height);
+    return smoothstep(threshold,threshold+transition,field)*bottom*top;
+}
+
+CloudRayStats integrateContinuousCloudSlab(float3 origin,float3 rayDirection,
+                                           uint stepCount) {
+    CloudRayStats stats;
+    stats.meanDensity=0;stats.maximumDensity=0;stats.minimumDensity=1;
+    stats.verticalMoment=0;stats.slantDepth=0;stats.middlePosition=0;
+    float3 d=normalize(rayDirection);
+    if(d.y<=.018||origin.y>=CloudTopHeight)return stats;
+    float inverseVertical=1.0/max(d.y,.018);
+    float entryDistance=max(CloudBaseHeight-origin.y,0.0)*inverseVertical;
+    float exitDistance=max(CloudTopHeight-origin.y,0.0)*inverseVertical;
+    float slabDistance=max(exitDistance-entryDistance,1e-4);
+    stats.slantDepth=min(slabDistance/(CloudTopHeight-CloudBaseHeight),4.6);
+    float densitySum=0,weightedHeight=0,weightedDistance=0;
+    [loop] for(uint stepIndex=0u;stepIndex<stepCount;++stepIndex){
+        float stepPosition=(float(stepIndex)+.5)/float(stepCount);
+        float sampleDistance=lerp(entryDistance,exitDistance,stepPosition);
+        float3 samplePosition=origin+d*sampleDistance;
+        float density=cloudContinuousDensity3D(samplePosition);
+        float height=saturate((samplePosition.y-CloudBaseHeight)/
+                              (CloudTopHeight-CloudBaseHeight));
+        densitySum+=density;weightedHeight+=density*height;
+        weightedDistance+=density*sampleDistance;
+        stats.maximumDensity=max(stats.maximumDensity,density);
+        stats.minimumDensity=min(stats.minimumDensity,density);
+    }
+    stats.meanDensity=densitySum/max(float(stepCount),1.0);
+    stats.verticalMoment=weightedHeight/max(densitySum,1e-4);
+    stats.middlePosition=origin+d*(weightedDistance/max(densitySum,1e-4));
+    if(densitySum<=1e-4)stats.minimumDensity=0;
+    return stats;
+}
+
+float cloudOpticalDepth(CloudRayStats stats) {
+    // Clear-weather wisps and moderate bodies retain most direct sunlight;
+    // the nonlinear core term still lets compact towers and storm decks become
+    // genuinely opaque. This avoids turning the whole default map into dusk.
+    float mean=stats.meanDensity,core=mean*mean*stats.maximumDensity;
+    float clearDepth=mean*.18+core*4.20;
+    float stormDepth=mean*.82+mean*mean*3.10;
+    return stats.slantDepth*lerp(clearDepth,stormDepth,
+                                 saturate(g_StormIntensity));
+}
+
+float cloudKeyTransmittance(float3 worldPosition) {
+    float3 keyDirection=directionToKeyLight();
+    if(keyDirection.y<=.025||worldPosition.y>=CloudTopHeight)return 1;
+    CloudRayStats stats=integrateContinuousCloudSlab(
+        worldPosition,keyDirection,CloudShadowMarchSteps);
+    return exp(-max(cloudOpticalDepth(stats),0.0));
+}
+
+struct SkyCloudSample {
+    float density;
+    float opacity;
+    float transmission;
+    float illumination;
+    float edge;
+};
+
+SkyCloudSample sampleSkyCloud(float3 rayDirection) {
+    SkyCloudSample sample;
+    sample.density=0;sample.opacity=0;sample.transmission=1;
+    sample.illumination=1;sample.edge=0;
+    float3 d=normalize(rayDirection);
+    if(d.y<=.018||camera.eye.y>=CloudTopHeight)return sample;
+
+    CloudRayStats stats=integrateContinuousCloudSlab(
+        camera.eye,d,CloudSkyMarchSteps);
+    sample.density=stats.meanDensity;
+    sample.transmission=exp(-max(cloudOpticalDepth(stats),0.0));
+    // Near-horizontal slab intersections are both extremely distant and the
+    // source of repeated pancake silhouettes. Atmospheric extinction hides
+    // those before the first full cloud body enters the upper sky.
+    sample.opacity=(1-sample.transmission)*smoothstep(.040,.17,d.y);
+
+    float3 sun=directionToSun();
+    float sunTravel=150.0/max(sun.y,.12);
+    float sunwardDensity=sun.y>0?
+        (cloudContinuousDensity3D(stats.middlePosition+sun*sunTravel)+
+         cloudContinuousDensity3D(stats.middlePosition+sun*sunTravel*2.0))*.5:
+        sample.density;
+    float selfLight=exp(-(sunwardDensity+stats.meanDensity*.72+
+                          stats.maximumDensity*.30)*
+        lerp(.90,2.70,saturate(g_StormIntensity)));
+    float underside=.24+.76*smoothstep(.18,.72,stats.verticalMoment);
+    float coreLight=lerp(1.0,.20,stats.maximumDensity);
+    sample.illumination=saturate(selfLight*.58+underside*.18+coreLight*.24);
+    float boundary=1-saturate(abs(stats.maximumDensity-.48)*2.05);
+    float layerVariation=stats.maximumDensity-stats.minimumDensity;
+    sample.edge=saturate(boundary*.72+layerVariation*.82);
+    return sample;
+}
 
 struct LocalLightSample {
     float3 direction;
@@ -406,7 +741,6 @@ float3 environmentRadiance(float3 direction) {
     float sunMu=saturate(dot(d,sun));
     float sunDisk=smoothstep(cos(.0058),cos(.0042),sunMu)*g_SunIntensity;
     float sunAureole=pow(sunMu,48)*(.16+.30*g_SunIntensity);
-    color+=sunDisk*g_SunColor*13.0+sunAureole*g_SunColor*1.4;
     float moonMu=saturate(dot(d,moon));
     float moonDisk=smoothstep(cos(.0052),cos(.0040),moonMu)*g_MoonPhase;
     color+=moonDisk*float3(.42,.52,.82)+pow(moonMu,96)*g_MoonColor*g_MoonIntensity*.8;
@@ -416,23 +750,26 @@ float3 environmentRadiance(float3 direction) {
         color+=proceduralStars(d)*g_StarVisibility*horizonStars*
                lerp(float3(.55,.68,1.0),float3(1.0,.72,.48),hash(floor(d.xy*317)));
 
-    if(d.y>.018){
-        float2 cloudPoint=d.xz/max(d.y,.075)*.52;
-        cloudPoint+=g_WindDirection*(g_Time*g_WindSpeed*.006);
-        // Two coherent octaves are enough at sky scale and avoid eight full
-        // noise octaves for every miss ray.
-        float cloudNoise=.68*valueNoise(cloudPoint)+
-                         .32*valueNoise(cloudPoint*2.11+31.4);
-        float cloudThreshold=lerp(.73,.51,g_StormIntensity);
-        float coverage=smoothstep(cloudThreshold,cloudThreshold+.105,cloudNoise);
-        coverage*=smoothstep(.025,.20,d.y);
-        float silver=pow(saturate(dot(d,sun)),10)*g_SunIntensity;
-        float3 clearCloud=lerp(float3(.10,.12,.15),float3(.96,.98,.94),daylight);
-        float3 stormCloud=float3(.055,.065,.078);
-        float3 cloudColor=lerp(clearCloud,stormCloud,g_StormIntensity*.88)+silver*.28;
-        color=lerp(color,cloudColor,coverage*lerp(.62,.94,g_StormIntensity));
-    }
     color=lerp(color,color*.44,g_StormIntensity*.62);
+    SkyCloudSample cloud=sampleSkyCloud(d);
+    if(cloud.opacity>.001){
+        float3 clearShadow=float3(.075,.105,.140);
+        float3 clearLit=float3(.64,.69,.74);
+        float3 stormShadow=float3(.035,.045,.060);
+        float3 stormLit=float3(.30,.34,.38);
+        float3 shadowColor=lerp(clearShadow,stormShadow,g_StormIntensity);
+        float3 litColor=lerp(clearLit,stormLit,g_StormIntensity);
+        float verticalLight=.10+.90*cloud.illumination;
+        float3 cloudColor=lerp(shadowColor,litColor,verticalLight)*
+                          lerp(.38,1.0,daylight);
+        float forwardScatter=pow(sunMu,18)*g_SunIntensity*cloud.edge;
+        cloudColor+=g_SunColor*forwardScatter*lerp(.24,.92,cloud.illumination);
+        color=lerp(color,cloudColor,cloud.opacity);
+    }
+    // The solar disc and aureole sit behind the slab. Dense cloud can fully
+    // hide the disc while forward scattering above supplies a silver lining.
+    color+=sunDisk*g_SunColor*13.0*cloud.transmission+
+           sunAureole*g_SunColor*1.4*lerp(.18,1.0,cloud.transmission);
     color+=lightningRadiance()*(.18+.48*horizonHaze);
     if(d.y<0)color=lerp(float3(.010,.014,.012),color,saturate(1+d.y*7.0));
     return max(color,0);
@@ -534,15 +871,15 @@ void RayGen() {
     // Grass is composited by the instanced raster pass.  A single primary
     // sample keeps the path tracer from paying twice for animated geometry;
     // static frames still converge through the accumulation buffer.
-    uint spatialSamples=1u;float3 frameColor=0;float sceneDepth=2200.0;
+    uint spatialSamples=1u;float3 frameColor=0;float sceneDepth=SceneRayMaximum;
     float frameKeyVisibility=0;
     [loop] for(uint sampleIndex=0;sampleIndex<spatialSamples;++sampleIndex){
         float2 jitter;
         if(camera.maxFrames>1u)jitter=float2(hash(pixel+camera.frameIndex*17),hash(pixel.yx+camera.frameIndex*31))-.5;
         else jitter=0;
         float2 uv=((float2(pixel)+.5+jitter)/float2(camera.resolution))*2-1;uv.y=-uv.y;
-        RayDesc ray;ray.Origin=camera.eye;ray.Direction=normalize(camera.forward+camera.right*uv.x*camera.aspect*camera.tanHalfFov+camera.up*uv.y*camera.tanHalfFov);ray.TMin=.02;ray.TMax=2200;
-        RadiancePayload payload;payload.color=0;payload.depth=0;payload.primaryT=2200.0;
+        RayDesc ray;ray.Origin=camera.eye;ray.Direction=normalize(camera.forward+camera.right*uv.x*camera.aspect*camera.tanHalfFov+camera.up*uv.y*camera.tanHalfFov);ray.TMin=.02;ray.TMax=SceneRayMaximum;
+        RadiancePayload payload;payload.color=0;payload.depth=0;payload.primaryT=SceneRayMaximum;
         payload.primaryKeyVisibility=1;
         TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,ray,payload);
         frameColor+=payload.color;
@@ -594,7 +931,7 @@ void RayGen() {
 [shader("miss")]
 void RadianceMiss(inout RadiancePayload payload) {
     payload.color=environmentRadiance(WorldRayDirection());
-    if(payload.depth==0){payload.primaryT=2200.0;payload.primaryKeyVisibility=1;}
+    if(payload.depth==0){payload.primaryT=SceneRayMaximum;payload.primaryKeyVisibility=1;}
 }
 [shader("miss")]
 void VisibilityMiss(inout VisibilityPayload payload) { payload.visible=1; }
@@ -836,16 +1173,21 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
     ray.Direction=sun;ray.TMin=.003;ray.TMax=1000;
     TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
              0x1,1,0,1,ray,shadow);
-    if(payload.depth==0)payload.primaryKeyVisibility=float(shadow.visible);
+    float cloudTransmission=cloudKeyTransmittance(hit);
+    float keyVisibility=float(shadow.visible)*cloudTransmission;
+    if(payload.depth==0)payload.primaryKeyVisibility=keyVisibility;
     float frontLight=saturate(dot(n,sun)),backLight=saturate(dot(-n,sun));
     float3 ambient=skyIrradiance(n)*(.50+.18*along);
-    float3 direct=keyRadiance*frontLight*shadow.visible*1.28;
+    float cloudShade=1-cloudTransmission;
+    ambient=ambient*lerp(1.0,1.10,cloudShade)+
+            float3(.014,.022,.034)*daylightAmount()*cloudShade;
+    float3 direct=keyRadiance*frontLight*keyVisibility*1.28;
     float3 unmodulated=keyRadiance*float3(.42,.74,.20)*backLight*
-                       shadow.visible*.72;
+                       keyVisibility*.72;
     float3 view=normalize(camera.eye-hit),halfVector=normalize(sun+view);
     float wetExponent=lerp(22.0,110.0,wetness);
     unmodulated+=keyRadiance*pow(saturate(dot(n,halfVector)),wetExponent)*
-                 lerp(.08,.34,wetness)*shadow.visible;
+                 lerp(.08,.34,wetness)*keyVisibility;
     ambient+=lightningRadiance()*(.18+.10*along);
     float seedHead=blade.tall*smoothstep(.70,.79,along)*(1-smoothstep(.92,1.0,along))
                    *step(.84,clusteredDryness);
@@ -866,7 +1208,9 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float3 bary=float3(1-attr.barycentrics.x-attr.barycentrics.y,attr.barycentrics.x,attr.barycentrics.y);
     Vertex a=Vertices[i0],b=Vertices[i1],c=Vertices[i2];float3 geometricNormal=normalize(a.normal*bary.x+b.normal*bary.y+c.normal*bary.z);bool upperFace=dot(geometricNormal,WorldRayDirection())<0;float3 surfaceNormal=upperFace?geometricNormal:-geometricNormal;float3 n=surfaceNormal;float2 uv=a.uv*bary.x+b.uv*bary.y+c.uv*bary.z;
     float3 hit=WorldRayOrigin()+WorldRayDirection()*RayTCurrent();float3 albedo=srgbToLinear(unpackColor(a.color)*bary.x+unpackColor(b.color)*bary.y+unpackColor(c.color)*bary.z);
-    float material=a.material;float kind=floor(material+.001);bool thinFoliage=(kind>.5&&kind<1.5)||(kind>3.5&&kind<4.5);uint2 pixel=DispatchRaysIndex().xy;float2 random=float2(hash(pixel+camera.frameIndex*13),hash(pixel.yx+camera.frameIndex*29));
+    float material=a.material;float kind=floor(material+.001);
+    bool riverSurface=kind>5.5&&kind<6.5;
+    bool thinFoliage=(kind>.5&&kind<1.5)||(kind>3.5&&kind<4.5);uint2 pixel=DispatchRaysIndex().xy;float2 random=float2(hash(pixel+camera.frameIndex*13),hash(pixel.yx+camera.frameIndex*29));
     float barkCavity=0;
     if(kind<.5){
         float3 edge1=b.position-a.position,edge2=c.position-a.position;float2 delta1=b.uv-a.uv,delta2=c.uv-a.uv;float determinant=delta1.x*delta2.y-delta1.y*delta2.x;
@@ -883,6 +1227,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float terrainMicroHeight=.5,terrainMicroCoverage=0;
     float3 puddleNormal=float3(0,1,0);
     float puddleImpactBright=0,puddleImpactDark=0,puddleImpactCrown=0;
+    float riverCentreDepth=0;
     float terrainRetention=0,terrainSlope=0;
     float materialRoughness=kind<.5?.74:(kind<1.5?.40:(kind<2.5?.90:
                             (kind<3.5?.67:(kind<4.5?.48:.72))));
@@ -929,7 +1274,8 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float3 distantStone=lerp(float3(.105,.115,.098),float3(.225,.205,.165),fine);
         albedo=lerp(albedo,distantStone,mountainStone*.80);
 
-        float nearTextureWeight=(payload.depth==0?1.0:0.0)*(1-smoothstep(70.0,110.0,terrainDistance))*(1-mountainStone);
+        float nearTextureWeight=(payload.depth==0?1.0:0.0)*
+                                (1-smoothstep(70.0,110.0,terrainDistance));
         if(nearTextureWeight>.001){
             float2 textureWarp=float2(filteredValueNoise(hit.xz+float2(12.7,-8.3),.047,footprint),
                                       filteredValueNoise(hit.xz+float2(-29.1,44.6),.061,footprint))-.5;
@@ -980,6 +1326,27 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             float3 tangent=normalize(float3(1,-surfaceNormal.x/max(surfaceNormal.y,.12),0));
             float3 bitangent=normalize(cross(surfaceNormal,tangent));
             n=normalize(tangent*mapXY.x+bitangent*mapXY.y+surfaceNormal*mapZ);
+            // Tile 2 is the centimetre-scale mineral/soil atlas.  Apply it
+            // triplanarly where the biome exposes rock so near escarpments keep
+            // their fissures on vertical faces instead of stretching XZ UVs.
+            float rockWeight=smoothstep(.08,.72,mountainStone);
+            if(rockWeight>.001){
+                TriplanarGroundSample rock=sampleGroundTriplanar(
+                    hit,surfaceNormal,2u,groundLodA,normalLodA);
+                float3 rockFrequency=clamp(rock.albedo.rgb/max(rock.lowAlbedo.rgb,.012),
+                                           .64,1.46);
+                rockFrequency*=lerp(.92,1.09,rock.height);
+                float rockDetail=saturate(nearTextureWeight*
+                    clamp(camera.groundSettings.y,0.0,2.0));
+                albedo*=lerp(float3(1,1,1),rockFrequency,rockWeight*rockDetail);
+                float rockNormalStrength=nearTextureWeight*rockWeight*
+                    clamp(camera.groundSettings.x,0.0,2.0)*.78;
+                float3 rockNormal=applyTriplanarGroundNormal(
+                    surfaceNormal,rock.normalGradient,rockNormalStrength);
+                n=normalize(lerp(n,rockNormal,rockWeight));
+                terrainRoughness=lerp(terrainRoughness,rock.albedo.a,rockWeight);
+                terrainCavity=max(terrainCavity,rock.cavity*rockWeight*.68);
+            }
         }else{
             float frequency=lerp(1.4,.12,smoothstep(8.0,190.0,terrainDistance));
             float sampleStep=.18/frequency;
@@ -1042,8 +1409,8 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
                 puddleMask=saturate(retainedMask+lowlandMask-
                                     retainedMask*lowlandMask);
                 if(payload.depth==0&&puddleMask>.002){
-                    WaterSurfaceSample waterSurface=evaluatePuddleSurface(hit.xz,
-                                                                          footprint);
+                    WaterSurfaceSample waterSurface=evaluateWaterSurface(
+                        hit.xz,footprint,float2(0,0),0.0,0.0);
                     puddleNormal=waterSurface.normal;
                     puddleImpactBright=waterSurface.brightCrest;
                     puddleImpactDark=waterSurface.darkTrough;
@@ -1056,19 +1423,71 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         }
         materialRoughness=terrainRoughness;
     }
+    if(riverSurface){
+        float riverDistance=distance(camera.eye,hit);
+        float pixelWorld=2*riverDistance*camera.tanHalfFov/
+                         max(1.0,(float)camera.resolution.y);
+        float grazing=rcp(max(abs(dot(surfaceNormal,-WorldRayDirection())),.20));
+        float footprint=min(pixelWorld*sqrt(grazing),.60);
+
+        // uv.y is authored monotonically downstream for both the main river
+        // and tributary. Reconstruct dP/dv so the procedural wave field flows
+        // through bends instead of sliding along a fixed world axis.
+        float3 edge1=b.position-a.position,edge2=c.position-a.position;
+        float2 delta1=b.uv-a.uv,delta2=c.uv-a.uv;
+        float determinant=delta1.x*delta2.y-delta1.y*delta2.x;
+        float2 downstream=float2(0,1);
+        if(abs(determinant)>1e-8){
+            float3 dPdv=(edge2*delta1.x-edge1*delta2.x)/determinant;
+            if(dot(dPdv.xz,dPdv.xz)>1e-8)downstream=normalize(dPdv.xz);
+        }
+        WaterSurfaceSample waterSurface=evaluateWaterSurface(
+            hit.xz,footprint,downstream,.46,1.0);
+        puddleMask=1.0;
+        puddleNormal=upperFace?waterSurface.normal:-waterSurface.normal;
+        n=puddleNormal;
+        puddleImpactBright=waterSurface.brightCrest;
+        puddleImpactDark=waterSurface.darkTrough;
+        puddleImpactCrown=waterSurface.crownFoam;
+        materialRoughness=lerp(.012,.042,saturate(g_RainIntensity));
+
+        // The generated strip is shallow at its banks and deepest at the
+        // centre. Beer-Lambert attenuation exposes a muted gravel bed near
+        // shore while the channel becomes blue-green through scattering.
+        riverCentreDepth=pow(saturate(1-abs(uv.x*2-1)),.70);
+        float depth=lerp(.055,.72,riverCentreDepth);
+        float opticalPath=depth/max(abs(dot(puddleNormal,
+                                             -WorldRayDirection())),.18);
+        float3 transmission=exp(-float3(2.30,.72,.38)*opticalPath);
+        float3 riverBed=srgbToLinear(float3(.105,.086,.052));
+        float3 bodyScatter=srgbToLinear(float3(.030,.105,.135));
+        albedo=riverBed*transmission+bodyScatter*(1-transmission);
+    }
     if(kind>2.5&&kind<3.5){
-        float rockVariant=round(frac(material)*10);float epsilon=.014;
-        float hx0=rockRelief(hit-float3(epsilon,0,0),rockVariant),hx1=rockRelief(hit+float3(epsilon,0,0),rockVariant);
-        float hy0=rockRelief(hit-float3(0,epsilon,0),rockVariant),hy1=rockRelief(hit+float3(0,epsilon,0),rockVariant);
-        float hz0=rockRelief(hit-float3(0,0,epsilon),rockVariant),hz1=rockRelief(hit+float3(0,0,epsilon),rockVariant);
-        float3 gradient=float3(hx1-hx0,hy1-hy0,hz1-hz0)/(2*epsilon);
-        gradient-=surfaceNormal*dot(gradient,surfaceNormal);
-        n=normalize(surfaceNormal-gradient*lerp(.030,.052,saturate(rockVariant*.5)));
-        float2 stoneCoordinates=float2(dot(hit,float3(.73,.27,.19)),dot(hit,float3(-.21,.46,.81)));
-        float mineral=valueNoise(stoneCoordinates*4.2);float fissure=pow(saturate(1-abs(valueNoise3(hit*5.4+rockVariant*9.0)*2-1)),13);
+        float rockVariant=round(frac(material)*10);
+        float rockDistance=distance(camera.eye,hit);
+        float rockPixel=2*rockDistance*camera.tanHalfFov/max(1.0,(float)camera.resolution.y);
+        float rockGrazing=rcp(max(abs(dot(surfaceNormal,-WorldRayDirection())),.20));
+        float rockLod=clamp(log2(max(rockPixel*512.0*pow(rockGrazing,.25),1.0))-.70,
+                            0.0,10.0);
+        TriplanarGroundSample rock=sampleGroundTriplanar(
+            hit+float3(2.73,-1.91,4.17)*rockVariant,surfaceNormal,2u,
+            rockLod,max(0.0,rockLod-1.0));
+        n=applyTriplanarGroundNormal(surfaceNormal,rock.normalGradient,
+                                     lerp(.70,.88,saturate(rockVariant*.5)));
+        float3 mineralFrequency=clamp(rock.albedo.rgb/max(rock.lowAlbedo.rgb,.012),
+                                      .62,1.48);
+        float2 stoneCoordinates=float2(dot(hit,float3(.73,.27,.19)),
+                                       dot(hit,float3(-.21,.46,.81)));
+        float mineral=valueNoise(stoneCoordinates*2.1);
+        float fissure=saturate(rock.cavity*.82+
+            pow(saturate(1-abs(valueNoise3(hit*2.7+rockVariant*9.0)*2-1)),13)*.30);
         float lichen=smoothstep(.56,.90,geometricNormal.y)*smoothstep(.60,.84,fbm(hit.xz*.23+11.7));
         float3 speciesTone=rockVariant<.5?float3(1.02,.98,.91):(rockVariant<1.5?float3(.94,.97,1.03):float3(.88,.91,.86));
-        albedo*=speciesTone*lerp(.76,1.14,mineral);albedo=lerp(albedo,srgbToLinear(float3(.055,.048,.039)),fissure*.70);albedo=lerp(albedo,srgbToLinear(float3(.18,.22,.075)),lichen*.34);
+        albedo*=speciesTone*mineralFrequency*lerp(.86,1.08,mineral);
+        albedo=lerp(albedo,srgbToLinear(float3(.055,.048,.039)),fissure*.72);
+        albedo=lerp(albedo,srgbToLinear(float3(.18,.22,.075)),lichen*.34);
+        materialRoughness=rock.albedo.a;
     }
     if(kind>4.5&&kind<5.5){
         float grain=valueNoise(float2(uv.x*7.0+uv.y*.15,uv.y*2.1));albedo*=lerp(.72,1.10,grain);
@@ -1076,7 +1495,8 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float wetScale=kind<.5?.52:(kind<1.5?.60:(kind<2.5?1.0:
                    (kind<3.5?.88:(kind<4.5?.62:.46))));
     float rainExposure=lerp(.56,1.0,saturate(surfaceNormal.y));
-    float wetness=saturate(g_WetnessFactor*wetScale*rainExposure);
+    float wetness=riverSurface?1.0:
+        saturate(g_WetnessFactor*wetScale*rainExposure);
     if(kind>1.5&&kind<2.5){
         // A thin film remains after rain, but exposed slopes drain faster and
         // concave catchments stay saturated longer.
@@ -1085,7 +1505,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             saturate(.65*terrainRetention+.35*slopeRunoff)));
     }
     wetness=max(wetness,puddleMask);
-    albedo*=lerp(1.0,.55,wetness);
+    if(!riverSurface)albedo*=lerp(1.0,.55,wetness);
     // A rain-ring trough slightly increases optical path length through the
     // shallow water. Keep this subtle: most of the impact remains reflective.
     albedo*=1-puddleMask*puddleImpactDark*.045;
@@ -1105,17 +1525,18 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     }
 
     float3 baseSun=directionToKeyLight(),sunTangent=normalize(cross(abs(baseSun.y)<.9?float3(0,1,0):float3(1,0,0),baseSun)),sunBitangent=cross(baseSun,sunTangent);float diskRadius=sqrt(random.x)*.0065,angle=random.y*6.2831853;float3 sunDir=normalize(baseSun+sunTangent*cos(angle)*diskRadius+sunBitangent*sin(angle)*diskRadius);
-    VisibilityPayload shadow;shadow.visible=0;RayDesc s;s.Origin=hit+(thinFoliage?sunDir:surfaceNormal)*.012;s.Direction=sunDir;s.TMin=.01;s.TMax=2200;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,s,shadow);
-    float visibility=float(shadow.visible);
+    VisibilityPayload shadow;shadow.visible=0;RayDesc s;s.Origin=hit+(thinFoliage?sunDir:surfaceNormal)*.012;s.Direction=sunDir;s.TMin=.01;s.TMax=SceneRayMaximum;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,s,shadow);
+    float cloudTransmission=cloudKeyTransmittance(hit);
+    float visibility=float(shadow.visible)*cloudTransmission;
     if(payload.depth==0)payload.primaryKeyVisibility=visibility;
     // The old ground path launched three additional soft-shadow rays, AO and
     // a bounce ray for nearly every screen pixel.  One stochastic sun sample
     // converges on static frames; terrain cavity/normal maps provide the local
     // ground occlusion without another traversal.
-    bool terrainSurface=kind>1.5&&kind<2.5;
+    bool terrainSurface=(kind>1.5&&kind<2.5)||riverSurface;
     VisibilityPayload ao;ao.visible=1;if(payload.depth==0&&!terrainSurface){ao.visible=0;RayDesc ar;ar.Origin=hit+surfaceNormal*.015;ar.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*47),hash(pixel.yx+camera.frameIndex*71)));ar.TMin=.01;ar.TMax=1.35;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,ar,ao);}
     float3 keyRadiance=keyLightRadiance();
-    float ndl=saturate(dot(n,sunDir));float occlusion=lerp(.76,1.0,float(ao.visible));float3 ambient=skyIrradiance(n)*(.48+.16*saturate(n.y))*occlusion;ambient+=lerp(float3(.010,.014,.020),float3(.20,.17,.12),daylightAmount())*(.08+.14*saturate(-n.y));ambient+=lightningRadiance()*(.16+.14*saturate(n.y));float3 direct=keyRadiance*ndl*visibility*1.28;float3 unmodulated=0;
+    float ndl=saturate(dot(n,sunDir));float occlusion=lerp(.76,1.0,float(ao.visible));float3 ambient=skyIrradiance(n)*(.48+.16*saturate(n.y))*occlusion;float cloudShade=1-cloudTransmission;ambient=ambient*lerp(1.0,1.10,cloudShade)+float3(.014,.022,.034)*daylightAmount()*cloudShade;ambient+=lerp(float3(.010,.014,.020),float3(.20,.17,.12),daylightAmount())*(.08+.14*saturate(-n.y));ambient+=lightningRadiance()*(.16+.14*saturate(n.y));float3 direct=keyRadiance*ndl*visibility*1.28;float3 unmodulated=0;
     // Restrict the additional traversal to visible primary surfaces inside
     // the finite local-light range. Secondary/bounce hits retain the current performance
     // budget, while direct local shadows remain exact for the displayed scene.
@@ -1127,6 +1548,13 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
                 hit,localLight.direction,localLight.distance);
             direct+=localLight.radiance*localNdotL*localVisibility;
         }
+    }
+    if(riverSurface){
+        // Water transmits illumination to its bed rather than behaving like a
+        // matte blue plane. The dominant visible energy still comes from the
+        // dielectric reflection path below.
+        ambient*=lerp(.90,.68,riverCentreDepth);
+        direct*=lerp(.34,.12,riverCentreDepth);
     }
     if(kind<.5)ambient*=lerp(1,.68,barkCavity);
     if(kind>1.5&&kind<2.5){
@@ -1177,7 +1605,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float waterFresnel=.0204+.9796*
             pow(1-saturate(dot(puddleNormal,viewDirection)),5);
         RadiancePayload reflection;reflection.color=result;reflection.depth=1;
-        reflection.primaryT=2200;reflection.primaryKeyVisibility=1;
+        reflection.primaryT=SceneRayMaximum;reflection.primaryKeyVisibility=1;
         // The bounded wave normal supplies distortion. Blend back toward a
         // nearly level reflection whenever that distortion approaches the
         // terrain horizon so a ripple cannot launch a ray into the ground.
@@ -1191,7 +1619,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             reflectionDirection=levelReflection;
         RayDesc reflectedRay;reflectedRay.Origin=hit+puddleNormal*.020;
         reflectedRay.Direction=reflectionDirection;
-        reflectedRay.TMin=.014;reflectedRay.TMax=2200;
+        reflectedRay.TMin=.014;reflectedRay.TMax=SceneRayMaximum;
         float reflectionWeight=puddleMask*waterFresnel*
             lerp(.88,1.0,smoothstep(.18,.82,puddleMask));
         float impactReflection=clamp(1+puddleImpactBright*.045+

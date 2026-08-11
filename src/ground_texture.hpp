@@ -7,10 +7,17 @@
 namespace dense {
 
 enum class GroundMaterialTile : uint32_t {
-    DenseShortTurf = 0,
-    CoarseMeadow = 1,
-    WornSoil = 2,
-    CloverMoss = 3,
+    // The numeric order is part of the CPU/HLSL ABI.  The more descriptive
+    // names below retain aliases for older call sites while making the atlas
+    // useful to the world-map biome pass.
+    MeadowTurf = 0,
+    UplandShortTurf = 1,
+    ExposedRockSoil = 2,
+    RiparianMoss = 3,
+    DenseShortTurf = MeadowTurf,
+    CoarseMeadow = UplandShortTurf,
+    WornSoil = ExposedRockSoil,
+    CloverMoss = RiparianMoss,
 };
 
 struct GroundTextureMip {
@@ -38,12 +45,33 @@ struct GroundTextureAtlas {
     std::vector<GroundTextureMip> normalHeightCavity;
 
     // B=0 and B=1 map to -amplitude and +amplitude respectively.
-    std::array<float,tileCount> heightAmplitudeMetres{.010f,.018f,.022f,.012f};
+    std::array<float,tileCount> heightAmplitudeMetres{.010f,.014f,.038f,.016f};
+};
+
+struct GroundBiomeInput {
+    float elevationMetres{};
+    // Rise/run, rather than degrees, so terrain normals can supply this as
+    // length(normal.xz) / normal.y without an atan in population loops.
+    float slopeGradient{};
+    float riverDistanceMetres{1000.0f};
+    float moisture{0.5f};
+    // Broad erosion/geology noise in [0,1].  This prevents a single contour
+    // line from looking like a painted biome boundary.
+    float exposure{};
+};
+
+struct GroundBiomeWeights {
+    std::array<float,GroundTextureAtlas::tileCount> material{};
 };
 
 // Atlas quadrants are ordered top-left, top-right, bottom-left, bottom-right,
 // matching GroundMaterialTile's numeric values. Every tile and every mip is
 // generated independently from the supplied seed.
 [[nodiscard]] GroundTextureAtlas makeGroundTextureAtlas(uint32_t seed = 0x67726f75u);
+
+// Produces a normalized, smoothly blended biome mixture.  It deliberately
+// depends only on sampled terrain/river values so EnvironmentGenerator and
+// tests can share it without coupling the material system to terrainHeight().
+[[nodiscard]] GroundBiomeWeights groundBiomeWeights(const GroundBiomeInput& input);
 
 } // namespace dense
