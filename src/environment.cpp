@@ -13,6 +13,41 @@ float smoothStep(float low,float high,float value) {
     return t*t*(3.0f-2.0f*t);
 }
 
+float meadowHash(float x,float z) {
+    const float value=std::sin(x*127.1f+z*311.7f)*43758.5453123f;
+    return value-std::floor(value);
+}
+
+float meadowValueNoise(float x,float z) {
+    const float cellX=std::floor(x),cellZ=std::floor(z);
+    const float localX=x-cellX,localZ=z-cellZ;
+    const float blendX=localX*localX*(3.0f-2.0f*localX);
+    const float blendZ=localZ*localZ*(3.0f-2.0f*localZ);
+    const float a=meadowHash(cellX,cellZ),b=meadowHash(cellX+1,cellZ);
+    const float c=meadowHash(cellX,cellZ+1),d=meadowHash(cellX+1,cellZ+1);
+    return (a+(b-a)*blendX)+((c+(d-c)*blendX)-(a+(b-a)*blendX))*blendZ;
+}
+
+struct MeadowColourFields {
+    float fertility;
+    float dryColony;
+    float lushColony;
+    float warmCool;
+};
+
+MeadowColourFields meadowColourFields(float x,float z) {
+    const float rotatedX=.819f*x+.574f*z,rotatedZ=-.574f*x+.819f*z;
+    const float broad=meadowValueNoise(x*.019f+17.3f,z*.019f-9.1f);
+    const float colony=meadowValueNoise(rotatedX*.064f-31.7f,rotatedZ*.064f+22.4f);
+    const float subclump=meadowValueNoise((x+rotatedX*.37f)*.17f+8.6f,
+                                          (z+rotatedZ*.37f)*.17f+41.2f);
+    const float fertility=clamp(.52f*broad+.33f*colony+.15f*subclump,0.0f,1.0f);
+    const float dry=smoothStep(.68f,.88f,.62f*colony+.38f*(1-broad));
+    const float lush=smoothStep(.60f,.84f,.58f*broad+.42f*subclump);
+    const float warmCool=clamp((colony-.5f)*1.4f+(broad-.5f)*.6f,-1.0f,1.0f);
+    return {fertility,dry,lush,warmCool};
+}
+
 float gaussian(float x,float z,float cx,float cz,float rx,float rz) {
     const float dx=(x-cx)/rx,dz=(z-cz)/rz;
     return std::exp(-(dx*dx+dz*dz));
@@ -385,6 +420,7 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         const float z=-grassHalfExtent+(iz+grassRng.range(.13f,.87f))*cell;
         const float radius=std::sqrt(x*x+z*z);
         if(radius>grassHalfExtent-.25f||radius<1.05f)continue;
+        const MeadowColourFields colour=meadowColourFields(x,z);
 
         float islandStrength=0;
         for(const auto& island:islands) {
@@ -398,14 +434,14 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         // rather than a handful of isolated vertical tufts.
         const bool tall=grassRng.unit()<(.50f+.24f*islandStrength);
         const float canopyShade=1.0f-.26f*(1.0f-smoothStep(5.0f,11.0f,radius));
-        const float meadowVariation=.72f+.28f*(.5f+.5f*std::sin(x*.31f+z*.19f));
+        const float meadowVariation=.78f+.25f*colour.fertility;
         const float density=std::min(1.0f,canopyShade*meadowVariation*(tall?1.18f:1.0f));
         if(grassRng.unit()>density)continue;
 
         const float baseY=terrainHeight(x,z)+.006f;
         const Vec3 normal=terrainNormal(x,z);
-        const float moisture=clamp(.58f+.20f*std::sin(x*.12f-z*.09f)+
-                                   grassRng.range(-.13f,.13f),0,1);
+        const float moisture=clamp(.58f+(colour.fertility-.5f)*.34f+
+                                   grassRng.range(-.018f,.018f),0,1);
         const float shortHeight=grassRng.range(.045f,.120f)*(.88f+.17f*moisture);
         const float tallHeight=tall?grassRng.range(.42f,.84f)*(.88f+.17f*moisture):0.0f;
         const uint32_t shortCode=static_cast<uint32_t>(clamp(shortHeight/.004f,1,255));
@@ -429,7 +465,9 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         mesh.grassPatches.push_back({x-horizontalReach,baseY-lowerReach,
                                      z-horizontalReach,x+horizontalReach,
                                      baseY+upperReach,z+horizontalReach,
-                                     grassRng.next(),packed,baseY,normal.x,normal.z,moisture});
+                                     grassRng.next(),packed,baseY,normal.x,normal.z,moisture,
+                                     colour.fertility,colour.dryColony,colour.lushColony,
+                                     colour.warmCool});
         if(tall)++mesh.tallGrassPatchCount;
     }
 

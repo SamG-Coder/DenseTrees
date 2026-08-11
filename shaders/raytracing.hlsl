@@ -10,13 +10,19 @@ struct Camera {
     float4 grassSettings;
     float4 groundSettings;
 };
-struct RadiancePayload { float3 color; uint depth; float primaryT; };
+struct RadiancePayload {
+    float3 color;
+    uint depth;
+    float primaryT;
+    float primarySunVisibility;
+};
 struct VisibilityPayload { uint visible; };
 struct GrassPatch {
     float minX, minY, minZ;
     float maxX, maxY, maxZ;
     uint seed, packed;
     float baseY, normalX, normalZ, moisture;
+    float colourFertility, colourDryColony, colourLushColony, colourWarmCool;
 };
 struct GrassAttributes { float2 encoded; };
 
@@ -169,6 +175,7 @@ void RayGen() {
     // sample keeps the path tracer from paying twice for animated geometry;
     // static frames still converge through the accumulation buffer.
     uint spatialSamples=1u;float3 frameColor=0;float sceneDepth=2200.0;
+    float frameSunVisibility=0;
     [loop] for(uint sampleIndex=0;sampleIndex<spatialSamples;++sampleIndex){
         float2 jitter;
         if(camera.maxFrames>1u)jitter=float2(hash(pixel+camera.frameIndex*17),hash(pixel.yx+camera.frameIndex*31))-.5;
@@ -176,20 +183,27 @@ void RayGen() {
         float2 uv=((float2(pixel)+.5+jitter)/float2(camera.resolution))*2-1;uv.y=-uv.y;
         RayDesc ray;ray.Origin=camera.eye;ray.Direction=normalize(camera.forward+camera.right*uv.x*camera.aspect*camera.tanHalfFov+camera.up*uv.y*camera.tanHalfFov);ray.TMin=.02;ray.TMax=2200;
         RadiancePayload payload;payload.color=0;payload.depth=0;payload.primaryT=2200.0;
+        payload.primarySunVisibility=1;
         TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,ray,payload);
         frameColor+=payload.color;
+        frameSunVisibility+=payload.primarySunVisibility;
         sceneDepth=min(sceneDepth,payload.primaryT*max(dot(ray.Direction,camera.forward),.001));
     }
     frameColor/=float(spatialSamples);
+    frameSunVisibility/=float(spatialSamples);
     float4 previous=Accumulation[pixel];float history=min(float(camera.frameIndex),float(max(camera.maxFrames,1u)-1u));float3 accumulated=(previous.rgb*history+frameColor)/(history+1);
+    float accumulatedSunVisibility=camera.frameIndex==0u?frameSunVisibility:
+        (camera.frameIndex<camera.maxFrames?
+            (Output[pixel].a*history+frameSunVisibility)/(history+1):Output[pixel].a);
     Accumulation[pixel]=float4(accumulated,sceneDepth);
-    Output[pixel]=float4(linearToSrgb(colorGrade(tonemap(accumulated*camera.exposure))),1);
+    Output[pixel]=float4(linearToSrgb(colorGrade(tonemap(accumulated*camera.exposure))),
+                         accumulatedSunVisibility);
 }
 
 [shader("miss")]
 void RadianceMiss(inout RadiancePayload payload) {
     payload.color=environmentRadiance(WorldRayDirection());
-    if(payload.depth==0)payload.primaryT=2200.0;
+    if(payload.depth==0){payload.primaryT=2200.0;payload.primarySunVisibility=1;}
 }
 [shader("miss")]
 void VisibilityMiss(inout VisibilityPayload payload) { payload.visible=1; }
@@ -394,14 +408,18 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
     bool front=dot(geometricNormal,WorldRayDirection())<0;
     float3 n=front?geometricNormal:-geometricNormal;
     float3 hit=WorldRayOrigin()+WorldRayDirection()*RayTCurrent();
+    float clusteredDryness=saturate(blade.dryness+patch.colourDryColony*.15-
+                                    patch.colourLushColony*.08);
     float dryThreshold=lerp(.82,.94,patch.moisture);
-    float dry=smoothstep(dryThreshold-.03,dryThreshold+.03,blade.dryness);
+    float dry=smoothstep(dryThreshold-.03,dryThreshold+.03,clusteredDryness);
     float3 green=lerp(float3(.040,.068,.014),float3(.095,.155,.030),
                       saturate(.28+.55*patch.moisture));
-    green*=blade.species<.5?float3(.97,1.03,.91):
-           (blade.species<1.5?float3(1.04,.98,.90):float3(.92,1.01,1.02));
+    green*=1.0+patch.colourWarmCool*float3(.035,.006,-.045);
+    green*=lerp(float3(.86,.93,.83),float3(1.10,1.08,.91),patch.colourFertility);
+    green=lerp(green,green*float3(1.10,1.01,.76),patch.colourDryColony*.22);
     green*=lerp(.72,1.04,smoothstep(0,.70,along));
-    float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along);
+    float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along)*
+                  lerp(.90,1.10,patch.colourDryColony);
     float3 albedo=lerp(green,straw,dry);
     float3 sun=directionToSun();uint2 pixel=DispatchRaysIndex().xy;
     float2 random=float2(hash(pixel+camera.frameIndex*131),
@@ -414,6 +432,7 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
     ray.Direction=sun;ray.TMin=.003;ray.TMax=1000;
     TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
              0x1,1,0,1,ray,shadow);
+    if(payload.depth==0)payload.primarySunVisibility=float(shadow.visible);
     float frontLight=saturate(dot(n,sun)),backLight=saturate(dot(-n,sun));
     float3 ambient=skyIrradiance(n)*(.50+.18*along);
     float3 direct=float3(1.02,.94,.73)*frontLight*shadow.visible*1.18;
@@ -421,7 +440,7 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
     float3 view=normalize(camera.eye-hit),halfVector=normalize(sun+view);
     direct+=pow(saturate(dot(n,halfVector)),22)*.08*shadow.visible;
     float seedHead=blade.tall*smoothstep(.70,.79,along)*(1-smoothstep(.92,1.0,along))
-                  *step(.84,blade.dryness);
+                   *step(.84,clusteredDryness);
     albedo=lerp(albedo,float3(.30,.27,.10),seedHead*.46);
     float3 result=albedo*(ambient+direct)*lerp(.58,1.0,smoothstep(0,.22,along));
     payload.color=applyAerialPerspective(result,hit,WorldRayDirection());
@@ -565,6 +584,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float3 baseSun=directionToSun(),sunTangent=normalize(cross(abs(baseSun.y)<.9?float3(0,1,0):float3(1,0,0),baseSun)),sunBitangent=cross(baseSun,sunTangent);float diskRadius=sqrt(random.x)*.0065,angle=random.y*6.2831853;float3 sunDir=normalize(baseSun+sunTangent*cos(angle)*diskRadius+sunBitangent*sin(angle)*diskRadius);
     VisibilityPayload shadow;shadow.visible=0;RayDesc s;s.Origin=hit+(thinFoliage?sunDir:surfaceNormal)*.012;s.Direction=sunDir;s.TMin=.01;s.TMax=2200;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,s,shadow);
     float visibility=float(shadow.visible);
+    if(payload.depth==0)payload.primarySunVisibility=visibility;
     // The old ground path launched three additional soft-shadow rays, AO and
     // a bounce ray for nearly every screen pixel.  One stochastic sun sample
     // converges on static frames; terrain cavity/normal maps provide the local
@@ -596,6 +616,6 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     if(kind>2.5&&kind<3.5)ambient*=.86;
     if(kind>4.5&&kind<5.5)ambient*=.84;
     float3 result=albedo*(ambient+direct);
-    if(payload.depth==0&&!terrainSurface){RadiancePayload bounce;bounce.color=0;bounce.depth=1;bounce.primaryT=6;RayDesc br;br.Origin=hit+surfaceNormal*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=6;TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}
+    if(payload.depth==0&&!terrainSurface){RadiancePayload bounce;bounce.color=0;bounce.depth=1;bounce.primaryT=6;bounce.primarySunVisibility=1;RayDesc br;br.Origin=hit+surfaceNormal*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=6;TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}
     payload.color=applyAerialPerspective(result,hit,WorldRayDirection());
 }

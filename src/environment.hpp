@@ -19,8 +19,15 @@ struct GrassPatchGpu {
     float normalX{};
     float normalZ{};
     float moisture{};
+    // Coherent, world-space meadow colour fields generated once per patch.
+    // Keeping a 64-byte stride makes GPU structured-buffer reads efficient
+    // while avoiding billions of repeated noise evaluations in the VS.
+    float colourFertility{};
+    float colourDryColony{};
+    float colourLushColony{};
+    float colourWarmCool{};
 };
-static_assert(sizeof(GrassPatchGpu) == 48);
+static_assert(sizeof(GrassPatchGpu) == 64);
 static_assert(offsetof(GrassPatchGpu,maxX) == 12);
 static_assert(offsetof(GrassPatchGpu,seed) == 24);
 

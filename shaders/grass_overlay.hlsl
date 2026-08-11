@@ -15,6 +15,7 @@ struct GrassPatch {
     float maxX, maxY, maxZ;
     uint seed, packed;
     float baseY, normalX, normalZ, moisture;
+    float colourFertility, colourDryColony, colourLushColony, colourWarmCool;
 };
 
 Texture2D<float4> SceneDepth : register(t0);
@@ -231,6 +232,7 @@ struct VSOutput {
     float4 bladeParameters : TEXCOORD3;
     float coverage : TEXCOORD4;
     nointerpolation uint ditherSeed : TEXCOORD5;
+    nointerpolation float4 colourFields : TEXCOORD6;
 };
 
 VSOutput inactiveVertex() {
@@ -289,10 +291,11 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
     float3 tangent1=bladeTangent(blade,motion,along1);
     float3 ribbonSide0=cameraFacingSide(center0,tangent0,blade.side);
     float3 ribbonSide1=cameraFacingSide(center1,tangent1,blade.side);
-    float3 ribbonNormal0=normalize(cross(ribbonSide0,tangent0));
-    float3 ribbonNormal1=normalize(cross(ribbonSide1,tangent1));
-    if(dot(ribbonNormal0,camera.eye-center0)<0)ribbonNormal0=-ribbonNormal0;
-    if(dot(ribbonNormal1,camera.eye-center1)<0)ribbonNormal1=-ribbonNormal1;
+    // The ribbon turns toward the camera for robust sub-pixel coverage, but
+    // lighting follows the blade's persistent biological plane.  Otherwise
+    // rotating the camera also rotates every grass normal and its shadow tone.
+    float3 shadingNormal0=normalize(cross(blade.side,tangent0));
+    float3 shadingNormal1=normalize(cross(blade.side,tangent1));
 
     float physicalWidth0=bladePhysicalHalfWidth(blade,along0);
     float physicalWidth1=bladePhysicalHalfWidth(blade,along1);
@@ -313,7 +316,7 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
     float sideSign=right?1.0:-1.0;
     float3 center=upper?center1:center0;
     float3 ribbonSide=upper?ribbonSide1:ribbonSide0;
-    float3 ribbonNormal=upper?ribbonNormal1:ribbonNormal0;
+    float3 shadingNormal=upper?shadingNormal1:shadingNormal0;
     float physicalWidth=upper?physicalWidth1:physicalWidth0;
     float renderWidth=upper?renderWidth1:renderWidth0;
     float3 worldPosition=center+ribbonSide*(renderWidth*sideSign);
@@ -321,23 +324,14 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
     VSOutput output;
     output.position=projectWorld(worldPosition);
     output.worldPosition=worldPosition;
-    output.normal=ribbonNormal;
+    output.normal=shadingNormal;
     output.bladeCoordinates=float2(sideSign,along);
     output.bladeParameters=float4(blade.dryness,blade.tall,blade.species,patch.moisture);
     output.coverage=distanceCoverage*saturate(physicalWidth/max(renderWidth,1e-5));
     output.ditherSeed=selection;
+    output.colourFields=float4(patch.colourFertility,patch.colourDryColony,
+                               patch.colourLushColony,patch.colourWarmCool);
     return output;
-}
-
-uint bayer2(uint2 p) {
-    return p.y==0u?(p.x==0u?0u:2u):(p.x==0u?3u:1u);
-}
-
-float orderedThreshold(uint2 pixel,uint seed) {
-    uint2 offset=uint2(hashUint(seed)&3u,hashUint(seed^0x9e3779b9u)&3u);
-    uint2 p=(pixel+offset)&3u;
-    uint value=4u*bayer2(p&1u)+bayer2((p>>1u)&1u);
-    return (float(value)+.5)*(1.0/16.0);
 }
 
 float4 PSMain(VSOutput input) : SV_Target0 {
@@ -350,41 +344,57 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float edgeDistance=1-abs(input.bladeCoordinates.x);
     float edgeWidth=max(fwidth(input.bladeCoordinates.x),1e-4);
     float edgeCoverage=saturate(edgeDistance/edgeWidth+.5);
-    float coverage=saturate(input.coverage*edgeCoverage);
-    clip(coverage-orderedThreshold(pixel,input.ditherSeed));
+    // Preserve the airy optical coverage of the original ray-traced meadow.
+    // More generated blades add geometric detail, not an opaque green wall.
+    float densityScale=max(camera.grassSettings.x,.001);
+    float densityCompensation=pow(min(1.0,3.0/densityScale),.72);
+    float coverage=saturate(input.coverage*edgeCoverage*.58*densityCompensation);
+    // Match the original ray-traced grass coverage: a stable, decorrelated
+    // stochastic test per blade and pixel.  Ordered 4x4 dithering made dense
+    // meadows read as an opaque screen and exposed a visible repeating grid.
+    uint coverageSeed=input.ditherSeed^(pixel.x*0x85ebca6bu)^(pixel.y*0xc2b2ae35u);
+    clip(coverage-randomUint(coverageSeed));
 
     float along=saturate(input.bladeCoordinates.y);
     float dryness=input.bladeParameters.x;
     float tall=input.bladeParameters.y;
-    float species=input.bladeParameters.z;
     float moisture=input.bladeParameters.w;
+    float fertile=input.colourFields.x;
+    float dryColony=input.colourFields.y;
+    float lushColony=input.colourFields.z;
+    float warmCool=input.colourFields.w;
+    dryness=saturate(dryness+dryColony*.15-lushColony*.08);
     float dryThreshold=lerp(.82,.94,moisture);
     float dry=smoothstep(dryThreshold-.03,dryThreshold+.03,dryness);
     float3 green=lerp(float3(.040,.068,.014),float3(.095,.155,.030),
                       saturate(.28+.55*moisture));
-    green*=species<.5?float3(.97,1.03,.91):
-           (species<1.5?float3(1.04,.98,.90):float3(.92,1.01,1.02));
+    green*=1.0+warmCool*float3(.035,.006,-.045);
+    green*=lerp(float3(.86,.93,.83),float3(1.10,1.08,.91),fertile);
+    green=lerp(green,green*float3(1.10,1.01,.76),dryColony*.22);
     green*=lerp(.72,1.04,smoothstep(0,.70,along));
-    float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along);
+    float3 straw=float3(.145,.122,.042)*lerp(.82,1.06,along)*
+                  lerp(.90,1.10,dryColony);
     float3 albedo=lerp(green,straw,dry);
     float seedHead=tall*smoothstep(.70,.79,along)*(1-smoothstep(.92,1.0,along))
                   *step(.84,dryness);
     albedo=lerp(albedo,float3(.30,.27,.10),seedHead*.46);
 
+    float3 view=normalize(camera.eye-input.worldPosition);
     float3 n=normalize(input.normal);
+    if(dot(n,view)<0)n=-n;
     float3 sun=directionToSun();
-    float3 sceneLinear=srgbToLinear(SceneColor.Load(int3(int2(pixel),0)).rgb);
-    float sceneLuminance=dot(sceneLinear,float3(.2126,.7152,.0722));
-    float localVisibility=lerp(.30,1.0,smoothstep(.018,.16,sceneLuminance));
+    // DXR stores the primary surface's actual direct-sun visibility in alpha.
+    // Inferring it from display luminance double-shadowed grass over the tree
+    // shadow and incorrectly treated dark bark/soil as occlusion.
+    float sunVisibility=SceneColor.Load(int3(int2(pixel),0)).a;
     float frontLight=saturate(dot(n,sun));
     float backLight=saturate(dot(-n,sun));
-    float3 ambient=skyIrradiance(n)*(.50+.18*along)*lerp(.72,1.0,localVisibility);
-    float3 direct=float3(1.02,.94,.73)*frontLight*localVisibility*1.18;
-    direct+=float3(.42,.74,.20)*backLight*localVisibility*.72;
-    float3 view=normalize(camera.eye-input.worldPosition);
+    float3 ambient=.5*(skyIrradiance(n)+skyIrradiance(-n))*(.50+.18*along);
+    float3 direct=float3(1.02,.94,.73)*frontLight*sunVisibility*1.18;
+    direct+=float3(.42,.74,.20)*backLight*sunVisibility*.72;
     float3 halfVector=normalize(sun+view);
-    direct+=pow(saturate(dot(n,halfVector)),22)*.08*localVisibility;
-    float3 result=albedo*(ambient+direct)*lerp(.58,1.0,smoothstep(0,.22,along));
+    direct+=pow(saturate(dot(n,halfVector)),22)*.08*sunVisibility;
+    float3 result=albedo*(ambient+direct)*lerp(.72,1.0,smoothstep(0,.22,along));
     float3 rayDirection=normalize(input.worldPosition-camera.eye);
     result=applyAerialPerspective(result,input.worldPosition,rayDirection);
     float3 displayColor=linearToSrgb(colorGrade(tonemap(result*camera.exposure)));

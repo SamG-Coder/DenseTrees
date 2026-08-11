@@ -155,6 +155,15 @@ int main() {
                                                     patch.normalZ*patch.normalZ));
         require(normalY>.70f&&patch.moisture>=0&&patch.moisture<=1,
                 "grass patch has invalid terrain alignment or moisture");
+        require(std::isfinite(patch.colourFertility)&&
+                    std::isfinite(patch.colourDryColony)&&
+                    std::isfinite(patch.colourLushColony)&&
+                    std::isfinite(patch.colourWarmCool)&&
+                    patch.colourFertility>=0&&patch.colourFertility<=1&&
+                    patch.colourDryColony>=0&&patch.colourDryColony<=1&&
+                    patch.colourLushColony>=0&&patch.colourLushColony<=1&&
+                    patch.colourWarmCool>=-1&&patch.colourWarmCool<=1,
+                "grass patch colour domains are invalid");
         if(i<64){
             const auto& copy=environmentCopy.grassPatches[i];
             require(patch.seed==copy.seed&&patch.packed==copy.packed&&patch.baseY==copy.baseY&&
