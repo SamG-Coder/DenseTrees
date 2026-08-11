@@ -171,6 +171,36 @@ int main() {
     }
     require(dense::EnvironmentGenerator::riverCenterX(0.0f)>250.0f,
             "main river intruded into the hero-tree clearing");
+    for(const float z:std::array<float,5>{-2400.0f,-1200.0f,0.0f,1200.0f,2400.0f}){
+        const float center=dense::EnvironmentGenerator::riverCenterX(z);
+        const float wetHalfWidth=dense::EnvironmentGenerator::riverWaterHalfWidth(z);
+        require(std::abs(wetHalfWidth/
+                         dense::EnvironmentGenerator::riverHalfWidth(z)-.90f)<1.0e-5f,
+                "main river terrain and water use different wetted widths");
+        for(const float side:std::array<float,2>{-1.0f,1.0f}){
+            const float bank=dense::EnvironmentGenerator::terrainHeight(
+                center+side*wetHalfWidth,z);
+            const float depth=dense::EnvironmentGenerator::riverSurfaceHeight(z)-bank;
+            require(depth>.075f&&depth<.085f,
+                    "main river analytic shoreline is detached from its shallow bank");
+        }
+    }
+    constexpr float tributaryBankTestX=-1600.0f;
+    const float tributaryWetHalfWidth=
+        dense::EnvironmentGenerator::tributaryWaterHalfWidth(tributaryBankTestX);
+    require(std::abs(tributaryWetHalfWidth/
+                     dense::EnvironmentGenerator::tributaryHalfWidth(tributaryBankTestX)-.90f)<
+                1.0e-5f,
+            "tributary terrain and water use different wetted widths");
+    for(const float side:std::array<float,2>{-1.0f,1.0f}){
+        const float z=dense::EnvironmentGenerator::tributaryCenterZ(tributaryBankTestX)+
+                      side*tributaryWetHalfWidth;
+        const float bank=dense::EnvironmentGenerator::terrainHeight(tributaryBankTestX,z);
+        const float depth=
+            dense::EnvironmentGenerator::tributarySurfaceHeight(tributaryBankTestX)-bank;
+        require(depth>.075f&&depth<.085f,
+                "tributary analytic shoreline is detached from its shallow bank");
+    }
     const std::array<size_t,5> sampledTerrainTriangles{{
         0,1,1379,environment.terrainIndices.size()/6,
         environment.terrainIndices.size()/3-1
@@ -238,22 +268,29 @@ int main() {
     require(flatLocalMinima>20&&selectedFlatLocalMinima>=flatLocalMinima/20,
             "runoff bake failed to retain representative flat local depressions");
     validateTriangles(environment.terrainVertices,environment.terrainIndices,"hill terrain");
-    require(environment.riverVertices.size()>1500&&
-                environment.riverIndices.size()/3<4000,
-            "persistent river mesh is absent or exceeded its static budget");
+    require(environment.riverVertices.size()>25000&&
+                environment.riverIndices.size()/3>45000&&
+                environment.riverIndices.size()/3<60000,
+            "persistent river mesh is absent or outside its close-view tessellation budget");
+    float minimumRiverClearance=std::numeric_limits<float>::max();
+    float maximumBankClearance=0;
     for(size_t i=0;i<environment.riverVertices.size();++i){
         const auto&vertex=environment.riverVertices[i];
         require(finite(vertex.position)&&finite(vertex.normal)&&
                     std::abs(dense::length(vertex.normal)-1.0f)<.002f&&
                     vertex.normal.y>.85f&&vertex.material==6.0f,
                 "river mesh emitted an invalid material, position, or normal");
-        if(i%31==0){
-            const auto ground=dense::EnvironmentGenerator::sampleTerrainSurface(
-                vertex.position.x,vertex.position.z);
-            require(ground.insideBounds&&vertex.position.y>=ground.position.y+.03f,
-                    "persistent river surface intersects its rendered terrain");
-        }
+        const auto ground=dense::EnvironmentGenerator::sampleTerrainSurface(
+            vertex.position.x,vertex.position.z);
+        const float clearance=vertex.position.y-ground.position.y;
+        minimumRiverClearance=std::min(minimumRiverClearance,clearance);
+        if(vertex.u<1.0e-5f||vertex.u>1.0f-1.0e-5f)
+            maximumBankClearance=std::max(maximumBankClearance,clearance);
+        require(ground.insideBounds&&clearance>=.029f,
+                "persistent river surface intersects its rendered terrain");
     }
+    require(maximumBankClearance<.30f,
+            "adaptive river correction left a visibly suspended bank edge");
     validateTriangles(environment.riverVertices,environment.riverIndices,"river water");
     uint32_t decodedTallPatches=0,waterRetainingGrassPatches=0;
     for(size_t i=0;i<environment.grassPatches.size();++i){

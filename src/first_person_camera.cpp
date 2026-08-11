@@ -34,6 +34,8 @@ FirstPersonCameraSettings sanitize(FirstPersonCameraSettings value) {
     value.accelerationResponse=positiveFinite(value.accelerationResponse,12.0f,0.0f);
     value.brakingResponse=positiveFinite(value.brakingResponse,18.0f,0.0f);
     value.heightHalfLife=positiveFinite(value.heightHalfLife,.075f,.0001f);
+    value.jumpVelocity=positiveFinite(value.jumpVelocity,4.8f,.01f);
+    value.gravity=positiveFinite(value.gravity,12.5f,.01f);
     value.horizontalHalfExtent=positiveFinite(
         value.horizontalHalfExtent,EnvironmentGenerator::traversalHalfExtent,
                                                value.capsuleRadius+.01f);
@@ -95,7 +97,9 @@ void FirstPersonCameraController::reset(float x,float z,float yaw,float pitch) {
     const GroundContact contact=groundContact(x,z);
     state_.footPosition={x,contact.valid?contact.supportHeight:0.0f,z};
     state_.cameraEyeY=state_.footPosition.y+settings_.eyeHeight;
+    state_.verticalVelocity=0;
     state_.grounded=contact.valid;accumulator_=0;
+    jumpInputHeld_=false;jumpQueued_=false;
 }
 
 void FirstPersonCameraController::setHorizontalHalfExtent(float halfExtent) {
@@ -108,11 +112,11 @@ void FirstPersonCameraController::setHorizontalHalfExtent(float halfExtent) {
     if(state_.footPosition.x!=oldX)state_.horizontalVelocity.x=0;
     if(state_.footPosition.z!=oldZ)state_.horizontalVelocity.z=0;
     const GroundContact contact=groundContact(state_.footPosition.x,state_.footPosition.z);
-    if(contact.valid) {
+    if(contact.valid&&state_.grounded) {
         state_.footPosition.y=contact.supportHeight;state_.grounded=true;
         state_.cameraEyeY=std::max(state_.cameraEyeY,
             contact.supportHeight+settings_.minimumEyeClearance);
-    } else state_.grounded=false;
+    } else if(!contact.valid) state_.grounded=false;
 }
 
 bool FirstPersonCameraController::tryMove(float deltaX,float deltaZ) {
@@ -120,19 +124,36 @@ bool FirstPersonCameraController::tryMove(float deltaX,float deltaZ) {
     const float candidateX=std::clamp(state_.footPosition.x+deltaX,-limit,limit);
     const float candidateZ=std::clamp(state_.footPosition.z+deltaZ,-limit,limit);
     const GroundContact contact=groundContact(candidateX,candidateZ);
-    if(!contact.valid||contact.minimumNormalY<settings_.minimumGroundNormalY||
-       contact.supportHeight-state_.footPosition.y>settings_.maximumStepHeight)return false;
-    state_.footPosition={candidateX,contact.supportHeight,candidateZ};
-    state_.grounded=true;return true;
+    if(!contact.valid||contact.minimumNormalY<settings_.minimumGroundNormalY)return false;
+    if(state_.grounded) {
+        if(contact.supportHeight-state_.footPosition.y>settings_.maximumStepHeight)return false;
+        state_.footPosition={candidateX,contact.supportHeight,candidateZ};
+        return true;
+    }
+    // Airborne motion retains its ballistic height. A rising hillside still
+    // blocks the capsule instead of allowing the player to tunnel through it.
+    if(contact.supportHeight>state_.footPosition.y+.02f)return false;
+    state_.footPosition.x=candidateX;state_.footPosition.z=candidateZ;
+    return true;
 }
 
 void FirstPersonCameraController::simulateStep(
     float deltaTime,const FirstPersonCameraInput& input) {
     const GroundContact current=groundContact(state_.footPosition.x,state_.footPosition.z);
-    if(current.valid) {
-        state_.footPosition.y=current.supportHeight;state_.grounded=true;
-    } else {
+    if(!current.valid) {
         state_.grounded=false;state_.horizontalVelocity={};return;
+    }
+    if(state_.grounded) {
+        state_.footPosition.y=current.supportHeight;
+        state_.verticalVelocity=0;
+    } else if(state_.verticalVelocity<=0&&
+              state_.footPosition.y<=current.supportHeight+.001f) {
+        state_.footPosition.y=current.supportHeight;
+        state_.verticalVelocity=0;state_.grounded=true;
+    }
+    if(state_.grounded&&jumpQueued_) {
+        state_.verticalVelocity=settings_.jumpVelocity;
+        state_.grounded=false;jumpQueued_=false;
     }
 
     const float forwardAxis=(input.forward?1.0f:0.0f)-(input.backward?1.0f:0.0f);
@@ -170,6 +191,16 @@ void FirstPersonCameraController::simulateStep(
             state_.horizontalVelocity.z=0;
     }
 
+    if(!state_.grounded) {
+        state_.verticalVelocity-=settings_.gravity*deltaTime;
+        const float nextY=state_.footPosition.y+state_.verticalVelocity*deltaTime;
+        const GroundContact landing=groundContact(state_.footPosition.x,state_.footPosition.z);
+        if(landing.valid&&state_.verticalVelocity<=0&&nextY<=landing.supportHeight) {
+            state_.footPosition.y=landing.supportHeight;
+            state_.verticalVelocity=0;state_.grounded=true;
+        } else state_.footPosition.y=nextY;
+    }
+
     const float targetEyeY=state_.footPosition.y+settings_.eyeHeight;
     const float heightBlend=1-std::exp2(-deltaTime/settings_.heightHalfLife);
     state_.cameraEyeY+= (targetEyeY-state_.cameraEyeY)*heightBlend;
@@ -183,6 +214,8 @@ void FirstPersonCameraController::update(
         state_.yaw=std::remainder(state_.yaw+input.yawDelta,2*pi);
     if(std::isfinite(input.pitchDelta))
         state_.pitch=clamp(state_.pitch+input.pitchDelta,-1.45f,1.45f);
+    if(input.jump&&!jumpInputHeld_&&state_.grounded)jumpQueued_=true;
+    jumpInputHeld_=input.jump;
     if(!std::isfinite(elapsedSeconds)||elapsedSeconds<=0)return;
 
     const float maximumSimulated=settings_.fixedTimeStep*settings_.maximumPhysicsSteps;

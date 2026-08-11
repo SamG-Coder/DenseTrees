@@ -22,6 +22,10 @@ struct FirstPersonCameraSettings {
     float accelerationResponse{12.0f};
     float brakingResponse{18.0f};
     float heightHalfLife{.075f};
+    // A compact, human-scale ballistic jump. Gravity is stored as a positive
+    // magnitude and applied downward by the fixed-step controller.
+    float jumpVelocity{4.8f};
+    float gravity{12.5f};
     // The camera may traverse the complete authored map. The controller still
     // subtracts its capsule radius so every support sample remains inside the
     // terrain's explicit two-metre edge margin.
@@ -34,6 +38,9 @@ struct FirstPersonCameraInput {
     bool left{};
     bool right{};
     bool sprint{};
+    // Button state, not an impulse. The controller detects the rising edge so
+    // key repeat or holding Space cannot trigger automatic bunny-hopping.
+    bool jump{};
     // Radians accumulated since the prior update. Positive pitch looks down,
     // matching the existing orbit-camera mouse convention.
     float yawDelta{};
@@ -46,6 +53,7 @@ struct FirstPersonCameraState {
     float yaw{};
     float pitch{};
     float cameraEyeY{};
+    float verticalVelocity{};
     bool grounded{};
 };
 
@@ -93,6 +101,8 @@ private:
     TerrainSurfaceSampler terrainSampler_;
     FirstPersonCameraState state_;
     float accumulator_{};
+    bool jumpInputHeld_{};
+    bool jumpQueued_{};
 };
 
 } // namespace dense

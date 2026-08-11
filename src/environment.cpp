@@ -11,10 +11,30 @@ namespace {
 
 constexpr float terrainGridExponent=2.05f;
 constexpr float tributaryConfluenceZ=520.0f;
+constexpr float wettedChannelFraction=.90f;
+constexpr float waterSurfaceLift=.012f;
+constexpr float shorelineWaterDepth=.080f;
 
 float smoothStep(float low,float high,float value) {
     const float t=clamp((value-low)/(high-low),0.0f,1.0f);
     return t*t*(3.0f-2.0f*t);
+}
+
+// One cross-section owns both the submerged bed and the exposed bank.  The
+// bed reaches a shallow, finite depth at the authored wetted edge, then rises
+// through a narrow natural bank before blending back into the floodplain.
+// Previously the carve remained near bed height where the independent water
+// strip ended, leaving roughly sixty centimetres of unsupported water edge.
+float channelBankTarget(float bed,float surface,float lateral,float halfWidth) {
+    const float normalized=std::abs(lateral)/std::max(halfWidth,.001f);
+    const float wetCoordinate=clamp(normalized/wettedChannelFraction,0.0f,1.0f);
+    const float bedRise=smoothStep(.04f,1.0f,std::pow(wetCoordinate,1.18f));
+    const float submerged=bed+(surface-shorelineWaterDepth-bed)*bedRise;
+    // A short near-level riparian bench gives the map-scale heightfield
+    // enough support samples to represent the shallow edge before rising to
+    // the floodplain.  The water itself still ends at the 0.90 shoreline.
+    const float bank=smoothStep(1.55f,1.75f,normalized);
+    return submerged+(surface+.58f-submerged)*bank;
 }
 
 float terrainGridCoordinate(int coordinate) {
@@ -70,6 +90,15 @@ MeadowColourFields meadowColourFields(float x,float z) {
     const float lush=smoothStep(.60f,.84f,.58f*broad+.42f*subclump);
     const float warmCool=clamp((colony-.5f)*1.4f+(broad-.5f)*.6f,-1.0f,1.0f);
     return {fertility,dry,lush,warmCool};
+}
+
+uint32_t worldGrassHash(int cellX,int cellZ,uint32_t seed) {
+    uint32_t value=seed^static_cast<uint32_t>(cellX)*0x8da6b343u^
+                   static_cast<uint32_t>(cellZ)*0xd8163841u;
+    value^=value>>16;value*=0x7feb352du;
+    value^=value>>15;value*=0x846ca68bu;
+    value^=value>>16;
+    return value?value:1u;
 }
 
 uint32_t packColor(float r,float g,float b) {
@@ -527,6 +556,10 @@ float EnvironmentGenerator::riverSurfaceHeight(float z) {
     return riverBedHeight(z)+.72f;
 }
 
+float EnvironmentGenerator::riverWaterHalfWidth(float z) {
+    return riverHalfWidth(z)*wettedChannelFraction;
+}
+
 float EnvironmentGenerator::tributaryCenterZ(float x) {
     const float joinX=riverCenterX(tributaryConfluenceZ);
     const float upstream=joinX-x;
@@ -549,6 +582,10 @@ float EnvironmentGenerator::tributarySurfaceHeight(float x) {
 
 float EnvironmentGenerator::tributaryBedHeight(float x) {
     return tributarySurfaceHeight(x)-.48f;
+}
+
+float EnvironmentGenerator::tributaryWaterHalfWidth(float x) {
+    return tributaryHalfWidth(x)*wettedChannelFraction;
 }
 
 float EnvironmentGenerator::terrainHeight(float x,float z) {
@@ -635,9 +672,11 @@ float EnvironmentGenerator::terrainHeight(float x,float z) {
         1.25f*std::pow(tributaryLateral/(tributaryFloodWidth+1.0f),1.7f);
     terrain=terrain+(std::min(terrain,tributaryFloodTarget)-terrain)*tributaryFlood;
     const float tributaryChannel=tributaryActive*
-        (1.0f-smoothStep(tributaryWidth*.76f,tributaryWidth,tributaryLateral));
-    const float tributaryChannelTarget=tributaryBedHeight(x)+.16f*
-        std::pow(tributaryLateral/(tributaryWidth+1.0f),2.0f);
+        (1.0f-smoothStep(tributaryWidth*1.75f,tributaryWidth*1.95f,
+                         tributaryLateral));
+    const float tributaryChannelTarget=channelBankTarget(
+        tributaryBedHeight(x),tributarySurfaceHeight(x),tributaryLateral,
+        tributaryWidth);
     terrain=terrain+(tributaryChannelTarget-terrain)*tributaryChannel;
 
     const float mainLateral=std::abs(x-riverCenterX(z));
@@ -653,9 +692,10 @@ float EnvironmentGenerator::terrainHeight(float x,float z) {
     const float mainFloodTarget=riverSurfaceHeight(z)+1.05f+floodplainTexture+
         1.45f*std::pow(mainLateral/(floodWidth+1.0f),1.8f);
     terrain=terrain+(std::min(terrain,mainFloodTarget)-terrain)*mainFloodplain;
-    const float mainChannel=1.0f-smoothStep(mainWidth*.76f,mainWidth,mainLateral);
-    const float mainChannelTarget=riverBedHeight(z)+.18f*
-        std::pow(mainLateral/(mainWidth+1.0f),2.0f);
+    const float mainChannel=1.0f-smoothStep(mainWidth*1.75f,mainWidth*1.95f,
+                                            mainLateral);
+    const float mainChannelTarget=channelBankTarget(
+        riverBedHeight(z),riverSurfaceHeight(z),mainLateral,mainWidth);
     terrain=terrain+(mainChannelTarget-terrain)*mainChannel;
 
     return rootMask*terrain;
@@ -712,8 +752,103 @@ TerrainSurfaceSample EnvironmentGenerator::sampleTerrainSurface(float x,float z)
     return {{worldX,height,worldZ},normalize(cross(p1-p0,p2-p0)),inside};
 }
 
+bool EnvironmentGenerator::makeGrassPatch(int cellX,int cellZ,uint32_t seed,
+                                           GrassPatchGpu& patch) {
+    Rng rng(worldGrassHash(cellX,cellZ,seed));
+    const float x=(static_cast<float>(cellX)+rng.range(.13f,.87f))*grassCellSize;
+    const float z=(static_cast<float>(cellZ)+rng.range(.13f,.87f))*grassCellSize;
+    const TerrainSurfaceSample surface=sampleTerrainSurface(x,z);
+    if(!surface.insideBounds)return false;
+
+    const float heroRadius=std::sqrt(x*x+z*z);
+    if(heroRadius<1.05f)return false;
+    const Vec3 normal=surface.normal;
+    const float slope=std::sqrt(normal.x*normal.x+normal.z*normal.z)/
+                      std::max(normal.y,.20f);
+    // Permanent water and its exposed gravel lip remain blade-free.  Grass
+    // resumes through a soft riparian transition rather than drawing a hard
+    // green line exactly on the hydraulic shoreline.
+    const float mainLateral=std::abs(x-riverCenterX(z));
+    const float mainBank=mainLateral-riverWaterHalfWidth(z);
+    const float joinX=riverCenterX(tributaryConfluenceZ);
+    const float tributaryActive=smoothStep(-2960.0f,-2760.0f,x)*
+        (1.0f-smoothStep(joinX-45.0f,joinX+18.0f,x));
+    const float tributaryLateral=std::abs(z-tributaryCenterZ(x));
+    const float tributaryBank=tributaryActive>.05f?
+        tributaryLateral-tributaryWaterHalfWidth(x):10000.0f;
+    if(mainBank<=0||tributaryBank<=0||normal.y<.80f)return false;
+    const float bankDistance=std::min(mainBank,tributaryBank);
+
+    const MeadowColourFields colour=meadowColourFields(x,z);
+    const float broadWet=mapFbm(x*.0038f+47.0f,z*.0038f-29.0f);
+    const float riverMoisture=1.0f-smoothStep(18.0f,285.0f,bankDistance);
+    const float moisture=clamp(.25f+.58f*riverMoisture+
+        .25f*(broadWet-.35f)-.22f*smoothStep(18.0f,105.0f,surface.position.y),0,1);
+    const float exposure=mapFbm(x*.0061f-83.0f,z*.0061f+51.0f);
+    const GroundBiomeWeights biome=groundBiomeWeights(
+        {surface.position.y,slope,bankDistance,moisture,exposure});
+    const float meadow=biome.material[static_cast<size_t>(GroundMaterialTile::MeadowTurf)];
+    const float upland=biome.material[static_cast<size_t>(GroundMaterialTile::UplandShortTurf)];
+    const float mineral=biome.material[static_cast<size_t>(GroundMaterialTile::ExposedRockSoil)];
+    const float riparian=biome.material[static_cast<size_t>(GroundMaterialTile::RiparianMoss)];
+    const float bareDriver=exposure*.58f+(1-moisture)*.42f;
+    const float coherentBare=smoothStep(.58f,.82f,bareDriver);
+    // Mineral cliffs, exposed gravel/sand and coherent dry-soil colonies are
+    // not sparse meadow.  Reject them before stochastic thinning so the
+    // streamed clipmap cannot sprinkle isolated green blades across a dirt or
+    // rock biome merely because normalized biome weights retain a tiny meadow
+    // transition component.
+    const bool mineralDominant=mineral>.38f&&mineral>meadow*1.05f&&
+                               mineral>riparian*1.35f;
+    const bool exposedBare=coherentBare>.64f&&
+                           (mineral>.14f||meadow<.52f||moisture<.28f);
+    if(mineralDominant||exposedBare)return false;
+    float suitability=meadow*.98f+upland*.30f+riparian*.78f;
+    suitability*=1-.94f*coherentBare;
+    suitability*=smoothStep(.80f,.93f,normal.y);
+    suitability*=smoothStep(1.8f,9.0f,bankDistance);
+    if(rng.unit()>clamp(suitability,0.0f,1.0f))return false;
+
+    const float tallProbability=clamp(.08f+.50f*meadow+.50f*riparian+
+                                      .10f*upland-.55f*mineral,0.0f,.78f);
+    const bool tall=rng.unit()<tallProbability;
+    const float canopyShade=1.0f-.26f*(1.0f-smoothStep(5.0f,11.0f,heroRadius));
+    if(rng.unit()>canopyShade)return false;
+    const float shortHeight=rng.range(.045f,.120f)*(.84f+.22f*moisture)*
+                            (.72f+.28f*clamp(meadow+riparian,0.0f,1.0f));
+    const float tallHeight=tall?rng.range(.40f,.82f)*(.86f+.18f*moisture):0.0f;
+    const uint32_t shortCode=static_cast<uint32_t>(clamp(shortHeight/.004f,1,255));
+    const uint32_t tallCode=tall?
+        static_cast<uint32_t>(clamp(tallHeight/.004f,1,255)):0u;
+    const uint32_t bladeCount=26u+static_cast<uint32_t>(rng.unit()*9.0f);
+    const uint32_t tallCount=tall?16u+static_cast<uint32_t>(rng.unit()*9.0f):0u;
+    const uint32_t packed=(bladeCount&255u)|(shortCode<<8)|(tallCount<<16)|(tallCode<<24);
+    const float maximumHeight=(tall?tallHeight:shortHeight)*2.5f;
+    const float lateralRatio=tall?.66f:.52f;
+    const float maximumWidth=tall?.043f:.018f;
+    constexpr float boundsSafety=.012f;
+    const float horizontalReach=.245f+maximumHeight*(slope+lateralRatio)+
+                                maximumWidth+boundsSafety;
+    const float surfaceRise=.245f*slope;
+    const float lowerReach=surfaceRise+maximumWidth*slope+boundsSafety;
+    const float upperReach=surfaceRise+maximumHeight*(normal.y+lateralRatio*slope)+
+                           maximumWidth*slope+boundsSafety;
+    const float baseY=surface.position.y+.006f;
+    // Camera-streamed grass intentionally does not invent local standing
+    // water. Global flood height still submerges these blades; retained
+    // micro-puddles remain driven by the terrain's baked runoff map.
+    const uint32_t packedSeed=rng.next()&0x00ffffffu;
+    patch={x-horizontalReach,baseY-lowerReach,z-horizontalReach,
+           x+horizontalReach,baseY+upperReach,z+horizontalReach,
+           packedSeed,packed,baseY,normal.x,normal.z,moisture,
+           colour.fertility,colour.dryColony,colour.lushColony,
+           colour.warmCool};
+    return true;
+}
+
 EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
     EnvironmentMesh mesh;
+    mesh.grassSeed=seed;
     constexpr int resolution=terrainResolution;
     mesh.terrainVertices.reserve(static_cast<size_t>(resolution)*resolution);
     mesh.terrainIndices.reserve(static_cast<size_t>(resolution-1)*(resolution-1)*6);
@@ -821,30 +956,95 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         else mesh.terrainIndices.insert(mesh.terrainIndices.end(),{a,c,b,b,c,d});
     }
 
-    // A small independent water mesh keeps the river visible even in dry
-    // weather.  It follows the same deterministic hydrology contract as the
-    // terrain carve.  Indices deliberately remain local to riverVertices so
-    // the renderer can build a dedicated opaque/reflection BLAS for kind 6.
+    // A dedicated water mesh keeps the river visible even in dry weather.
+    // Its outer row now lands on the exact wetted shoreline used by the
+    // terrain cross-section above.  The mesh is never individually lifted to
+    // sampled terrain: doing that distorted rows without recomputing their
+    // normals and was the source of the long dark/suspended edge.  Indices
+    // deliberately remain local to riverVertices so the renderer can build a
+    // dedicated opaque/reflection BLAS for kind 6.
     const uint32_t riverColor=packColor(.075f,.19f,.235f);
     const auto appendStrip=[&](int longitudinalSegments,int crossSegments,
                                auto crossSection) {
         const uint32_t base=static_cast<uint32_t>(mesh.riverVertices.size());
+        const uint32_t stride=static_cast<uint32_t>(crossSegments+1);
+        const size_t stripVertexCount=static_cast<size_t>(longitudinalSegments+1)*stride;
+        std::vector<float> clearanceLift(stripVertexCount,0.0f);
         for(int segment=0;segment<=longitudinalSegments;++segment) {
             const auto section=crossSection(static_cast<float>(segment)/longitudinalSegments);
-            const Vec3 tangent=normalize(section[1]);
             const Vec3 lateral=normalize(section[2]);
-            const Vec3 normal=normalize(cross(tangent,lateral));
             for(int across=0;across<=crossSegments;++across) {
                 const float u=static_cast<float>(across)/crossSegments;
                 const float offset=(u*2.0f-1.0f)*section[3].x;
-                Vec3 position=section[0]+lateral*offset;
+                const Vec3 position=section[0]+lateral*offset;
                 const TerrainSurfaceSample ground=sampleTerrainSurface(position.x,position.z);
-                position.y=std::max(position.y,ground.position.y+.035f);
-                mesh.riverVertices.push_back({position,normal,riverColor,
+                const size_t local=static_cast<size_t>(segment)*stride+
+                                   static_cast<size_t>(across);
+                // This is a clearance constraint, not the final vertex lift.
+                // The slope-limited field below turns isolated coarse-terrain
+                // intersections into a continuous water surface.
+                clearanceLift[local]=std::max(0.0f,
+                    ground.position.y+.035f-position.y);
+                mesh.riverVertices.push_back({position,{0,1,0},riverColor,
                                                6.0f,u,section[3].y});
             }
         }
-        const uint32_t stride=static_cast<uint32_t>(crossSegments+1);
+
+        // The 6.4 km terrain becomes intentionally coarse far from the hero
+        // oak.  Enforce its clearance as a minimal Lipschitz surface rather
+        // than independently clamping vertices.  Four alternating sweeps are
+        // sufficient for the rectangular strip graph and limit any adaptive
+        // correction to a physically subtle 1.4 percent grade.
+        constexpr float maximumAdaptiveGrade=.014f;
+        const auto relax=[&](size_t target,size_t source) {
+            const Vec3& a=mesh.riverVertices[base+static_cast<uint32_t>(target)].position;
+            const Vec3& b=mesh.riverVertices[base+static_cast<uint32_t>(source)].position;
+            const float dx=a.x-b.x,dz=a.z-b.z;
+            const float distance=std::sqrt(dx*dx+dz*dz);
+            clearanceLift[target]=std::max(clearanceLift[target],
+                clearanceLift[source]-maximumAdaptiveGrade*distance);
+        };
+        for(int iteration=0;iteration<2;++iteration) {
+            for(int segment=0;segment<=longitudinalSegments;++segment)
+                for(int across=0;across<=crossSegments;++across) {
+                    const size_t local=static_cast<size_t>(segment)*stride+across;
+                    if(segment>0)relax(local,local-stride);
+                    if(across>0)relax(local,local-1);
+                }
+            for(int segment=longitudinalSegments;segment>=0;--segment)
+                for(int across=crossSegments;across>=0;--across) {
+                    const size_t local=static_cast<size_t>(segment)*stride+across;
+                    if(segment<longitudinalSegments)relax(local,local+stride);
+                    if(across<crossSegments)relax(local,local+1);
+                }
+        }
+        for(size_t local=0;local<stripVertexCount;++local)
+            mesh.riverVertices[base+static_cast<uint32_t>(local)].position.y+=
+                clearanceLift[local];
+
+        // Derive normals from the corrected positions.  This keeps lighting,
+        // reflections, and the actual tessellated water surface in agreement.
+        for(int segment=0;segment<=longitudinalSegments;++segment)
+            for(int across=0;across<=crossSegments;++across) {
+                const int previousSegment=std::max(segment-1,0);
+                const int nextSegment=std::min(segment+1,longitudinalSegments);
+                const int previousAcross=std::max(across-1,0);
+                const int nextAcross=std::min(across+1,crossSegments);
+                const auto localIndex=[&](int row,int column) {
+                    return base+static_cast<uint32_t>(row)*stride+
+                           static_cast<uint32_t>(column);
+                };
+                const Vec3 along=
+                    mesh.riverVertices[localIndex(nextSegment,across)].position-
+                    mesh.riverVertices[localIndex(previousSegment,across)].position;
+                const Vec3 acrossVector=
+                    mesh.riverVertices[localIndex(segment,nextAcross)].position-
+                    mesh.riverVertices[localIndex(segment,previousAcross)].position;
+                Vec3 normal=normalize(cross(along,acrossVector));
+                if(normal.y<0)normal=normal*-1.0f;
+                mesh.riverVertices[localIndex(segment,across)].normal=normal;
+            }
+
         for(int segment=0;segment<longitudinalSegments;++segment)
             for(int across=0;across<crossSegments;++across) {
                 const uint32_t a=base+static_cast<uint32_t>(segment)*stride+across;
@@ -853,7 +1053,10 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
             }
     };
 
-    constexpr int mainSegments=196,mainCrossSegments=6;
+    // Four-metre longitudinal rows and a dozen lanes keep silhouettes and
+    // specular highlights stable at first-person viewing distance.  The old
+    // ~30 m rows visibly stepped and aliased as a repeated texture.
+    constexpr int mainSegments=1470,mainCrossSegments=12;
     appendStrip(mainSegments,mainCrossSegments,[&](float t) {
         const float z=-2940.0f+t*5880.0f;
         constexpr float derivativeStep=1.0f;
@@ -861,27 +1064,36 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         const float dy=(riverSurfaceHeight(z+derivativeStep)-
                         riverSurfaceHeight(z-derivativeStep))*.5f;
         const Vec3 tangent{dx,dy,1.0f};
-        const Vec3 lateral{1.0f,0.0f,-dx};
+        // Across-river positions stay at this exact Z.  That makes
+        // abs(x-riverCenterX(z)) identical to the terrain carve's coordinate.
+        const Vec3 lateral{1.0f,0.0f,0.0f};
         return std::array<Vec3,4>{{
-            {riverCenterX(z),riverSurfaceHeight(z),z},tangent,lateral,
-            {riverHalfWidth(z)*.76f,t,0}
+            {riverCenterX(z),riverSurfaceHeight(z)+waterSurfaceLift,z},tangent,lateral,
+            {riverWaterHalfWidth(z),t,0}
         }};
     });
 
-    constexpr int tributarySegments=112,tributaryCrossSegments=5;
+    constexpr int tributarySegments=790,tributaryCrossSegments=10;
+    constexpr float tributaryWaterStartX=-2740.0f;
     const float joinX=riverCenterX(tributaryConfluenceZ);
+    const float tributaryWaterEndX=joinX-riverWaterHalfWidth(tributaryConfluenceZ);
     appendStrip(tributarySegments,tributaryCrossSegments,[&](float t) {
-        const float x=-2860.0f+t*(joinX+2860.0f);
+        // Begin only after the authored tributary activation ramp is fully
+        // carved.  The former strip started in its half-strength valley and
+        // had to be lifted more than sixteen metres above solid ground.
+        const float x=tributaryWaterStartX+t*(tributaryWaterEndX-tributaryWaterStartX);
         constexpr float derivativeStep=1.0f;
         const float dz=(tributaryCenterZ(x+derivativeStep)-
                         tributaryCenterZ(x-derivativeStep))*.5f;
         const float dy=(tributarySurfaceHeight(x+derivativeStep)-
                         tributarySurfaceHeight(x-derivativeStep))*.5f;
         const Vec3 tangent{1.0f,dy,dz};
-        const Vec3 lateral{dz,0.0f,-1.0f};
+        // Likewise the tributary crosses at fixed X, sharing
+        // abs(z-tributaryCenterZ(x)) with its authored bank.
+        const Vec3 lateral{0.0f,0.0f,-1.0f};
         return std::array<Vec3,4>{{
-            {x,tributarySurfaceHeight(x),tributaryCenterZ(x)},tangent,lateral,
-            {tributaryHalfWidth(x)*.72f,t,0}
+            {x,tributarySurfaceHeight(x)+waterSurfaceLift,tributaryCenterZ(x)},
+            tangent,lateral,{tributaryWaterHalfWidth(x),t,0}
         }};
     });
 

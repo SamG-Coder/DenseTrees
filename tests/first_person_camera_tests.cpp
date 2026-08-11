@@ -1,5 +1,6 @@
 #include "first_person_camera.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -100,6 +101,63 @@ int main() {
     longStall.update(5.0f,forwardInput);clampedFrame.update(.10f,forwardInput);
     require(near(longStall.state().footPosition.z,clampedFrame.state().footPosition.z,2.0e-4f),
             "long render stall bypassed the bounded fixed-step budget");
+
+    dense::FirstPersonCameraInput jumpInput;jumpInput.jump=true;
+    dense::FirstPersonCameraController jumper({},flatTerrain);
+    jumper.reset(0,0,0,0);
+    jumper.update(1.0f/120.0f,jumpInput);
+    require(!jumper.state().grounded&&jumper.state().verticalVelocity>4.5f&&
+                jumper.state().footPosition.y>0,
+            "grounded Space press did not launch a jump immediately");
+    float jumpPeak=jumper.state().footPosition.y;
+    float previousEyeY=jumper.pose().eye.y;
+    float largestEyeStep=0;
+    for(int frame=0;frame<240;++frame) {
+        jumper.update(1.0f/120.0f,{});
+        jumpPeak=std::max(jumpPeak,jumper.state().footPosition.y);
+        largestEyeStep=std::max(largestEyeStep,
+                                std::abs(jumper.pose().eye.y-previousEyeY));
+        previousEyeY=jumper.pose().eye.y;
+        require(jumper.pose().eye.y>=jumper.state().footPosition.y+
+                    jumper.settings().minimumEyeClearance-1.0e-5f,
+                "jump allowed the camera eye to enter its ground capsule");
+    }
+    require(jumpPeak>.78f&&jumpPeak<1.05f&&jumper.state().grounded&&
+                near(jumper.state().footPosition.y,0)&&
+                near(jumper.state().verticalVelocity,0)&&largestEyeStep<.08f,
+            "jump arc, landing, or first-person eye smoothing is implausible");
+
+    // A button state held across Windows key-repeat events must produce only
+    // one rising edge and must not auto-jump again on landing.
+    dense::FirstPersonCameraController heldJump({},flatTerrain);
+    heldJump.reset(0,0,0,0);
+    advance(heldJump,jumpInput,2.2f);
+    require(heldJump.state().grounded&&near(heldJump.state().footPosition.y,0)&&
+                near(heldJump.state().verticalVelocity,0),
+            "holding Space caused automatic bunny-hopping after landing");
+
+    dense::FirstPersonCameraController jump120({},flatTerrain),jump60({},flatTerrain);
+    jump120.reset(0,0,0,0);jump60.reset(0,0,0,0);
+    jump120.update(1.0f/120.0f,jumpInput);jump60.update(1.0f/60.0f,jumpInput);
+    advance(jump120,{},1.0f-1.0f/120.0f,1.0f/120.0f);
+    advance(jump60,{},1.0f-1.0f/60.0f,1.0f/60.0f);
+    require(near(jump120.state().footPosition.y,jump60.state().footPosition.y,2.0e-4f)&&
+                near(jump120.state().verticalVelocity,jump60.state().verticalVelocity,2.0e-4f)&&
+                jump120.state().grounded==jump60.state().grounded,
+            "fixed-step jump depends on render-frame partitioning");
+
+    dense::FirstPersonCameraController runningJump({},flatTerrain);
+    runningJump.reset(0,0,0,0);
+    dense::FirstPersonCameraInput forwardJump=forwardInput;forwardJump.jump=true;
+    runningJump.update(1.0f/120.0f,forwardJump);
+    dense::FirstPersonCameraInput airborneForward=forwardInput;
+    advance(runningJump,airborneForward,.25f);
+    const float velocityBeforeAirPress=runningJump.state().verticalVelocity;
+    airborneForward.jump=true;
+    runningJump.update(1.0f/120.0f,airborneForward);
+    require(runningJump.state().footPosition.z>.10f&&
+                runningJump.state().verticalVelocity<velocityBeforeAirPress,
+            "air control stopped or an airborne Space press reset jump velocity");
 
     dense::FirstPersonCameraSettings boundedSettings;
     boundedSettings.horizontalHalfExtent=2.0f;

@@ -118,6 +118,7 @@ struct App {
     bool moveLeft = false;
     bool moveRight = false;
     bool sprint = false;
+    bool jump = false;
     float pendingYawDelta = 0.0f;
     float pendingPitchDelta = 0.0f;
     uint32_t generation = 0;
@@ -158,8 +159,8 @@ struct App {
         if(cameraMode==CameraMode::Orbit)
             return L" \u2014 Orbit [F2: first person]";
         return playerLocalLight.enabled?
-            L" \u2014 First person [F2: orbit | WASD+Shift | LMB light: on]":
-            L" \u2014 First person [F2: orbit | WASD+Shift | LMB light: off]";
+            L" \u2014 First person [F2: orbit | WASD+Shift | Space: jump | LMB light: on]":
+            L" \u2014 First person [F2: orbit | WASD+Shift | Space: jump | LMB light: off]";
     }
 
     void refreshInteractionTitle() {
@@ -171,7 +172,7 @@ struct App {
     }
 
     void clearFirstPersonInput() {
-        moveForward=moveBackward=moveLeft=moveRight=sprint=false;
+        moveForward=moveBackward=moveLeft=moveRight=sprint=jump=false;
         pendingYawDelta=0.0f;
         pendingPitchDelta=0.0f;
     }
@@ -220,6 +221,7 @@ struct App {
         case VK_SHIFT:
         case VK_LSHIFT:
         case VK_RSHIFT:state=&sprint;break;
+        case VK_SPACE:state=&jump;break;
         default:return false;
         }
         if(cameraMode==CameraMode::FirstPerson) {
@@ -279,6 +281,7 @@ struct App {
             input.left=moveLeft;
             input.right=moveRight;
             input.sprint=sprint;
+            input.jump=jump;
             input.yawDelta=pendingYawDelta;
             input.pitchDelta=pendingPitchDelta;
         }
@@ -355,7 +358,9 @@ struct App {
             } else DestroyWindow(window);
             return true;
         }
-        if(key=='R'||key==VK_SPACE){regenerate(window);return true;}
+        if(key=='R'||(key==VK_SPACE&&cameraMode==CameraMode::Orbit)){
+            regenerate(window);return true;
+        }
         if(key>='1'&&key<='5'){
             setSpecies(window,static_cast<dense::TreeSpecies>(key-'1'));
             return true;

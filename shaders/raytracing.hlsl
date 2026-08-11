@@ -384,6 +384,7 @@ static const float CloudTopHeight=1510.0;
 static const float CloudCellWidth=1600.0;
 static const uint CloudCellProbeSteps=7u;
 static const uint CloudSkyMarchSteps=20u;
+static const uint CloudNightMarchSteps=32u;
 static const uint CloudShadowMarchSteps=5u;
 
 float2 cloudWindOffset() {
@@ -557,7 +558,7 @@ float cloudContinuousDensity3D(float3 worldPosition) {
 }
 
 CloudRayStats integrateContinuousCloudSlab(float3 origin,float3 rayDirection,
-                                           uint stepCount) {
+                                           uint stepCount,float stratumOffset) {
     CloudRayStats stats;
     stats.meanDensity=0;stats.maximumDensity=0;stats.minimumDensity=1;
     stats.verticalMoment=0;stats.slantDepth=0;stats.middlePosition=0;
@@ -569,8 +570,14 @@ CloudRayStats integrateContinuousCloudSlab(float3 origin,float3 rayDirection,
     float slabDistance=max(exitDistance-entryDistance,1e-4);
     stats.slantDepth=min(slabDistance/(CloudTopHeight-CloudBaseHeight),4.6);
     float densitySum=0,weightedHeight=0,weightedDistance=0;
+    // A stable sub-stratum phase prevents every sky pixel from sampling the
+    // exact same twenty elevations. That lock-step quadrature was invisible
+    // in daylight but read as horizontal contour bands against a black night
+    // sky. Surface-shadow integration deliberately passes zero to preserve
+    // the existing coherent world-space shadow field.
+    float phase=clamp(stratumOffset,-.45,.45);
     [loop] for(uint stepIndex=0u;stepIndex<stepCount;++stepIndex){
-        float stepPosition=(float(stepIndex)+.5)/float(stepCount);
+        float stepPosition=(float(stepIndex)+.5+phase)/float(stepCount);
         float sampleDistance=lerp(entryDistance,exitDistance,stepPosition);
         float3 samplePosition=origin+d*sampleDistance;
         float density=cloudContinuousDensity3D(samplePosition);
@@ -603,7 +610,7 @@ float cloudKeyTransmittance(float3 worldPosition) {
     float3 keyDirection=directionToKeyLight();
     if(keyDirection.y<=.025||worldPosition.y>=CloudTopHeight)return 1;
     CloudRayStats stats=integrateContinuousCloudSlab(
-        worldPosition,keyDirection,CloudShadowMarchSteps);
+        worldPosition,keyDirection,CloudShadowMarchSteps,0);
     return exp(-max(cloudOpticalDepth(stats),0.0));
 }
 
@@ -622,8 +629,15 @@ SkyCloudSample sampleSkyCloud(float3 rayDirection) {
     float3 d=normalize(rayDirection);
     if(d.y<=.018||camera.eye.y>=CloudTopHeight)return sample;
 
+    // Night needs finer integration because the large cloud-to-sky contrast
+    // exposes height quadrature that daylight naturally masks. A fixed
+    // per-pixel phase converts any residual integration error into fine,
+    // temporally stable grain rather than coherent horizontal slices.
+    float daylight=daylightAmount();
+    uint skySteps=daylight<.12?CloudNightMarchSteps:CloudSkyMarchSteps;
+    float nightPhase=(hash(float2(DispatchRaysIndex().xy)+float2(73,191))-.5)*.88;
     CloudRayStats stats=integrateContinuousCloudSlab(
-        camera.eye,d,CloudSkyMarchSteps);
+        camera.eye,d,skySteps,daylight<.12?nightPhase:0);
     sample.density=stats.meanDensity;
     sample.transmission=exp(-max(cloudOpticalDepth(stats),0.0));
     // Near-horizontal slab intersections are both extremely distant and the
@@ -760,8 +774,18 @@ float3 environmentRadiance(float3 direction) {
         float3 shadowColor=lerp(clearShadow,stormShadow,g_StormIntensity);
         float3 litColor=lerp(clearLit,stormLit,g_StormIntensity);
         float verticalLight=.10+.90*cloud.illumination;
-        float3 cloudColor=lerp(shadowColor,litColor,verticalLight)*
-                          lerp(.38,1.0,daylight);
+        float3 dayCloud=lerp(shadowColor,litColor,verticalLight);
+        // Night clouds reflect dim skylight and moonlight; multiplying the
+        // daytime palette by .38 made them tens of times brighter than the
+        // night sky. Keep their optical opacity (so stars remain occluded),
+        // but shade the body from a dedicated low-luminance moon palette.
+        float moonFill=saturate(g_MoonIntensity*2.0);
+        float3 nightShadow=float3(.0015,.0030,.0070);
+        float3 nightLit=float3(.006,.010,.020)+
+                        g_MoonColor*g_MoonIntensity*.16;
+        float3 nightCloud=lerp(nightShadow,nightLit,verticalLight)*
+                          lerp(.58,1.0,moonFill);
+        float3 cloudColor=lerp(nightCloud,dayCloud,daylight);
         float forwardScatter=pow(sunMu,18)*g_SunIntensity*cloud.edge;
         cloudColor+=g_SunColor*forwardScatter*lerp(.24,.92,cloud.illumination);
         color=lerp(color,cloudColor,cloud.opacity);
@@ -1228,6 +1252,10 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float3 puddleNormal=float3(0,1,0);
     float puddleImpactBright=0,puddleImpactDark=0,puddleImpactCrown=0;
     float riverCentreDepth=0;
+    // A primary-ray water footprint is retained for reflection filtering.
+    // Puddles keep full local detail; the kilometre-scale river progressively
+    // becomes a rough, level aggregate once its waves are sub-pixel.
+    float riverReflectionDetail=1.0;
     float terrainRetention=0,terrainSlope=0;
     float materialRoughness=kind<.5?.74:(kind<1.5?.40:(kind<2.5?.90:
                             (kind<3.5?.67:(kind<4.5?.48:.72))));
@@ -1257,16 +1285,28 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
 
         float soilMacro=filteredFbmWorld(hit.xz+float2(83,-47),.090,footprint);
         float soilFine=filteredValueNoise(hit.xz+float2(-31,14),1.7,fineFootprint);
+        // Map-scale erosion domains define real bare-soil/sandy clearings.
+        // The old root-distance multiplier forced every point beyond 230 m
+        // back to meadow, even in dry or mineral biomes, which contradicted
+        // the streamed grass mask across the new multi-kilometre map.
+        float biomeExposure=filteredFbmWorld(
+            hit.xz+float2(-1360,836),.0061,footprint);
         float rootCore=1-smoothstep(.72,1.35,rootDistance);
         float rootFringe=(1-smoothstep(1.10,2.70,rootDistance))*smoothstep(.55,.72,soilMacro);
         float slopeBare=smoothstep(.075,.23,slope)*smoothstep(.60,.78,soilMacro);
         float flatBare=smoothstep(.78,.90,.65*soilMacro+.35*soilFine)*(1-smoothstep(.10,.22,slope));
         float soilStructure=max(rootCore,max(rootFringe*.82,max(slopeBare*.68,flatBare*.62)));
+        float biomeBare=smoothstep(.62,.82,
+            biomeExposure*.58+(1-terrainMoisture)*.42);
+        biomeBare*=1-lushMask*.72;
+        biomeBare*=1-smoothstep(.18,.42,slope);
+        soilStructure=max(soilStructure,biomeBare*.88);
         float soilMask=smoothstep(.22,.72,soilStructure+(soilFine-.5)*.18);
-        soilMask*=1-smoothstep(150.0,230.0,rootDistance);
         float soilDryness=smoothstep(.42,.72,1-terrainMoisture);
         float3 soil=lerp(float3(.042,.024,.010),float3(.105,.061,.024),.30+.48*soilFine);
         soil=lerp(soil,float3(.160,.101,.041),soilDryness*.42);
+        float sandWeight=biomeBare*soilDryness*(1-smoothstep(.08,.24,slope));
+        soil=lerp(soil,float3(.185,.135,.068),sandWeight*.70);
         albedo=lerp(meadow,soil,soilMask);
 
         float highGround=smoothstep(18.0,92.0,hit.y)*smoothstep(760,1040,rootDistance);
@@ -1443,13 +1483,27 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         }
         WaterSurfaceSample waterSurface=evaluateWaterSurface(
             hit.xz,footprint,downstream,.46,1.0);
+        // At a grazing angle a single screen pixel covers many centimetres of
+        // river. Sampling one procedural wave normal there produces coherent
+        // glint stripes that look like texture tiling. Converge both the
+        // normal and the reflection direction toward the filtered mean plane
+        // before those waves become sub-pixel.
+        riverReflectionDetail=1-smoothstep(.055,.42,footprint);
+        float3 levelRiverNormal=normalize(lerp(
+            surfaceNormal,upperFace?float3(0,1,0):float3(0,-1,0),.92));
+        float3 detailedRiverNormal=upperFace?waterSurface.normal:
+                                             -waterSurface.normal;
         puddleMask=1.0;
-        puddleNormal=upperFace?waterSurface.normal:-waterSurface.normal;
+        puddleNormal=normalize(lerp(levelRiverNormal,detailedRiverNormal,
+                                    riverReflectionDetail));
         n=puddleNormal;
         puddleImpactBright=waterSurface.brightCrest;
         puddleImpactDark=waterSurface.darkTrough;
         puddleImpactCrown=waterSurface.crownFoam;
-        materialRoughness=lerp(.012,.042,saturate(g_RainIntensity));
+        float resolvedWaterRoughness=lerp(.012,.042,
+                                          saturate(g_RainIntensity));
+        materialRoughness=lerp(resolvedWaterRoughness,.14,
+                               1-riverReflectionDetail);
 
         // The generated strip is shallow at its banks and deepest at the
         // centre. Beer-Lambert attenuation exposes a muted gravel bed near
@@ -1459,8 +1513,10 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float opticalPath=depth/max(abs(dot(puddleNormal,
                                              -WorldRayDirection())),.18);
         float3 transmission=exp(-float3(2.30,.72,.38)*opticalPath);
-        float3 riverBed=srgbToLinear(float3(.105,.086,.052));
-        float3 bodyScatter=srgbToLinear(float3(.030,.105,.135));
+        // Shallow water reveals a wet gravel/silt bed. The previous near-black
+        // bed albedo made the shoreline look like an unlit geometry strip.
+        float3 riverBed=srgbToLinear(float3(.205,.168,.105));
+        float3 bodyScatter=srgbToLinear(float3(.034,.108,.137));
         albedo=riverBed*transmission+bodyScatter*(1-transmission);
     }
     if(kind>2.5&&kind<3.5){
@@ -1509,9 +1565,15 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     // A rain-ring trough slightly increases optical path length through the
     // shallow water. Keep this subtle: most of the impact remains reflective.
     albedo*=1-puddleMask*puddleImpactDark*.045;
-    materialRoughness=lerp(materialRoughness,.02,wetness);
-    materialRoughness=lerp(materialRoughness,
-        lerp(.004,.040,saturate(g_RainIntensity)),puddleMask);
+    // The river already resolved roughness from its projected footprint.
+    // Applying the generic wet-film override here would collapse it back to a
+    // mirror and reintroduce grazing shimmer. Other wet materials and terrain
+    // puddles retain their existing response exactly.
+    if(!riverSurface){
+        materialRoughness=lerp(materialRoughness,.02,wetness);
+        materialRoughness=lerp(materialRoughness,
+            lerp(.004,.040,saturate(g_RainIntensity)),puddleMask);
+    }
 
     // Environment foliage remains in the immutable BLAS, so it receives a
     // small shading flutter.  Instance 0 is the physically deformed oak and
@@ -1553,8 +1615,8 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         // Water transmits illumination to its bed rather than behaving like a
         // matte blue plane. The dominant visible energy still comes from the
         // dielectric reflection path below.
-        ambient*=lerp(.90,.68,riverCentreDepth);
-        direct*=lerp(.34,.12,riverCentreDepth);
+        ambient*=lerp(.96,.68,riverCentreDepth);
+        direct*=lerp(.50,.12,riverCentreDepth);
     }
     if(kind<.5)ambient*=lerp(1,.68,barkCavity);
     if(kind>1.5&&kind<2.5){
@@ -1614,7 +1676,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float3 waveReflection=normalize(reflect(WorldRayDirection(),puddleNormal));
         float horizonSafety=smoothstep(.012,.105,dot(waveReflection,levelNormal));
         float3 reflectionDirection=normalize(lerp(levelReflection,waveReflection,
-                                                   horizonSafety));
+            horizonSafety*(riverSurface?riverReflectionDetail:1.0)));
         if(dot(reflectionDirection,levelNormal)<.008)
             reflectionDirection=levelReflection;
         RayDesc reflectedRay;reflectedRay.Origin=hit+puddleNormal*.020;
@@ -1628,7 +1690,13 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         // Near-normal Fresnel contributions do not justify a full traversal.
         // Preserve the physical sky term cheaply; use an exact DXR reflection
         // once the contribution is large enough to reveal scene geometry.
-        if(reflectionWeight>.022)
+        // A sharp secondary ray cannot represent a sub-pixel lobe. Once a
+        // distant river footprint has integrated the wave field, use the
+        // already filtered environment instead of aliasing geometry into
+        // horizontal sparkle bands. Nearby water and all puddles retain the
+        // exact DXR reflection path.
+        bool exactWaterReflection=!riverSurface||riverReflectionDetail>.16;
+        if(reflectionWeight>.022&&exactWaterReflection)
             TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,reflectedRay,reflection);
         else if(reflectionWeight>.004)
             reflection.color=environmentRadiance(reflectionDirection);

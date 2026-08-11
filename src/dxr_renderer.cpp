@@ -11,7 +11,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -84,6 +86,17 @@ struct DxrRenderer::Impl{
     UINT vertexCount{},indexCount{},treeVertexCount{},treeIndexCount{},grassPatchCount{};
     float treeHeight=1.0f;bool treeWindWasActive=false;
     UINT visibleNearGrassPatchCount{},visibleFarGrassPatchCount{};
+    struct GrassChunk{
+        std::vector<GrassPatchGpu>patches;
+        uint64_t lastUse{};
+    };
+    std::unordered_map<uint64_t,GrassChunk>grassChunkCache;
+    uint64_t grassStreamEpoch{};
+    std::vector<GrassPatchGpu>streamedGrassPatches;
+    bool grassStreamValid{};
+    float grassStreamCenterX=std::numeric_limits<float>::quiet_NaN();
+    float grassStreamCenterZ=std::numeric_limits<float>::quiet_NaN();
+    float grassStreamRadius{};
 
     ~Impl(){wait();if(cameraBuffer&&cameraMapped)cameraBuffer->Unmap(0,nullptr);if(environmentBuffer&&environmentMapped)environmentBuffer->Unmap(0,nullptr);if(visibleGrassBuffer&&visibleGrassMapped)visibleGrassBuffer->Unmap(0,nullptr);release(hitTable);release(missTable);release(raygenTable);release(instanceBuffer);release(tlasScratch);release(grassBlasScratch);release(staticBlasScratch);release(blasScratch);release(tlas);release(grassBlas);release(staticBlas);release(blas);release(visibleGrassBuffer);release(grassBuffer);release(indexBuffer);release(baseTreeVertexBuffer);release(vertexBuffer);release(environmentBuffer);release(cameraBuffer);release(groundNormal);release(groundAlbedo);release(barkNormal);release(grassDepth);release(accumulation);release(output);release(treeWindPipeline);release(treeWindRoot);release(grassPipeline);release(grassRoot);release(stateProps);release(state);release(root);for(auto&b:backBuffers)release(b);release(gpuHeap);release(dsvHeap);release(rtvHeap);release(list);release(allocator);release(fence);release(queue);release(swap);release(device);release(factory);if(fenceEvent)CloseHandle(fenceEvent);}
     bool fail(HRESULT hr,const wchar_t*message){wchar_t text[320];wsprintfW(text,L"%s (HRESULT 0x%08X)",message,static_cast<unsigned>(hr));lastError=text;return false;}
@@ -94,6 +107,155 @@ struct DxrRenderer::Impl{
     template<class T>ID3D12Resource*upload(const std::vector<T>&data){ID3D12Resource*r=makeBuffer(data.size()*sizeof(T),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!r)return nullptr;void*mapped{};if(FAILED(r->Map(0,nullptr,&mapped))){release(r);return nullptr;}std::memcpy(mapped,data.data(),data.size()*sizeof(T));r->Unmap(0,nullptr);return r;}
     template<class T>ID3D12Resource*uploadDefault(const std::vector<T>&data){const UINT64 bytes=std::max<UINT64>(data.size()*sizeof(T),256);ID3D12Resource*destination=makeBuffer(bytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST),*staging=makeBuffer(bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!destination||!staging){release(destination);release(staging);return nullptr;}void*mapped{};if(FAILED(staging->Map(0,nullptr,&mapped))){release(destination);release(staging);return nullptr;}std::memcpy(mapped,data.data(),data.size()*sizeof(T));staging->Unmap(0,nullptr);if(!begin()){release(destination);release(staging);return nullptr;}list->CopyBufferRegion(destination,0,staging,0,data.size()*sizeof(T));auto barrier=transition(destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_GENERIC_READ);list->ResourceBarrier(1,&barrier);if(!execute()){release(destination);release(staging);return nullptr;}release(staging);return destination;}
     template<class T>ID3D12Resource*uploadDefaultUav(const std::vector<T>&data){const UINT64 bytes=std::max<UINT64>(data.size()*sizeof(T),256);ID3D12Resource*destination=makeBuffer(bytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),*staging=makeBuffer(bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!destination||!staging){release(destination);release(staging);return nullptr;}void*mapped{};if(FAILED(staging->Map(0,nullptr,&mapped))){release(destination);release(staging);return nullptr;}std::memcpy(mapped,data.data(),data.size()*sizeof(T));staging->Unmap(0,nullptr);if(!begin()){release(destination);release(staging);return nullptr;}list->CopyBufferRegion(destination,0,staging,0,data.size()*sizeof(T));auto barrier=transition(destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);list->ResourceBarrier(1,&barrier);if(!execute()){release(destination);release(staging);return nullptr;}release(staging);return destination;}
+    uint32_t terrainRetentionByte(float worldX,float worldZ)const{
+        constexpr int resolution=EnvironmentGenerator::terrainResolution;
+        constexpr int centre=(resolution-1)/2;
+        constexpr float gridExponent=2.05f;
+        if(environment.terrainVertices.size()<static_cast<size_t>(resolution)*resolution)
+            return 0;
+        const auto gridPosition=[](float world){
+            const float normalized=clamp(
+                world/EnvironmentGenerator::terrainHalfExtent,-1.0f,1.0f);
+            const float uniform=std::copysign(
+                std::pow(std::abs(normalized),1.0f/gridExponent),normalized);
+            return centre+uniform*centre;
+        };
+        const float gridX=gridPosition(worldX),gridZ=gridPosition(worldZ);
+        const int cellX=std::clamp(static_cast<int>(std::floor(gridX)),0,resolution-2);
+        const int cellZ=std::clamp(static_cast<int>(std::floor(gridZ)),0,resolution-2);
+        const auto gridCoordinate=[](int coordinate){
+            const float centred=static_cast<float>(coordinate-centre)/centre;
+            return std::copysign(EnvironmentGenerator::terrainHalfExtent*
+                                 std::pow(std::abs(centred),gridExponent),centred);
+        };
+        const float x0=gridCoordinate(cellX),x1=gridCoordinate(cellX+1);
+        const float z0=gridCoordinate(cellZ),z1=gridCoordinate(cellZ+1);
+        // The terrain triangles are planar in emitted world space.  The
+        // inverse-grid fractional coordinate is nonlinear and therefore is
+        // not a valid barycentric weight except at the vertices themselves.
+        const float u=clamp((worldX-x0)/(x1-x0),0.0f,1.0f);
+        const float v=clamp((worldZ-z0)/(z1-z0),0.0f,1.0f);
+        const auto retention=[&](int x,int z){
+            const uint32_t color=environment.terrainVertices[
+                static_cast<size_t>(z)*resolution+x].color;
+            return static_cast<float>(color>>24);
+        };
+        const float a=retention(cellX,cellZ),b=retention(cellX+1,cellZ);
+        const float c=retention(cellX,cellZ+1),d=retention(cellX+1,cellZ+1);
+        float value{};
+        // Match EnvironmentGenerator's alternating triangle diagonal exactly;
+        // puddle edges therefore agree with both the emitted terrain and the
+        // grass shader instead of being bilinearly smeared across a ridge.
+        if(((cellX+cellZ)&1)==0){
+            value=v>=u?a*(1-v)+c*(v-u)+d*u:
+                       a*(1-u)+d*v+b*(u-v);
+        }else{
+            value=u+v<=1?a*(1-u-v)+c*v+b*u:
+                          b*(1-v)+c*(1-u)+d*(u+v-1);
+        }
+        return static_cast<uint32_t>(clamp(value+0.5f,0.0f,255.0f));
+    }
+    void rebuildGrassStream(const Vec3&eye,float drawDistance){
+        constexpr int chunkCells=32;
+        constexpr float snap=12.0f,guardBand=22.0f;
+        const float centreX=std::round(eye.x/snap)*snap;
+        const float centreZ=std::round(eye.z/snap)*snap;
+        const float radius=drawDistance+guardBand;
+        streamedGrassPatches.clear();
+        const float cell=EnvironmentGenerator::grassCellSize;
+        const size_t expectedPatches=std::min<size_t>(grassPatchCount,
+            static_cast<size_t>(pi*radius*radius/(cell*cell)*.86f)+2048u);
+        if(streamedGrassPatches.capacity()<expectedPatches)
+            streamedGrassPatches.reserve(expectedPatches);
+        const int minimumX=static_cast<int>(std::floor((centreX-radius)/cell));
+        const int maximumX=static_cast<int>(std::ceil((centreX+radius)/cell));
+        const int minimumZ=static_cast<int>(std::floor((centreZ-radius)/cell));
+        const int maximumZ=static_cast<int>(std::ceil((centreZ+radius)/cell));
+        const auto floorDivide=[](int value){
+            int quotient=value/chunkCells;
+            if(value%chunkCells<0)--quotient;
+            return quotient;
+        };
+        const auto chunkKey=[](int x,int z){
+            return (static_cast<uint64_t>(static_cast<uint32_t>(x))<<32)|
+                   static_cast<uint32_t>(z);
+        };
+        const int minimumChunkX=floorDivide(minimumX);
+        const int maximumChunkX=floorDivide(maximumX);
+        const int minimumChunkZ=floorDivide(minimumZ);
+        const int maximumChunkZ=floorDivide(maximumZ);
+        const float radiusSquared=radius*radius;
+        const float chunkWorldSize=chunkCells*cell;
+        ++grassStreamEpoch;
+        size_t activeChunkCount=0;
+        for(int chunkZ=minimumChunkZ;chunkZ<=maximumChunkZ;++chunkZ){
+            for(int chunkX=minimumChunkX;chunkX<=maximumChunkX;++chunkX){
+                const float chunkMinimumX=chunkX*chunkWorldSize;
+                const float chunkMaximumX=chunkMinimumX+chunkWorldSize;
+                const float chunkMinimumZ=chunkZ*chunkWorldSize;
+                const float chunkMaximumZ=chunkMinimumZ+chunkWorldSize;
+                const float closestX=clamp(centreX,chunkMinimumX,chunkMaximumX);
+                const float closestZ=clamp(centreZ,chunkMinimumZ,chunkMaximumZ);
+                const float chunkDeltaX=closestX-centreX;
+                const float chunkDeltaZ=closestZ-centreZ;
+                if(chunkDeltaX*chunkDeltaX+chunkDeltaZ*chunkDeltaZ>radiusSquared)
+                    continue;
+                ++activeChunkCount;
+                const uint64_t key=chunkKey(chunkX,chunkZ);
+                auto [iterator,inserted]=grassChunkCache.try_emplace(key);
+                GrassChunk&chunk=iterator->second;
+                if(inserted){
+                    chunk.patches.reserve(chunkCells*chunkCells*3/4);
+                    const int firstCellX=chunkX*chunkCells;
+                    const int firstCellZ=chunkZ*chunkCells;
+                    for(int localZ=0;localZ<chunkCells;++localZ){
+                        for(int localX=0;localX<chunkCells;++localX){
+                            GrassPatchGpu patch;
+                            if(EnvironmentGenerator::makeGrassPatch(
+                                firstCellX+localX,firstCellZ+localZ,
+                                environment.grassSeed,patch)){
+                                const float patchX=(patch.minX+patch.maxX)*.5f;
+                                const float patchZ=(patch.minZ+patch.maxZ)*.5f;
+                                const uint32_t retention=terrainRetentionByte(patchX,patchZ);
+                                patch.seed=(patch.seed&0x00ffffffu)|(retention<<24);
+                                chunk.patches.push_back(patch);
+                            }
+                        }
+                    }
+                }
+                chunk.lastUse=grassStreamEpoch;
+                for(const GrassPatchGpu&patch:chunk.patches){
+                    const float patchX=(patch.minX+patch.maxX)*.5f-centreX;
+                    const float patchZ=(patch.minZ+patch.maxZ)*.5f-centreZ;
+                    if(patchX*patchX+patchZ*patchZ>radiusSquared)continue;
+                    streamedGrassPatches.push_back(patch);
+                    if(streamedGrassPatches.size()>=grassPatchCount)break;
+                }
+                if(streamedGrassPatches.size()>=grassPatchCount)break;
+            }
+            if(streamedGrassPatches.size()>=grassPatchCount)break;
+        }
+        // Keep roughly one maximum-range neighbourhood plus a small travel
+        // history.  Cache eviction never affects blade identity because every
+        // chunk is rebuilt solely from its absolute integer coordinates.
+        const size_t cacheLimit=std::max<size_t>(256,activeChunkCount+128);
+        if(grassChunkCache.size()>cacheLimit){
+            std::vector<std::pair<uint64_t,uint64_t>>evictionCandidates;
+            evictionCandidates.reserve(grassChunkCache.size()-activeChunkCount);
+            for(const auto&entry:grassChunkCache)
+                if(entry.second.lastUse!=grassStreamEpoch)
+                    evictionCandidates.push_back({entry.second.lastUse,entry.first});
+            std::sort(evictionCandidates.begin(),evictionCandidates.end());
+            size_t removeCount=grassChunkCache.size()-cacheLimit;
+            for(const auto&candidate:evictionCandidates){
+                if(removeCount==0)break;
+                removeCount-=grassChunkCache.erase(candidate.second);
+            }
+        }
+        grassStreamCenterX=centreX;grassStreamCenterZ=centreZ;
+        grassStreamRadius=radius;
+        grassStreamValid=true;
+    }
     std::pair<UINT,UINT> compactVisibleGrass(
         const Vec3&eye,const Vec3&forward,const Vec3&right,const Vec3&up,
         float tanHalf,float aspect,const DebugRenderSettings&settings){
@@ -103,7 +265,15 @@ struct DxrRenderer::Impl{
         const float shortDistance=clamp(settings.shortGrassDrawDistance,2.0f,128.0f);
         const float tallDistance=std::max(shortDistance,
             clamp(settings.tallGrassDrawDistance,4.0f,192.0f));
-        for(const GrassPatchGpu&patch:environment.grassPatches){
+        const float streamDeltaX=eye.x-grassStreamCenterX;
+        const float streamDeltaZ=eye.z-grassStreamCenterZ;
+        const float streamDelta=std::sqrt(streamDeltaX*streamDeltaX+
+                                          streamDeltaZ*streamDeltaZ);
+        if(!grassStreamValid||!std::isfinite(streamDelta)||
+           streamDelta>12.0f||grassStreamRadius<tallDistance+12.0f){
+            rebuildGrassStream(eye,tallDistance);
+        }
+        for(const GrassPatchGpu&patch:streamedGrassPatches){
             const bool tall=((patch.packed>>16)&255u)!=0;
             const float drawDistance=tall?tallDistance:shortDistance;
             const Vec3 center{(patch.minX+patch.maxX)*.5f,patch.baseY,
@@ -121,8 +291,10 @@ struct DxrRenderer::Impl{
             if(std::abs(dot(delta,right))>projectedDepth*tanHalf*aspect+radius)continue;
             if(std::abs(dot(delta,up))>projectedDepth*tanHalf+radius)continue;
             if(dot(delta,delta)<shortDistance*shortDistance){
+                if(nearCount+farCount>=grassPatchCount)break;
                 visible[nearCount++]=patch;
             }else if(tall){
+                if(nearCount+farCount>=grassPatchCount)break;
                 visible[grassPatchCount-1u-farCount++]=patch;
             }
         }
@@ -263,6 +435,13 @@ struct DxrRenderer::Impl{
         if(visibleGrassBuffer&&visibleGrassMapped)visibleGrassBuffer->Unmap(0,nullptr);
         visibleGrassMapped=nullptr;release(visibleGrassBuffer);
         release(grassBuffer);release(indexBuffer);release(baseTreeVertexBuffer);release(vertexBuffer);
+        grassChunkCache.clear();grassStreamEpoch=0;
+        grassChunkCache.reserve(1024);
+        streamedGrassPatches.clear();
+        grassStreamValid=false;
+        grassStreamCenterX=std::numeric_limits<float>::quiet_NaN();
+        grassStreamCenterZ=std::numeric_limits<float>::quiet_NaN();
+        grassStreamRadius=0;
         if(environment.terrainVertices.empty())environment=EnvironmentGenerator{}.build();
 
         std::vector<MeshVertex>treeVertices=tree.branchVertices;
@@ -295,10 +474,12 @@ struct DxrRenderer::Impl{
         vertexCount=static_cast<UINT>(vertices.size());indexCount=static_cast<UINT>(indices.size());
         baseTreeVertexBuffer=uploadDefault(treeVertices);
         vertexBuffer=uploadDefaultUav(vertices);indexBuffer=uploadDefault(indices);
-        grassPatchCount=static_cast<UINT>(environment.grassPatches.size());
+        constexpr UINT mapGrassPatchCapacity=600000u;
+        grassPatchCount=std::max<UINT>(
+            static_cast<UINT>(environment.grassPatches.size()),mapGrassPatchCapacity);
         grassBuffer=uploadDefault(environment.grassPatches);
         visibleGrassBuffer=makeBuffer(
-            std::max<UINT64>(environment.grassPatches.size()*sizeof(GrassPatchGpu),256),
+            std::max<UINT64>(static_cast<UINT64>(grassPatchCount)*sizeof(GrassPatchGpu),256),
             D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
         if(visibleGrassBuffer&&
            FAILED(visibleGrassBuffer->Map(0,nullptr,&visibleGrassMapped))){

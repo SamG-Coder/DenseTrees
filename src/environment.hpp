@@ -55,6 +55,11 @@ struct EnvironmentMesh {
     std::vector<MeshVertex> detailVertices;
     std::vector<uint32_t> detailIndices;
     std::vector<GrassPatchGpu> grassPatches;
+    // Seed used by the camera-relative grass clipmap.  Grass patches are
+    // regenerated from absolute world-grid coordinates, so they stay anchored
+    // while the player traverses the full map instead of ending at a fixed
+    // world-origin disc.
+    uint32_t grassSeed{};
     uint32_t tallGrassPatchCount{};
     uint32_t rockCount{};
     uint32_t shrubCount{};
@@ -92,10 +97,11 @@ public:
     static constexpr float traversalEdgeMargin = 2.0f;
     static constexpr float traversalHalfExtent =
         terrainHalfExtent - traversalEdgeMargin;
-    // Covers the complete 30 m camera orbit plus the 192 m debug range.
-    // Visible blades are instanced by the raster overlay, so this broader
-    // field no longer bloats the ray-tracing acceleration structure.
+    // Legacy origin-field radius retained for deterministic generation tests.
+    // Rendering uses makeGrassPatch() as a camera-relative world-anchored
+    // clipmap, so this is no longer a visible map boundary.
     static constexpr float grassHalfExtent = 224.0f;
+    static constexpr float grassCellSize = 0.55f;
 
     static float terrainHeight(float x, float z);
     static Vec3 terrainNormal(float x, float z);
@@ -107,10 +113,21 @@ public:
     static float riverHalfWidth(float z);
     static float riverBedHeight(float z);
     static float riverSurfaceHeight(float z);
+    // The wetted shoreline is shared by the terrain carve, persistent-water
+    // mesh, grass biome mask, and tests.  Keeping it as an explicit world
+    // contract prevents a water strip from ending over a different bank
+    // profile and exposing a dark suspended edge.
+    static float riverWaterHalfWidth(float z);
     static float tributaryCenterZ(float x);
     static float tributaryHalfWidth(float x);
     static float tributaryBedHeight(float x);
     static float tributarySurfaceHeight(float x);
+    static float tributaryWaterHalfWidth(float x);
+    // Deterministically materializes one absolute world-grid grass patch.
+    // Returns false for permanent water, exposed dirt/mineral ground, steep
+    // slopes and other biomes that should not carry meadow grass.
+    static bool makeGrassPatch(int cellX,int cellZ,uint32_t seed,
+                               GrassPatchGpu& patch);
     EnvironmentMesh build(uint32_t seed = 0x6f616b31u) const;
 };
 
