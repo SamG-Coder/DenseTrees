@@ -1,4 +1,21 @@
+# CMake out-of-source build trees
 /build/
+/build-*/
+/cmake-build-*/
+
+# Accidental in-source CMake/Ninja output
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+CMakeUserPresets.json
+
 /.vs/
 *.user
 *.suo
