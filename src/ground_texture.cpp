@@ -137,29 +137,52 @@ float cellularStemFragment(const CellularSample& stem,float length,float width,
 MaterialSample denseTurf(float u,float v,uint32_t seed) {
     const float macro=periodicFbm(u,v,4,5,seed^0x71b52a91u);
     const float fine=periodicFbm(u,v,32,4,seed^0x36d17ab5u);
+    // A mown lawn is not one uniformly bright green mat.  Fertility and
+    // drying form overlapping colonies at roughly 15--50 cm, while the cut
+    // leaf litter remains a separate centimetre-scale layer below them.
+    const float oliveField=periodicFbm(u,v,7,4,seed^0x6c8e9cf5u);
+    const float feltField=periodicFbm(u,v,18,3,seed^0xb74f0a31u);
     const CellularSample mat=periodicCellular(u,v,37,seed^0xad90777du);
     const CellularSample cutA=periodicCellular(u,v,103,seed^0x3142c7a1u);
     const CellularSample cutB=periodicCellular(u,v,71,seed^0xf0ad239bu);
     const float turfClump=(1-smoothStep(.12f,.48f,mat.nearest))*(.72f+.28f*mat.identity);
     const float fragments=saturate(cellularStemFragment(cutA,.39f,.060f,.40f)+
                                    cellularStemFragment(cutB,.34f,.052f,.61f)*.70f);
-    const float pale=smoothStep(.70f,.94f,periodicValueNoise(u,v,19,seed^0x05f131b7u));
+    const float olive=smoothStep(.54f,.78f,oliveField+.10f*(.5f-macro));
+    const float felt=smoothStep(.56f,.82f,feltField+.12f*olive);
+    const float thatch=saturate(fragments*.72f+felt*olive*.24f);
+    const float lush=smoothStep(.48f,.76f,macro+.08f*turfClump)*(1-.58f*olive);
+
+    const float greenR=mix(.022f,.052f,macro)+.009f*turfClump;
+    const float greenG=mix(.064f,.142f,macro)+.018f*turfClump;
+    const float greenB=mix(.006f,.018f,fine)+.002f*turfClump;
+    const float oliveR=mix(.066f,.098f,feltField);
+    const float oliveG=mix(.088f,.120f,feltField);
+    const float oliveB=mix(.010f,.022f,fine);
     MaterialSample sample;
-    sample.red=mix(.030f,.070f,macro)+.010f*turfClump+.012f*fragments+.018f*pale;
-    sample.green=mix(.088f,.170f,macro)+.020f*turfClump+.026f*fragments+.020f*pale;
-    sample.blue=mix(.010f,.033f,fine)+.004f*turfClump+.005f*fragments+.006f*pale;
-    sample.roughness=saturate(.95f-.030f*turfClump-.045f*fragments-
-                              .025f*macro+.018f*(1-fine));
-    sample.height=saturate(.48f+.090f*(macro-.5f)+.075f*(fine-.5f)+
-                           .070f*turfClump+.045f*fragments);
-    sample.cavity=saturate(.08f+.18f*(1-fine)+.16f*(1-turfClump)*
-                           smoothStep(.35f,.75f,macro));
+    sample.red=mix(greenR,oliveR,olive*.52f);
+    sample.green=mix(greenG,oliveG,olive*.52f);
+    sample.blue=mix(greenB,oliveB,olive*.52f);
+    // Cut fragments are straw-coloured rather than brighter green.  Keeping
+    // the blend partial leaves a dark, living sward visible between pieces.
+    sample.red=mix(sample.red,.148f,thatch*.58f);
+    sample.green=mix(sample.green,.120f,thatch*.58f);
+    sample.blue=mix(sample.blue,.032f,thatch*.58f);
+    sample.red+=.008f*lush;sample.green+=.018f*lush;sample.blue+=.001f*lush;
+    sample.roughness=saturate(.925f+.030f*felt-.035f*turfClump-
+                              .025f*lush+.018f*(1-fine));
+    sample.height=saturate(.465f+.070f*(macro-.5f)+.050f*(fine-.5f)+
+                           .052f*turfClump+.026f*fragments-.020f*felt);
+    sample.cavity=saturate(.105f+.16f*(1-fine)+.19f*(1-turfClump)*
+                           smoothStep(.32f,.72f,macro)+.055f*felt-
+                           .035f*fragments);
     return sample;
 }
 
 MaterialSample coarseMeadow(float u,float v,uint32_t seed) {
     const float macro=periodicFbm(u,v,2,6,seed^0xe8a72b6du);
     const float dryPatch=periodicFbm(u,v,7,4,seed^0x94c3d8f1u);
+    const float felt=periodicFbm(u,v,20,3,seed^0x4bb8615du);
     const float grit=periodicFbm(u,v,47,3,seed^0x09d31efbu);
     const CellularSample tuft=periodicCellular(u,v,23,seed^0x30b4a6c9u);
     const CellularSample stone=periodicCellular(u,v,71,seed^0xc075b31du);
@@ -171,18 +194,25 @@ MaterialSample coarseMeadow(float u,float v,uint32_t seed) {
                                (.34f+.82f*tuftMask));
     const float exposedGrit=(1-smoothStep(.10f,.25f,stone.nearest))*
                             smoothStep(.70f,.94f,stone.identity)*smoothStep(.50f,.76f,dryPatch);
-    const float dryness=smoothStep(.47f,.80f,dryPatch+.13f*(1-macro));
-    const float greenR=mix(.038f,.074f,macro),greenG=mix(.085f,.157f,macro),greenB=mix(.012f,.032f,macro);
-    const float dryR=mix(.112f,.202f,dryPatch),dryG=mix(.096f,.170f,dryPatch),dryB=mix(.030f,.060f,dryPatch);
+    const float dryness=smoothStep(.48f,.80f,dryPatch+.13f*(1-macro));
+    const float thatch=saturate(stems*.68f+
+        smoothStep(.61f,.84f,felt)*dryness*.26f);
+    const float greenR=mix(.030f,.066f,macro),greenG=mix(.072f,.148f,macro),greenB=mix(.008f,.023f,grit);
+    const float dryR=mix(.088f,.162f,dryPatch),dryG=mix(.088f,.146f,dryPatch),dryB=mix(.018f,.041f,dryPatch);
     MaterialSample sample;
-    sample.red=mix(greenR,dryR,dryness)+.016f*stems+.045f*exposedGrit;
-    sample.green=mix(greenG,dryG,dryness)+.019f*stems+.041f*exposedGrit;
-    sample.blue=mix(greenB,dryB,dryness)+.005f*stems+.034f*exposedGrit;
-    sample.roughness=saturate(.93f+.025f*dryness-.070f*stems-.090f*exposedGrit);
+    sample.red=mix(greenR,dryR,dryness)+.045f*exposedGrit;
+    sample.green=mix(greenG,dryG,dryness)+.041f*exposedGrit;
+    sample.blue=mix(greenB,dryB,dryness)+.034f*exposedGrit;
+    sample.red=mix(sample.red,.155f,thatch*.46f);
+    sample.green=mix(sample.green,.126f,thatch*.46f);
+    sample.blue=mix(sample.blue,.034f,thatch*.46f);
+    sample.roughness=saturate(.925f+.035f*dryness+.018f*felt-
+                              .045f*stems-.090f*exposedGrit);
     sample.height=saturate(.46f+.085f*(macro-.5f)+.070f*(grit-.5f)+
-                           .085f*tuftMask+.055f*stems+.10f*exposedGrit);
-    sample.cavity=saturate(.12f+.26f*(1-tuftMask)+.18f*(1-stems)*
-                           smoothStep(.42f,.78f,dryPatch));
+                           .070f*tuftMask+.038f*stems+.10f*exposedGrit-
+                           .018f*felt);
+    sample.cavity=saturate(.13f+.24f*(1-tuftMask)+.17f*(1-stems)*
+                           smoothStep(.42f,.78f,dryPatch)+.045f*felt);
     return sample;
 }
 

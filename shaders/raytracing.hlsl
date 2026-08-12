@@ -1321,6 +1321,10 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float fineFootprint=min(pixelWorld*sqrt(grazing),.55);
         float broad=filteredFbmWorld(hit.xz+float2(37.1,-19.6),.030,footprint);
         float patch=filteredFbmWorld(hit.xz+float2(-11.4,63.2),.140,footprint);
+        // Reference lawns carry soft metre-scale colonies of dark green,
+        // olive and yellow-green turf.  Keep these world coherent so the
+        // detailed atlas reads as a cut mat rather than coloured pixel noise.
+        float colony=filteredFbmWorld(hit.xz+float2(18.9,-42.7),.52,footprint);
         float fine=filteredValueNoise(hit.xz+float2(7.7,21.3),2.3,fineFootprint);
         float slope=1-saturate(surfaceNormal.y),rootDistance=length(hit.xz);
         terrainSlope=length(surfaceNormal.xz)/max(surfaceNormal.y,.05);
@@ -1330,12 +1334,18 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float lushMask=smoothstep(.42,.72,terrainMoisture);
         float dryDriver=.65*(1-broad)+.35*patch;
         float dryMask=smoothstep(.64,.82,dryDriver)*(1-.65*lushMask);
-        float3 shadowSward=float3(.028,.050,.012),pasture=float3(.070,.110,.027);
-        float3 lushSward=float3(.098,.154,.036),drySward=float3(.155,.134,.052);
+        float oliveMask=smoothstep(.54,.77,
+            .54*(1-terrainMoisture)+.46*colony)*(1-.58*lushMask);
+        float3 shadowSward=float3(.020,.048,.007),pasture=float3(.046,.112,.013);
+        float3 lushSward=float3(.066,.158,.018),oliveSward=float3(.091,.109,.014);
+        float3 drySward=float3(.142,.116,.029);
         float3 meadow=lerp(shadowSward,pasture,smoothstep(.24,.52,terrainMoisture));
-        meadow=lerp(meadow,lushSward,lushMask*.72);
-        meadow=lerp(meadow,drySward,dryMask*.62);
-        meadow*=lerp(.90,1.10,fine);
+        meadow=lerp(meadow,lushSward,lushMask*.62);
+        meadow=lerp(meadow,oliveSward,oliveMask*.46);
+        meadow=lerp(meadow,drySward,dryMask*.52);
+        // Fine luminance modulation stays narrow; the phone references are
+        // saturated by sunlight, but the material itself must not be neon.
+        meadow*=lerp(.92,1.07,fine);
 
         float soilMacro=filteredFbmWorld(hit.xz+float2(83,-47),.090,footprint);
         float soilFine=filteredValueNoise(hit.xz+float2(-31,14),1.7,fineFootprint);
@@ -1406,9 +1416,10 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
                 textureNormal=lerp(textureNormal,soilNormal,soilMask);
                 textureLow=lerp(textureLow,soilLow,soilMask);
             }
-            float3 highFrequency=clamp(textureAlbedo.rgb/max(textureLow.rgb,.012),.68,1.42);
-            highFrequency*=lerp(.94,1.06,textureNormal.b);
-            float materialDetail=saturate(nearTextureWeight*clamp(camera.groundSettings.y,0.0,2.0)*.90);
+            float3 highFrequency=clamp(textureAlbedo.rgb/max(textureLow.rgb,.012),.72,1.34);
+            highFrequency*=lerp(.95,1.05,textureNormal.b);
+            float materialDetail=saturate(nearTextureWeight*
+                clamp(camera.groundSettings.y,0.0,2.0)*.84);
             albedo*=lerp(float3(1,1,1),highFrequency,materialDetail);
             terrainRoughness=textureAlbedo.a;
             terrainCavity=textureNormal.a*nearTextureWeight*.55;

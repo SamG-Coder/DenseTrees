@@ -92,6 +92,46 @@ MeadowColourFields meadowColourFields(float x,float z) {
     return {fertility,dry,lush,warmCool};
 }
 
+// Both the legacy origin field and the camera-streamed clipmap use this one
+// population contract.  At the normal 1.0 height scale, the visible overlay
+// scatters blades below each encoded maximum, so codes 13--20 read as roughly
+// 3--8 cm mown turf and codes 32--40 as roughly 8--16 cm coarse stems.  The
+// packed byte layout remains unchanged.
+struct MownTurfPopulation {
+    uint32_t packed{};
+    float maximumHeight{};
+};
+
+MownTurfPopulation makeMownTurfPopulation(Rng& rng,bool coarse) {
+    constexpr float heightCodeStep=.004f;
+    const float shortHeight=rng.range(.053f,.084f);
+    const float coarseHeight=coarse?rng.range(.129f,.164f):0.0f;
+    const uint32_t shortCode=static_cast<uint32_t>(
+        clamp(shortHeight/heightCodeStep,1,255));
+    const uint32_t coarseCode=coarse?static_cast<uint32_t>(
+        clamp(coarseHeight/heightCodeStep,1,255)):0u;
+    const uint32_t bladeCount=28u+static_cast<uint32_t>(rng.unit()*7.0f);
+    const uint32_t coarseCount=coarse?
+        1u+static_cast<uint32_t>(rng.unit()*3.0f):0u;
+    return {(bladeCount&255u)|(shortCode<<8)|(coarseCount<<16)|(coarseCode<<24),
+            coarse?coarseHeight:shortHeight};
+}
+
+float mownTurfDensity(const MeadowColourFields& colour) {
+    // Broad fertility keeps the lawn full, while the existing coherent dry
+    // colonies open a few soft-edged thin areas instead of salt-and-pepper
+    // holes chosen independently in every cell.
+    return clamp(.88f+.12f*colour.fertility-.28f*colour.dryColony,
+                 .58f,1.0f);
+}
+
+float coarseTurfProbability(const MeadowColourFields& colour,float habitat) {
+    // Coarse stems occur as occasional local accents in lush or sheltered
+    // colonies.  They are deliberately rare enough never to form a canopy.
+    return clamp(.025f+.035f*colour.fertility+.020f*colour.lushColony+
+                 .035f*clamp(habitat,0.0f,1.0f),.025f,.11f);
+}
+
 uint32_t worldGrassHash(int cellX,int cellZ,uint32_t seed) {
     uint32_t value=seed^static_cast<uint32_t>(cellX)*0x8da6b343u^
                    static_cast<uint32_t>(cellZ)*0xd8163841u;
@@ -807,25 +847,18 @@ bool EnvironmentGenerator::makeGrassPatch(int cellX,int cellZ,uint32_t seed,
     suitability*=1-.94f*coherentBare;
     suitability*=smoothStep(.80f,.93f,normal.y);
     suitability*=smoothStep(1.8f,9.0f,bankDistance);
+    suitability*=mownTurfDensity(colour);
     if(rng.unit()>clamp(suitability,0.0f,1.0f))return false;
 
-    const float tallProbability=clamp(.08f+.50f*meadow+.50f*riparian+
-                                      .10f*upland-.55f*mineral,0.0f,.78f);
-    const bool tall=rng.unit()<tallProbability;
+    const float coarseHabitat=clamp(.25f*meadow+.65f*riparian+
+                                    .10f*upland-.45f*mineral,0.0f,1.0f);
+    const bool coarse=rng.unit()<coarseTurfProbability(colour,coarseHabitat);
     const float canopyShade=1.0f-.26f*(1.0f-smoothStep(5.0f,11.0f,heroRadius));
     if(rng.unit()>canopyShade)return false;
-    const float shortHeight=rng.range(.045f,.120f)*(.84f+.22f*moisture)*
-                            (.72f+.28f*clamp(meadow+riparian,0.0f,1.0f));
-    const float tallHeight=tall?rng.range(.40f,.82f)*(.86f+.18f*moisture):0.0f;
-    const uint32_t shortCode=static_cast<uint32_t>(clamp(shortHeight/.004f,1,255));
-    const uint32_t tallCode=tall?
-        static_cast<uint32_t>(clamp(tallHeight/.004f,1,255)):0u;
-    const uint32_t bladeCount=26u+static_cast<uint32_t>(rng.unit()*9.0f);
-    const uint32_t tallCount=tall?16u+static_cast<uint32_t>(rng.unit()*9.0f):0u;
-    const uint32_t packed=(bladeCount&255u)|(shortCode<<8)|(tallCount<<16)|(tallCode<<24);
-    const float maximumHeight=(tall?tallHeight:shortHeight)*2.5f;
-    const float lateralRatio=tall?.66f:.52f;
-    const float maximumWidth=tall?.043f:.018f;
+    const MownTurfPopulation population=makeMownTurfPopulation(rng,coarse);
+    const float maximumHeight=population.maximumHeight*2.5f;
+    const float lateralRatio=coarse?.66f:.52f;
+    const float maximumWidth=coarse?.043f:.018f;
     constexpr float boundsSafety=.012f;
     const float horizontalReach=.245f+maximumHeight*(slope+lateralRatio)+
                                 maximumWidth+boundsSafety;
@@ -840,7 +873,7 @@ bool EnvironmentGenerator::makeGrassPatch(int cellX,int cellZ,uint32_t seed,
     const uint32_t packedSeed=rng.next()&0x00ffffffu;
     patch={x-horizontalReach,baseY-lowerReach,z-horizontalReach,
            x+horizontalReach,baseY+upperReach,z+horizontalReach,
-           packedSeed,packed,baseY,normal.x,normal.z,moisture,
+           packedSeed,population.packed,baseY,normal.x,normal.z,moisture,
            colour.fertility,colour.dryColony,colour.lushColony,
            colour.warmCool};
     return true;
@@ -1160,31 +1193,25 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
                                     +.07f*std::sin(dx*8.3f-dz*5.2f-island.phase);
             islandStrength=std::max(islandStrength,clamp((ragged-q)*1.7f,0.0f,1.0f));
         }
-        // Long grass is a continuous meadow with denser island-like colonies,
-        // rather than a handful of isolated vertical tufts.
-        const bool tall=grassRng.unit()<(.50f+.24f*islandStrength);
+        // A mown lawn is overwhelmingly short.  Existing island fields now
+        // localize the occasional coarse stem instead of creating a second,
+        // knee-high meadow canopy.
+        const bool coarse=grassRng.unit()<
+            coarseTurfProbability(colour,islandStrength);
         const float canopyShade=1.0f-.26f*(1.0f-smoothStep(5.0f,11.0f,radius));
-        const float meadowVariation=.78f+.25f*colour.fertility;
-        const float density=std::min(1.0f,canopyShade*meadowVariation*(tall?1.18f:1.0f));
+        const float density=canopyShade*mownTurfDensity(colour);
         if(grassRng.unit()>density)continue;
 
         const float baseY=terrainHeight(x,z)+.006f;
         const Vec3 normal=terrainNormal(x,z);
         const float moisture=clamp(.58f+(colour.fertility-.5f)*.34f+
                                    grassRng.range(-.018f,.018f),0,1);
-        const float shortHeight=grassRng.range(.045f,.120f)*(.88f+.17f*moisture);
-        const float tallHeight=tall?grassRng.range(.42f,.84f)*(.88f+.17f*moisture):0.0f;
-        const uint32_t shortCode=static_cast<uint32_t>(clamp(shortHeight/.004f,1,255));
-        const uint32_t tallCode=tall?
-            static_cast<uint32_t>(clamp(tallHeight/.004f,1,255)):0u;
-        const uint32_t bladeCount=28u+static_cast<uint32_t>(grassRng.unit()*7.0f);
-        const uint32_t tallCount=tall?18u+static_cast<uint32_t>(grassRng.unit()*7.0f):0u;
-        const uint32_t packed=(bladeCount&255u)|(shortCode<<8)|(tallCount<<16)|(tallCode<<24);
-        const float maximumHeight=(tall?tallHeight:shortHeight)*2.5f;
+        const MownTurfPopulation population=makeMownTurfPopulation(grassRng,coarse);
+        const float maximumHeight=population.maximumHeight*2.5f;
         const float slope=std::sqrt(normal.x*normal.x+normal.z*normal.z)/
                           std::max(normal.y,.25f);
-        const float lateralRatio=tall?.66f:.52f;
-        const float maximumWidth=tall?.043f:.018f;
+        const float lateralRatio=coarse?.66f:.52f;
+        const float maximumWidth=coarse?.043f:.018f;
         constexpr float grassBoundsSafety=.012f;
         const float horizontalReach=.245f+maximumHeight*(slope+lateralRatio)+
                                     maximumWidth+grassBoundsSafety;
@@ -1198,10 +1225,10 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         mesh.grassPatches.push_back({x-horizontalReach,baseY-lowerReach,
                                      z-horizontalReach,x+horizontalReach,
                                      baseY+upperReach,z+horizontalReach,
-                                     packedSeed,packed,baseY,normal.x,normal.z,moisture,
+                                     packedSeed,population.packed,baseY,normal.x,normal.z,moisture,
                                      colour.fertility,colour.dryColony,colour.lushColony,
                                      colour.warmCool});
-        if(tall)++mesh.tallGrassPatchCount;
+        if(coarse)++mesh.tallGrassPatchCount;
     }
 
     Rng detailRng(seed^0xc8013ea4u);

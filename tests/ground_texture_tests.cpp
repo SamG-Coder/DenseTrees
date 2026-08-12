@@ -58,6 +58,15 @@ void validatePatch(const dense::GrassPatchGpu& patch) {
             "grass patch base lies outside its AABB");
     require(patch.moisture>=0&&patch.moisture<=1,
             "grass moisture escaped its normalized range");
+    const uint32_t bladeCount=patch.packed&255u;
+    const uint32_t shortCode=(patch.packed>>8)&255u;
+    const uint32_t coarseCount=(patch.packed>>16)&255u;
+    const uint32_t coarseCode=(patch.packed>>24)&255u;
+    require(bladeCount>=28&&bladeCount<=34&&shortCode>=13&&shortCode<=20,
+            "streamed grass left the dense mown-turf population range");
+    require(coarseCount?(coarseCount<=3&&coarseCode>=32&&coarseCode<=40&&
+                         coarseCode>shortCode):(coarseCode==0),
+            "streamed grass emitted an invalid coarse-blade population");
 }
 
 } // namespace
@@ -93,7 +102,7 @@ int main() {
     // origin-centred grass disc and must still contain healthy pasture.
     constexpr uint32_t grassSeed=0x6f616b31u;
     const int farBaseX=grassCell(880.0f),farBaseZ=grassCell(-760.0f);
-    int farAccepted=0,deterministicAccepted=0;
+    int farAccepted=0,deterministicAccepted=0,farCoarse=0;
     for(int z=0;z<64;++z)for(int x=0;x<64;++x) {
         dense::GrassPatchGpu first{},second{};
         const bool accepted=dense::EnvironmentGenerator::makeGrassPatch(
@@ -108,6 +117,7 @@ int main() {
                 "absolute grass cell did not reproduce byte-identical data");
         ++deterministicAccepted;
         validatePatch(first);
+        farCoarse+=((first.packed>>16)&255u)!=0;
         const float patchX=(first.minX+first.maxX)*.5f;
         const float patchZ=(first.minZ+first.maxZ)*.5f;
         require(std::sqrt(patchX*patchX+patchZ*patchZ)>
@@ -118,6 +128,8 @@ int main() {
             "far meadow produced too little grass outside the legacy radius");
     require(deterministicAccepted==farAccepted,
             "not every accepted far patch was checked deterministically");
+    require(farCoarse>0&&farCoarse*8<farAccepted,
+            "far-field coarse blades are absent or no longer rare");
 
     // The persistent water contract must win before stochastic biome thinning:
     // no seed or camera position may put meadow blades in either wetted channel.
@@ -155,7 +167,8 @@ int main() {
             "tributary exclusion survey did not cover enough cells");
 
     std::cout << "grass survey: far=" << farAccepted
-              << "/4096 main-water=" << mainWaterCells
+              << "/4096 coarse=" << farCoarse
+              << " main-water=" << mainWaterCells
               << " tributary-water=" << tributaryWaterCells << '\n';
     return EXIT_SUCCESS;
 }

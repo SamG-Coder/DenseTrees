@@ -49,9 +49,9 @@ float3 tonemap(float3 x) {
 
 float3 colorGrade(float3 c) {
     float luminance=dot(c,float3(.2126,.7152,.0722));
-    c=lerp(luminance.xxx,c,1.055);
-    c=(c-.18)*1.015+.18;
-    c=pow(saturate(c),.985)*float3(1.006,1.0,.992);
+    c=lerp(luminance.xxx,c,1.025);
+    c=(c-.18)*.995+.18;
+    c=pow(saturate(c),.992)*float3(1.002,1.0,.994);
     return saturate(c);
 }
 
@@ -227,13 +227,17 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
     uint patchRandomSeed=patch.seed&0x00ffffffu;
     uint seed=hashUint(patchRandomSeed^((bladeIndex+1u)*0x9e3779b9u));
     blade.tall=bladeIndex<tallCount?1.0:0.0;
-    float radius=sqrt(randomUint(seed))*lerp(.265,.072,blade.tall);
+    // The retained far-resident population is distributed through the patch
+    // like the short blades.  Keeping it in tight central clumps made every
+    // lawn patch read as a tuft of long meadow grass.
+    float radius=sqrt(randomUint(seed))*lerp(.265,.205,blade.tall);
     float offsetAngle=randomUint(seed^0x68bc21ebu)*6.2831853;
     uint subclump=bladeIndex%3u;
     float clusterAngle=randomUint(patchRandomSeed^0x91e10da5u)*6.2831853+
                        float(subclump)*2.0943951+
                        (randomUint(seed^0x243f6a88u)-.5)*.34;
-    float clusterRadius=lerp(.10,.15,randomUint(patchRandomSeed^(subclump*0x9e3779b9u)))*blade.tall;
+    float clusterRadius=lerp(.018,.045,
+        randomUint(patchRandomSeed^(subclump*0x9e3779b9u)))*blade.tall;
     blade.base=float3((patch.minX+patch.maxX)*.5,patch.baseY,
                       (patch.minZ+patch.maxZ)*.5)
               +axisX*(cos(offsetAngle)*radius+cos(clusterAngle)*clusterRadius)
@@ -243,23 +247,35 @@ BladeData makeBlade(GrassPatch patch,uint bladeIndex,float3 patchNormal,
                      (randomUint(seed^0x68bc21ebu)-.5)*.42;
     blade.side=normalize(axisX*cos(bladeAngle)+axisZ*sin(bladeAngle));
     blade.naturalLean=normalize(cross(blade.side,blade.normal));
-    blade.species=float(patchRandomSeed%3u);
+    // A small independent subset supplies the broader leaves visible in
+    // closely mown mixed turf; it is deliberately unrelated to grass LOD.
+    blade.species=randomUint(seed^0x7f4a7c15u);
     float shortMaximum=float((patch.packed>>8)&255u)*.004;
     float tallMaximum=float((patch.packed>>24)&255u)*.004;
     float maximumHeight=lerp(shortMaximum,tallMaximum,blade.tall);
-    blade.height=maximumHeight*lerp(.50,1.0,randomUint(seed^0xa511e9b3u))*
+    blade.dryness=randomUint(seed^0xc2b2ae35u);
+    float clippingThreshold=lerp(.925,.970,patch.moisture)-
+                            patch.colourDryColony*.025;
+    float dryClipping=step(clippingThreshold,blade.dryness);
+    blade.height=maximumHeight*lerp(.62,1.0,randomUint(seed^0xa511e9b3u))*
                  clamp(camera.grassSettings.y,.35,2.5);
-    blade.halfWidth=lerp(lerp(.0022,.0048,randomUint(seed^0x63d83595u)),
-                         lerp(.0035,.0085,randomUint(seed^0x63d83595u)),blade.tall)
-                   *lerp(.88,1.16,patch.moisture);
+    blade.height*=lerp(1.0,.52,dryClipping);
+    float widthVariation=randomUint(seed^0x63d83595u);
+    float mediumBlade=max(blade.tall,step(.86,blade.species));
+    float fineWidth=lerp(.0004,.0010,widthVariation);
+    float mediumWidth=lerp(.0010,.0020,widthVariation);
+    blade.halfWidth=lerp(fineWidth,mediumWidth,mediumBlade)*
+                    lerp(.92,1.10,patch.moisture);
     float individualPhase=randomUint(seed^0xb5297a4du)*6.2831853;
     float coherentPhase=randomUint(patchRandomSeed^0xd1b54a35u)*6.2831853;
-    blade.phase=lerp(individualPhase,coherentPhase,.78*blade.tall);
-    blade.stiffness=lerp(lerp(.36,.88,randomUint(seed^0x1b56c4e9u)),
-                         lerp(.24,.62,randomUint(seed^0x1b56c4e9u)),blade.tall);
-    blade.dryness=randomUint(seed^0xc2b2ae35u);
-    blade.leanStrength=lerp(blade.tall>.5?.22:.025,blade.tall>.5?.45:.14,
-                            randomUint(seed^0x94d049bbu));
+    blade.phase=lerp(individualPhase,coherentPhase,.24+.18*blade.tall);
+    float flexibility=randomUint(seed^0x1b56c4e9u);
+    blade.stiffness=lerp(lerp(.48,.88,flexibility),
+                         lerp(.32,.68,flexibility),mediumBlade);
+    float leanVariation=randomUint(seed^0x94d049bbu);
+    blade.leanStrength=lerp(lerp(.035,.14,leanVariation),
+                            lerp(.055,.19,leanVariation),mediumBlade);
+    blade.leanStrength=lerp(blade.leanStrength,.24,dryClipping);
     float2 water=grassWaterState(patch,patchNormal);
     float uncompressedWaterline=saturate(water.y/max(blade.height,.02));
     float depthResponse=smoothstep(.08,.86,uncompressedWaterline);
@@ -395,9 +411,9 @@ float3 cameraFacingSide(float3 center,float3 tangent,float3 fallbackSide) {
 }
 
 float bladePhysicalHalfWidth(BladeData blade,float along) {
-    float seedHead=blade.tall*step(.84,blade.dryness)*smoothstep(.58,.66,along)
-                  *(1-smoothstep(.90,1.0,along));
-    return blade.halfWidth*(pow(max(1-along,.015),.72)+seedHead*1.65)+.00015;
+    // A simple tapered leaf keeps the skyline clipped and mown.  In
+    // particular there is no widened seed-head interval near the blade tip.
+    return blade.halfWidth*pow(max(1-along,.012),.72)+.00008;
 }
 
 float4 projectWorld(float3 worldPosition) {
@@ -555,38 +571,43 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float edgeDistance=1-abs(input.bladeCoordinates.x);
     float edgeWidth=max(fwidth(input.bladeCoordinates.x),1e-4);
     float edgeCoverage=saturate(edgeDistance/edgeWidth+.5);
-    // Let the physical gaps between ribbons provide the meadow transparency.
+    // Let the physical gaps between ribbons provide the turf transparency.
     // Per-pixel stochastic rejection turned shadowed grass into black/yellow
     // salt-and-pepper noise.  A conservative analytic edge keeps narrow tips
     // anti-aliased without punching random holes through every blade.
     float densityScale=max(camera.grassSettings.x,.001);
     float densityCompensation=pow(min(1.0,3.0/densityScale),.36);
     float coverage=saturate(input.coverage*edgeCoverage*densityCompensation);
-    clip(coverage-.16);
+    clip(coverage-.06);
 
     float along=saturate(input.bladeCoordinates.y);
     float dryness=input.bladeParameters.x;
-    float tall=input.bladeParameters.y;
     float waterlineAlong=saturate(input.bladeParameters.z);
     float moisture=input.bladeParameters.w;
     float fertile=input.colourFields.x;
     float dryColony=input.colourFields.y;
     float lushColony=input.colourFields.z;
     float warmCool=input.colourFields.w;
-    dryness=saturate(dryness+dryColony*.15-lushColony*.08);
-    float dryThreshold=lerp(.82,.94,moisture);
-    float dry=smoothstep(dryThreshold-.03,dryThreshold+.03,dryness);
-    float3 green=lerp(float3(.035,.056,.022),float3(.070,.112,.040),
-                      saturate(.28+.55*moisture));
-    green*=1.0+warmCool*float3(.035,.006,-.045);
-    green*=lerp(float3(.86,.93,.83),float3(1.10,1.08,.91),fertile);
-    green=lerp(green,green*float3(1.10,1.01,.76),dryColony*.22);
-    green*=lerp(.72,1.04,smoothstep(0,.70,along));
-    float3 straw=float3(.118,.103,.052)*lerp(.82,1.06,along)*
-                  lerp(.90,1.10,dryColony);
-    float3 albedo=lerp(green,straw,dry);
+    dryness=saturate(dryness+dryColony*.10-lushColony*.07);
+    float dryThreshold=lerp(.90,.965,moisture)-dryColony*.025+lushColony*.012;
+    float dry=smoothstep(dryThreshold,dryThreshold+.025,dryness);
+    float bladeTone=float((input.ditherSeed>>8)&255u)*(1.0/255.0);
+    float vitality=saturate(.22+.48*moisture+.18*fertile+.10*lushColony-
+                            .10*dryColony+(bladeTone-.5)*.18);
+    float3 green=lerp(float3(.034,.068,.028),float3(.073,.126,.046),vitality);
+    green*=1.0+warmCool*float3(.040,.008,-.035);
+    green*=lerp(float3(.92,.95,.90),float3(1.06,1.04,.95),fertile);
+    float olive=smoothstep(.56,.94,bladeTone+dryColony*.16-lushColony*.10);
+    green=lerp(green,float3(.091,.101,.039),olive*.38);
+    green*=lerp(.86,1.03,smoothstep(0,.72,along));
+    float3 straw=float3(.137,.113,.061)*lerp(.90,1.04,along)*
+                  lerp(.94,1.08,dryColony);
+    float3 albedo=lerp(green,straw,dry*.84);
+    float yellowTip=smoothstep(.66,.91,dryness)*
+                    smoothstep(.58,.97,along)*(1-dry*.58);
+    albedo=lerp(albedo,float3(.126,.124,.052),yellowTip*.46);
     float albedoLuminance=dot(albedo,float3(.2126,.7152,.0722));
-    albedo=lerp(albedoLuminance.xxx,albedo,.78);
+    albedo=lerp(albedoLuminance.xxx,albedo,.72);
     // Puddles weigh down the blade and soak its lower stem.  The tip keeps the
     // atmospheric wetness only, so flattened grass still has readable green
     // detail above the thin water film.
@@ -597,10 +618,6 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float wetness=max(saturate(g_WetnessFactor*.78),submergedStem);
     albedo*=lerp(1.0,.61,wetness);
     albedo*=lerp(1.0,.78,submergedStem);
-    float seedHead=tall*smoothstep(.70,.79,along)*(1-smoothstep(.92,1.0,along))
-                  *step(.84,dryness);
-    albedo=lerp(albedo,float3(.30,.27,.10),seedHead*.46);
-
     float3 view=normalize(camera.eye-input.worldPosition);
     float3 n=normalize(input.normal);
     if(dot(n,view)<0)n=-n;
@@ -612,9 +629,9 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float sunVisibility=SceneColor.Load(int3(int2(pixel),0)).a;
     float frontLight=saturate(dot(n,sun));
     float backLight=saturate(dot(-n,sun));
-    float3 ambient=.5*(skyIrradiance(n)+skyIrradiance(-n))*(.56+.16*along);
-    ambient+=keyRadiance*float3(.020,.026,.012)*(.35+.65*sunVisibility);
-    float3 direct=keyRadiance*frontLight*sunVisibility*1.28;
+    float3 ambient=.5*(skyIrradiance(n)+skyIrradiance(-n))*(.66+.14*along);
+    ambient+=keyRadiance*float3(.022,.028,.016)*(.38+.62*sunVisibility);
+    float3 direct=keyRadiance*frontLight*sunVisibility*1.14;
     // Coverage and scene-depth rejection have already run, so inline rays are
     // issued only for surviving grass fragments inside the local-light range.
     // The raster blades themselves are intentionally not in the
@@ -627,22 +644,22 @@ float4 PSMain(VSOutput input) : SV_Target0 {
             input.worldPosition,localLight.direction,localLight.distance);
         direct+=localLight.radiance*localNdotL*localVisibility*.68;
     }
-    float3 transmittedTint=lerp(albedo,float3(.10,.14,.035),.32);
+    float3 transmittedTint=lerp(albedo,float3(.080,.108,.045),.26);
     float3 unmodulated=keyRadiance*transmittedTint*backLight*
-                        sunVisibility*.46;
+                        sunVisibility*.40;
     float3 halfVector=normalize(sun+view);
     float wetExponent=lerp(22.0,110.0,wetness);
     unmodulated+=keyRadiance*pow(saturate(dot(n,halfVector)),wetExponent)*
                  lerp(.025,.13,wetness)*sunVisibility;
     ambient+=lightningRadiance()*(.18+.10*along);
-    float fade=lerp(.72,1.0,smoothstep(0,.22,along));
+    float fade=lerp(.82,1.0,smoothstep(0,.22,along));
     float3 result=(albedo*(ambient+direct)+unmodulated)*fade;
     float3 rayDirection=normalize(input.worldPosition-camera.eye);
     result=applyAerialPerspective(result,input.worldPosition,rayDirection);
     float3 displayColor=linearToSrgb(colorGrade(tonemap(result*camera.exposure)));
-    // Conventional alpha blending preserves the original airy meadow without
-    // random black pinholes. Depth writing deliberately keeps this to a
+    // Conventional alpha blending gives the fine ribbons a dense lawn read
+    // without random black pinholes. Depth writing deliberately keeps this to a
     // single physically nearest ribbon rather than accumulating an opaque
     // stack of dozens of transparent blades.
-    return float4(displayColor,saturate(coverage*.58));
+    return float4(displayColor,saturate(coverage*.72));
 }

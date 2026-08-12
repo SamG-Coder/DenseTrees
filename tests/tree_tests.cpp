@@ -291,7 +291,7 @@ int main() {
     require(maximumBankClearance<.30f,
             "adaptive river correction left a visibly suspended bank edge");
     validateTriangles(environment.riverVertices,environment.riverIndices,"river water");
-    uint32_t decodedTallPatches=0,waterRetainingGrassPatches=0;
+    uint32_t decodedCoarsePatches=0,waterRetainingGrassPatches=0;
     for(size_t i=0;i<environment.grassPatches.size();++i){
         const auto& patch=environment.grassPatches[i];
         require(std::isfinite(patch.minX)&&std::isfinite(patch.minY)&&
@@ -302,18 +302,20 @@ int main() {
                     patch.minZ<patch.maxZ,
                 "grass AABB does not enclose its patch base and blade height");
         const uint32_t blades=patch.packed&255u,shortCode=(patch.packed>>8)&255u;
-        const uint32_t tallCount=(patch.packed>>16)&255u,tallCode=(patch.packed>>24)&255u;
-        const bool tall=tallCount!=0;
-        if(tall)++decodedTallPatches;
+        const uint32_t coarseCount=(patch.packed>>16)&255u,
+                       coarseCode=(patch.packed>>24)&255u;
+        const bool coarse=coarseCount!=0;
+        if(coarse)++decodedCoarsePatches;
         const float grassRetention=dense::grassPatchWaterRetention(patch.seed);
         if(grassRetention>1.0f/255.0f)++waterRetainingGrassPatches;
         require(std::isfinite(grassRetention)&&grassRetention>=0&&grassRetention<=1,
                 "grass patch runoff retention left normalized range");
-        require(blades>=28&&blades<=34&&shortCode>=9&&shortCode<=34,
-                "grass candidate count or short height left the meadow range");
-        require(tall?(tallCount>=18&&tallCount<=24&&tallCount<blades&&tallCode>=90&&
-                       tallCode<=255&&tallCode>shortCode):(tallCode==0),
-                "clustered long-grass encoding is invalid");
+        require(blades>=28&&blades<=34&&shortCode>=13&&shortCode<=20,
+                "grass candidate count or short height left the mown-turf range");
+        require(coarse?(coarseCount>=1&&coarseCount<=3&&coarseCount<blades&&
+                         coarseCode>=32&&coarseCode<=40&&coarseCode>shortCode):
+                        (coarseCode==0),
+                "rare coarse-blade encoding is invalid");
         const float normalY=std::sqrt(std::max(0.0f,1-patch.normalX*patch.normalX-
                                                     patch.normalZ*patch.normalZ));
         require(normalY>.70f&&patch.moisture>=0&&patch.moisture<=1,
@@ -334,14 +336,14 @@ int main() {
                     "same environment seed did not reproduce grass patch data");
         }
     }
-    require(decodedTallPatches==environment.tallGrassPatchCount,
-            "long-grass summary does not match the packed patch data");
+    require(decodedCoarsePatches==environment.tallGrassPatchCount,
+            "coarse-grass summary does not match the packed patch data");
     require(waterRetainingGrassPatches>environment.grassPatches.size()/100&&
                 waterRetainingGrassPatches<environment.grassPatches.size()/5,
             "grass did not inherit a plausible fraction of terrain basins");
-    require(environment.tallGrassPatchCount>environment.grassPatches.size()/2&&
-                environment.tallGrassPatchCount<environment.grassPatches.size()*3/4,
-            "clustered long grass is absent or overwhelms the short meadow");
+    require(environment.tallGrassPatchCount>environment.grassPatches.size()/40&&
+                environment.tallGrassPatchCount<environment.grassPatches.size()/10,
+            "coarse blades are absent or no longer rare within the mown turf");
     require(environment.rockCount>=30&&environment.rockCount<=90,
             "rock families escaped their ecological inventory");
     require(environment.shrubCount>=14&&environment.shrubCount<=24,

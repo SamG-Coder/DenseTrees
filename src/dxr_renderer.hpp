@@ -7,8 +7,10 @@
 namespace dense {
 
 struct DebugRenderSettings {
-    float grassDensity = 3.00f;
-    float bladeHeightScale = 1.25f;
+    // The default sward is close-mown park turf.  Density supplies the fine
+    // overlapping canopy while the authored blade heights remain physical.
+    float grassDensity = 3.75f;
+    float bladeHeightScale = 1.00f;
     float groundNormalStrength = 1.00f;
     float groundDetailStrength = 1.00f;
     float shortGrassDrawDistance = 26.0f;
