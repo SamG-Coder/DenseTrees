@@ -604,6 +604,73 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
             if(score>continuationScore[parent]){continuationScore[parent]=score;continuationChild[parent]=static_cast<int>(i);}
         }
     }
+
+    // Pipe-model area alone is almost constant between ramification points,
+    // which made mature scaffold limbs look like manufactured arms.  Carry a
+    // multiplicative, axis-continuous taper on top of the supported-area radius.
+    // Same-order lateral daughters inherit the parent's factor unchanged, so
+    // their biological child/parent ratio (and collar classification) remains
+    // intact; only the selected continuation accumulates length taper.
+    std::vector<float> longitudinalTaper(nodes.size(),1.0f);
+    if(p.species==TreeSpecies::EnglishOak) {
+        for(size_t i=1;i<nodes.size();++i) {
+            const size_t parent=static_cast<size_t>(nodes[i].parent);
+            float factor=1.0f;
+            if(nodes[i].axisOrder==nodes[parent].axisOrder) {
+                factor=longitudinalTaper[parent];
+                if(continuationChild[parent]==static_cast<int>(i)&&nodes[i].axisOrder<=2) {
+                    const float segmentLength=length(nodes[i].position-nodes[parent].position);
+                    const float rate=nodes[i].axisOrder==0?.015f:
+                        (nodes[i].axisOrder==1?.055f:.10f);
+                    factor*=std::exp(-rate*segmentLength);
+                }
+            } else if(nodes[i].axisOrder==1) {
+                // Lower the old .38 m order-one plateau without changing its
+                // supported-area distribution along the newly born axis.
+                factor=.34f/.38f;
+            } else if(nodes[i].axisOrder==2) {
+                factor=.14f/.16f;
+            }
+            longitudinalTaper[i]=factor;
+            if(nodes[i].axisOrder<=2) {
+                float radius=nodes[i].radius*factor;
+                const float parentRadius=nodes[parent].radius;
+                const float segmentLength=length(nodes[i].position-nodes[parent].position);
+                if(nodes[i].axisOrder==nodes[parent].axisOrder) {
+                    if(continuationChild[parent]==static_cast<int>(i)) {
+                        const float rate=nodes[i].axisOrder==0?.015f:
+                            (nodes[i].axisOrder==1?.055f:.10f);
+                        radius=std::min(radius,parentRadius*std::exp(-rate*segmentLength));
+                    } else {
+                        // A same-order reiteration is a daughter axis, not a
+                        // second full-diameter continuation through the parent.
+                        const float lateralRatio=nodes[i].axisOrder==0?.92f:
+                            (nodes[i].axisOrder==1?.88f:.84f);
+                        radius=std::min(radius,parentRadius*lateralRatio);
+                    }
+                } else if(nodes[i].axisOrder>nodes[parent].axisOrder) {
+                    radius=std::min(radius,parentRadius*(nodes[i].axisOrder==1?.70f:
+                                                         (nodes[i].axisOrder==2?.62f:.58f)));
+                }
+                nodes[i].radius=radius;
+            }
+        }
+    }
+    // A stable per-axis phase keeps low-frequency wood asymmetry continuous
+    // through transported continuation rings, while independent laterals do
+    // not all share the same machine-perfect oval.
+    std::vector<size_t> meshAxisRoot(nodes.size());
+    for(size_t i=1;i<nodes.size();++i) {
+        const size_t parent=static_cast<size_t>(nodes[i].parent);
+        meshAxisRoot[i]=(nodes[i].axisOrder==nodes[parent].axisOrder&&
+                         continuationChild[parent]==static_cast<int>(i))?
+                        meshAxisRoot[parent]:i;
+    }
+    auto axisSectionPhase=[&](size_t i) {
+        uint32_t h=static_cast<uint32_t>(meshAxisRoot[i])*0x9e3779b9u^p.seed^0x85ebca6bu;
+        h^=h>>16;h*=0x7feb352du;h^=h>>15;
+        return static_cast<float>(h&0xffffu)*(2*pi/65535.0f);
+    };
     std::vector<Vec3> tangents(nodes.size()),frameSides(nodes.size()),frameUps(nodes.size());
     for(size_t i=0;i<nodes.size();++i) {
         Vec3 incoming=nodes[i].direction;
@@ -637,7 +704,7 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
             if(lengthSq(existing)>1.0e-8f&&dot(normalize(existing),normalize(load))>.72f) {
                 existing+=load;
                 const float magnitude=length(existing);
-                if(magnitude>.22f)existing=existing*(.22f/magnitude);
+                if(magnitude>.15f)existing=existing*(.15f/magnitude);
                 return;
             }
         }
@@ -654,12 +721,15 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
             if(lengthSq(loadDirection)<.01f)continue;
             loadDirection=normalize(loadDirection);
             const float ratio=clamp(nodes[child].radius/std::max(nodes[junction].radius,.001f),0,1);
-            const float strength=.19f*std::pow(ratio,1.35f);
-            const float extent=clamp(.18f+nodes[junction].radius*2.25f,.38f,1.35f);
+            const float strength=.105f*std::pow(ratio,1.50f);
+            // A quieter ridge carried farther down the supporting grain reads
+            // as reaction wood; a strong short pulse reads as a swollen joint.
+            const float extent=clamp(.30f+nodes[junction].radius*2.80f,.50f,1.55f);
 
             size_t cursor=junction;float travelled=0;
             while(true) {
-                const float x=clamp(travelled/extent,0,1),falloff=(1-x)*(1-x);
+                const float x=clamp(travelled/extent,0,1);
+                const float falloff=1-x*x*(3-2*x);
                 addReactionLoad(cursor,loadDirection*(strength*falloff));
                 if(nodes[cursor].parent<0||travelled>=extent)break;
                 const size_t ancestor=static_cast<size_t>(nodes[cursor].parent);
@@ -669,13 +739,14 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
             }
 
             int forward=continuationChild[junction];travelled=0;
-            const float forwardExtent=extent*.42f;
+            const float forwardExtent=extent*.40f;
             while(forward>=0&&travelled<forwardExtent) {
                 const size_t forwardNode=static_cast<size_t>(forward);
                 travelled+=length(nodes[forwardNode].position-
                                   nodes[static_cast<size_t>(nodes[forwardNode].parent)].position);
                 const float x=clamp(travelled/std::max(forwardExtent,.001f),0,1);
-                addReactionLoad(forwardNode,loadDirection*(strength*(1-x)*(1-x)*.72f));
+                const float falloff=1-x*x*(3-2*x);
+                addReactionLoad(forwardNode,loadDirection*(strength*falloff*.65f));
                 forward=continuationChild[forwardNode];
             }
         }
@@ -717,15 +788,31 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
         const float uvOverlap=std::min(overlap,structuralCollar?.022f:.008f);
         const float buriedRadius=continuation?a.radius:
             std::min(b.radius*(structuralCollar?.46f:.78f),a.radius*(structuralCollar?.25f:.34f));
-        const Vec3 collarStart=a.position-segmentAxis*overlap;
-        const float collarPathLength=segmentLength+overlap;
+        Vec3 emergenceOutward=segmentAxis-tangents[parentIndex]*dot(segmentAxis,tangents[parentIndex]);
+        if(lengthSq(emergenceOutward)<.001f)emergenceOutward=frameSides[parentIndex];
+        emergenceOutward=normalize(emergenceOutward);
+        const float outwardOffset=structuralCollar?
+            std::max(0.0f,a.radius*.82f-buriedRadius*1.12f):0.0f;
+        const float axialInset=structuralCollar?std::min(overlap*.30f,a.radius*.12f):0.0f;
+        // Start a structural daughter in the outward quadrant of its supporting
+        // pipe.  Moving backward along the daughter axis drove the old collar
+        // through the bole centre and exposed a diagonal tube intersection on
+        // the opposite side.  The containment margin leaves the complete first
+        // ring below the parent surface, while avoiding that cross-bole chord.
+        const Vec3 collarStart=structuralCollar?
+            a.position+emergenceOutward*outwardOffset-tangents[parentIndex]*axialInset:
+            a.position-segmentAxis*overlap;
+        const float collarPathLength=length(b.position-collarStart);
+        const float collarEmergenceDistance=structuralCollar?
+            clamp(buriedRadius*1.14f+axialInset,overlap*.54f,overlap*1.16f):overlap;
         // A modest Hermite bend makes a structural daughter share the parent's
         // grain direction while it is still below the bark, then turn toward
         // its own axis outside the collar.  Handles are deliberately short to
         // prevent decorative loops at acute oak forks.
         const Vec3 collarEntryTangent=structuralCollar?
-            normalize(segmentAxis*(codominantCollar?.80f:.88f)+
-                      tangents[parentIndex]*(codominantCollar?.20f:.12f)):segmentAxis;
+            normalize(segmentAxis*(codominantCollar?.68f:.75f)+
+                      tangents[parentIndex]*(codominantCollar?.32f:.25f)+
+                      emergenceOutward*.08f):segmentAxis;
         const Vec3 collarExitTangent=tangents[i];
         const Vec3 collarEntryHandle=collarEntryTangent*(collarPathLength*.58f);
         const Vec3 collarExitHandle=collarExitTangent*(collarPathLength*.58f);
@@ -782,8 +869,8 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
                     const float dLobeDx=6*x*(1-x);
                     const float dxDAlignment=alignment>-.18f&&alignment<1.0f?1/1.18f:0;
                     const float dAlignmentTheta=dot(circumferential,direction);
-                    reactionFlare+=magnitude*(.10f+.90f*lobeWeight);
-                    reactionTheta+=magnitude*.90f*dLobeDx*dxDAlignment*dAlignmentTheta;
+                    reactionFlare+=magnitude*(.02f+.98f*lobeWeight);
+                    reactionTheta+=magnitude*.98f*dLobeDx*dxDAlignment*dAlignmentTheta;
 
                     const Vec3 rawDerivative=(reactionLoads[i][lobe]-startLoad)*blendDerivative;
                     const Vec3 loadDerivative=rawDerivative-
@@ -792,12 +879,12 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
                     const Vec3 directionDerivative=(loadDerivative-
                                                     direction*magnitudeDerivative)/magnitude;
                     const float alignmentDerivative=dot(radial,directionDerivative);
-                    reactionArc+=magnitudeDerivative*(.10f+.90f*lobeWeight)+
-                                 magnitude*.90f*dLobeDx*dxDAlignment*alignmentDerivative;
+                    reactionArc+=magnitudeDerivative*(.02f+.98f*lobeWeight)+
+                                  magnitude*.98f*dLobeDx*dxDAlignment*alignmentDerivative;
                 }
-                if(reactionFlare>.26f) {
-                    const float scale=.26f/reactionFlare;
-                    reactionFlare=.26f;reactionTheta*=scale;reactionArc*=scale;
+                if(reactionFlare>.16f) {
+                    const float scale=.16f/reactionFlare;
+                    reactionFlare=.16f;reactionTheta*=scale;reactionArc*=scale;
                 }
                 flare+=reactionFlare;dFlareTheta+=reactionTheta;dFlareArc+=reactionArc;
             }
@@ -809,13 +896,13 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
                 // smoothstep. Preserve the physical taper in their normals.
                 dBaseRadiusDq=(b.radius-a.radius)*(ringCount==2?1.0f:6*q*(1-q));
             } else {
-                const float emergenceQ=clamp(overlap/std::max(collarPathLength,.001f),.08f,.52f);
-                const float neckEnd=clamp(emergenceQ+(structuralCollar?.34f:.24f),.20f,.76f);
+                const float emergenceQ=clamp(collarEmergenceDistance/std::max(collarPathLength,.001f),.08f,.52f);
+                const float neckEnd=clamp(emergenceQ+(structuralCollar?.44f:.28f),.20f,.82f);
                 const float neckX=clamp(q/neckEnd,0,1),neckBlend=neckX*neckX*(3-2*neckX);
                 const float dNeckDq=q>0&&q<neckEnd?6*neckX*(1-neckX)/neckEnd:0;
                 const float collarWidth=structuralCollar?.18f:.14f,collarOffset=(q-emergenceQ)/collarWidth;
                 const float collarPulse=std::exp(-collarOffset*collarOffset);
-                const float collarStrength=codominantCollar?.14f:(structuralCollar?.10f:.035f);
+                const float collarStrength=codominantCollar?.08f:(structuralCollar?.06f:.025f);
                 // A real branch collar is a saddle of reaction wood, not an
                 // inflatable ring.  Weight the flare toward the parent's grain
                 // direction and analytically carry its angular derivative into
@@ -838,8 +925,60 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
             const float arcStart=std::max(0.0f,arcLength[parentIndex]-uvOverlap),arc=arcStart+(arcLength[i]-arcStart)*q;
             const float phase5=angle*5+arc*.38f,phase11=angle*9-arc*.24f,phase2=angle*2+arc*.61f;const float relief=1+.0050f*std::sin(phase5)+.0025f*std::sin(phase11)+.0015f*std::sin(phase2);
             const float dReliefTheta=.0250f*std::cos(phase5)+.0225f*std::cos(phase11)+.0030f*std::cos(phase2);const float dReliefArc=.00190f*std::cos(phase5)-.00060f*std::cos(phase11)+.000915f*std::cos(phase2);
-            const float radius=baseRadius*flare*relief;const float maturity=std::sqrt(clamp(baseRadius/.18f,0,1));const float ageShade=.86f+.12f*maturity;
-            const float dBaseRadiusArc=dBaseRadiusDq/std::max(collarPathLength,.001f);const float dRadiusTheta=dBaseRadiusDTheta*flare*relief+baseRadius*(relief*dFlareTheta+flare*dReliefTheta);const float dRadiusArc=dBaseRadiusArc*flare*relief+baseRadius*(relief*dFlareArc+flare*dReliefArc);const Vec3 surfaceNormal=normalize(radial-circumferential*(dRadiusTheta/std::max(radius,.00001f))-ringTangent*dRadiusArc);
+            const float dBaseRadiusArc=dBaseRadiusDq/std::max(collarPathLength,.001f);
+
+            // Mature structural wood is neither circular nor randomly noisy.
+            // A gravity-oriented second harmonic gives loaded limbs an oval
+            // section; a much weaker third harmonic supplies slow woody sweep.
+            // Normalize mean squared radius so this changes shape, not pipe area.
+            float sectionShape=1,dSectionTheta=0,dSectionArc=0;
+            if(p.species==TreeSpecies::EnglishOak&&b.axisOrder<=1) {
+                auto smoothUnit=[](float x){x=clamp(x,0,1);return x*x*(3-2*x);};
+                auto smoothDerivative=[](float x){return x>0&&x<1?6*x*(1-x):0.0f;};
+                const float heightX=(ringHeight-.85f)/.50f;
+                const float radiusX=(baseRadius-.06f)/.06f;
+                const float heightFade=smoothUnit(heightX),radiusFade=smoothUnit(radiusX);
+                const float dHeightFadeArc=smoothDerivative(heightX)*ringTangent.y/.50f;
+                const float dRadiusFadeArc=smoothDerivative(radiusX)*dBaseRadiusArc/.06f;
+                const float sectionFade=heightFade*radiusFade;
+                const float dSectionFadeArc=dHeightFadeArc*radiusFade+
+                                             heightFade*dRadiusFadeArc;
+                const float baseE2=b.axisOrder==0?.035f:.050f;
+                const float baseE3=b.axisOrder==0?.008f:.012f;
+                const float e2=baseE2*sectionFade,e3=baseE3*sectionFade;
+                const float de2Arc=baseE2*dSectionFadeArc,de3Arc=baseE3*dSectionFadeArc;
+                Vec3 gravityPlane=Vec3{0,1,0}-ringTangent*ringTangent.y;
+                const float phase=axisSectionPhase(i);
+                float majorAngle=phase*.5f;
+                if(lengthSq(gravityPlane)>.015f) {
+                    gravityPlane=normalize(gravityPlane);
+                    majorAngle=std::atan2(dot(gravityPlane,ringUp),
+                                         dot(gravityPlane,ringSide));
+                }
+                const float harmonic2=2*(angle-majorAngle)+arc*.10f+.15f*std::sin(phase);
+                const float harmonic3=3*angle-arc*.11f+phase;
+                const float shapeSum=1+e2*std::cos(harmonic2)+e3*std::cos(harmonic3);
+                const float normalization=1/std::sqrt(1+.5f*(e2*e2+e3*e3));
+                const float dNormalizationArc=-normalization*normalization*normalization*
+                    .5f*(e2*de2Arc+e3*de3Arc);
+                sectionShape=normalization*shapeSum;
+                dSectionTheta=normalization*(-2*e2*std::sin(harmonic2)-
+                                               3*e3*std::sin(harmonic3));
+                dSectionArc=dNormalizationArc*shapeSum+normalization*(
+                    de2Arc*std::cos(harmonic2)-e2*.10f*std::sin(harmonic2)+
+                    de3Arc*std::cos(harmonic3)+e3*.11f*std::sin(harmonic3));
+            }
+
+            const float radius=baseRadius*flare*relief*sectionShape;const float maturity=std::sqrt(clamp(baseRadius/.18f,0,1));const float ageShade=.86f+.12f*maturity;
+            const float dRadiusTheta=dBaseRadiusDTheta*flare*relief*sectionShape+
+                baseRadius*(relief*sectionShape*dFlareTheta+
+                            flare*sectionShape*dReliefTheta+
+                            flare*relief*dSectionTheta);
+            const float dRadiusArc=dBaseRadiusArc*flare*relief*sectionShape+
+                baseRadius*(relief*sectionShape*dFlareArc+
+                            flare*sectionShape*dReliefArc+
+                            flare*relief*dSectionArc);
+            const Vec3 surfaceNormal=normalize(radial-circumferential*(dRadiusTheta/std::max(radius,.00001f))-ringTangent*dRadiusArc);
             mesh.branchVertices.push_back({ringCenter+radial*radius,surfaceNormal,vary(t.barkColor,ageShade),speciesMaterial,texU,arc});
         }
         for(int ring=0;ring<ringCount-1;++ring)for(int k=0;k<sides;++k){const uint32_t current=base+ring*ringVertices+static_cast<uint32_t>(k),next=current+1,endCurrent=current+ringVertices,endNext=endCurrent+1;mesh.branchIndices.insert(mesh.branchIndices.end(),{current,next,endCurrent,next,endNext,endCurrent});}

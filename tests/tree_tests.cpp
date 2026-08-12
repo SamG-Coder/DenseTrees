@@ -56,7 +56,6 @@ void validateTriangles(const std::vector<dense::MeshVertex>& vertices,
 }
 
 } // namespace
-
 int main() {
     {
     const auto groundAtlas=dense::makeGroundTextureAtlas(0x1234abcdu);
@@ -507,7 +506,16 @@ int main() {
     // branch that owns them, then identify the mesh-only root range exactly.
     std::vector<int> meshContinuation(oakNodes.size(),-1);
     std::vector<float> meshContinuationScore(oakNodes.size(),-2.0f);
-    for(size_t i=1;i<oakNodes.size();++i){const size_t parent=static_cast<size_t>(oakNodes[i].parent);if(oakNodes[i].axisOrder!=oakNodes[parent].axisOrder)continue;const float score=dense::dot(dense::normalize(oakNodes[i].position-oakNodes[parent].position),oakNodes[parent].direction);if(score>meshContinuationScore[parent]){meshContinuationScore[parent]=score;meshContinuation[parent]=static_cast<int>(i);}}
+    for(size_t i=1;i<oakNodes.size();++i) {
+        const size_t parent=static_cast<size_t>(oakNodes[i].parent);
+        if(oakNodes[i].axisOrder!=oakNodes[parent].axisOrder)continue;
+        const float score=dense::dot(dense::normalize(oakNodes[i].position-
+            oakNodes[parent].position),oakNodes[parent].direction);
+        if(score>meshContinuationScore[parent]) {
+            meshContinuationScore[parent]=score;
+            meshContinuation[parent]=static_cast<int>(i);
+        }
+    }
     size_t biologicalBranchVertexCount = 0;
     size_t biologicalBranchIndexCount = 0;
     size_t baselineBiologicalBranchIndexCount = 0;
@@ -515,9 +523,14 @@ int main() {
     size_t sampledBuriedCollars = 0;
     size_t sampledCodominantCollars = 0;
     size_t sampledSaddleCollars = 0;
+    size_t sampledRestrainedCollars = 0;
+    size_t sampledOvalStructuralRings = 0;
+    size_t sampledLongTaperPaths = 0;
     std::vector<size_t> meshSegmentVertexOffset(oakNodes.size());
     std::vector<int> meshSegmentRingCount(oakNodes.size());
     std::vector<int> meshSegmentSides(oakNodes.size());
+    std::vector<float> meshAxisPathLength(oakNodes.size());
+    std::vector<float> meshAxisStartRadius(oakNodes.size());
     for (size_t i = 1; i < oakNodes.size(); ++i) {
         const int sides = oakNodes[i].axisOrder == 0 ? 48 : (oakNodes[i].axisOrder == 1 ? 32 : (oakNodes[i].axisOrder == 2 ? 16 : 8));
         const size_t ringVertices = static_cast<size_t>(sides + 1);
@@ -529,6 +542,44 @@ int main() {
         meshSegmentSides[i]=sides;
         require(biologicalBranchVertexCount + ringVertices * ringCount <= oakMesh.branchVertices.size(),
                 "oak branch vertex stream ended inside a biological segment");
+
+        if(continuation&&oakNodes[i].axisOrder<=1) {
+            const float localLength=dense::length(oakNodes[i].position-oakNodes[parent].position);
+            const bool parentContinues=oakNodes[parent].parent>=0&&
+                meshContinuation[static_cast<size_t>(oakNodes[parent].parent)]==static_cast<int>(parent)&&
+                oakNodes[parent].axisOrder==oakNodes[i].axisOrder;
+            meshAxisPathLength[i]=(parentContinues?meshAxisPathLength[parent]:0)+localLength;
+            meshAxisStartRadius[i]=parentContinues?meshAxisStartRadius[parent]:oakNodes[parent].radius;
+            const float taperRate=oakNodes[i].axisOrder==0?.015f:.055f;
+            require(oakNodes[i].radius<=oakNodes[parent].radius*std::exp(-taperRate*localLength)+1.0e-5f,
+                    "oak structural continuation regained a constant-diameter arm plateau");
+            const float longPathThreshold=oakNodes[i].axisOrder==0?4.0f:2.5f;
+            if(meshAxisPathLength[i]>longPathThreshold&&meshAxisStartRadius[i]>.08f) {
+                const float requiredRatio=oakNodes[i].axisOrder==0?.95f:.90f;
+                require(oakNodes[i].radius<meshAxisStartRadius[i]*requiredRatio,
+                        "oak structural axis does not show visible cumulative taper");
+                ++sampledLongTaperPaths;
+            }
+
+            const auto* end=oakMesh.branchVertices.data()+biologicalBranchVertexCount+
+                            ringVertices*static_cast<size_t>(ringCount-1);
+            dense::Vec3 endCenter{};
+            for(int k=0;k<sides;++k)endCenter+=end[k].position;
+            endCenter=endCenter/static_cast<float>(sides);
+            if(endCenter.y>1.35f&&oakNodes[i].radius>.125f) {
+                float minimumRadius=std::numeric_limits<float>::max(),maximumRadius=0;
+                for(int k=0;k<sides;++k) {
+                    const float radius=dense::length(end[k].position-endCenter);
+                    minimumRadius=std::min(minimumRadius,radius);
+                    maximumRadius=std::max(maximumRadius,radius);
+                }
+                require(maximumRadius>minimumRadius*1.035f,
+                        "mature oak structural ring regressed to a circular tube");
+                require(maximumRadius<minimumRadius*1.42f,
+                        "mature oak structural ring became an inflated or pinched oval");
+                ++sampledOvalStructuralRings;
+            }
+        }
 
         if (structuralCollar && oakNodes[i].radius > .008f) {
             const auto* start = oakMesh.branchVertices.data() + biologicalBranchVertexCount;
@@ -576,10 +627,17 @@ int main() {
             collarRadiusMean /= sides;
             const dense::Vec3 daughterDirection = dense::normalize(
                 oakNodes[i].position - oakNodes[parent].position);
-            require(dense::dot(startCenter - oakNodes[parent].position, daughterDirection) < -1.0e-5f,
-                    "structural oak daughter no longer begins below its parent's bark");
+            const dense::Vec3 daughterOutward=dense::normalize(daughterDirection-supportDirection*
+                dense::dot(daughterDirection,supportDirection));
+            const dense::Vec3 startOutward=startCenter-oakNodes[parent].position-supportDirection*
+                dense::dot(startCenter-oakNodes[parent].position,supportDirection);
+            require(dense::dot(startOutward,daughterOutward)>1.0e-5f,
+                    "structural oak daughter no longer begins in its outward support quadrant");
             require(startRadius < endRadius * .74f,
                     "structural oak daughter regained a full-width glued-on cuff");
+            require(collarRadiusMean < endRadius * 1.14f &&
+                        collarRadiusMaximum < endRadius * 1.25f,
+                    "structural oak daughter collar became a bulbous joint");
             require(maximumBuriedDistance < oakNodes[parent].radius*.98f,
                     "structural oak daughter start ring is not wholly inside its supporting pipe");
             if (oakNodes[parent].parent >= 0) {
@@ -596,6 +654,7 @@ int main() {
                 }
             }
             ++sampledBuriedCollars;
+            ++sampledRestrainedCollars;
             sampledCodominantCollars += codominantCollar;
         }
 
@@ -643,6 +702,12 @@ int main() {
             "oak codominant-fork collar regression sample is unexpectedly empty");
     require(sampledSaddleCollars > 10,
             "oak asymmetric-saddle regression sample is unexpectedly small");
+    require(sampledRestrainedCollars > 20,
+            "oak restrained-collar regression sample is unexpectedly small");
+    require(sampledOvalStructuralRings > 40,
+            "oak non-circular structural-ring regression sample is unexpectedly small");
+    require(sampledLongTaperPaths > 10,
+            "oak cumulative structural-taper regression sample is unexpectedly small");
     require(biologicalBranchIndexCount >= baselineBiologicalBranchIndexCount &&
                 biologicalBranchIndexCount - baselineBiologicalBranchIndexCount <=
                     sampledCodominantCollars * 32u * 3u * 6u,
@@ -679,6 +744,8 @@ int main() {
                 "major oak fork no longer carries an asymmetric load path down the parent");
         require(meanRadius>oakNodes[junction].radius*1.003f,
                 "major oak fork no longer broadens its supporting bole");
+        require(meanRadius<oakNodes[junction].radius*1.14f,
+                "major oak reaction wood became an inflated muscular joint");
 
         const int outgoingIndex=meshContinuation[junction];
         require(outgoingIndex>=0,
