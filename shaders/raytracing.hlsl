@@ -1355,11 +1355,22 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         // the streamed grass mask across the new multi-kilometre map.
         float biomeExposure=filteredFbmWorld(
             hit.xz+float2(-1360,836),.0061,footprint);
-        float rootCore=1-smoothstep(.72,1.35,rootDistance);
-        float rootFringe=(1-smoothstep(1.10,2.70,rootDistance))*smoothstep(.55,.72,soilMacro);
+        // The oak's organic root floor is a distinct material, not geological
+        // exposure.  A world-stable, gently irregular boundary avoids the old
+        // circular soil decal while the roughly 80 cm feather lets turf and loam
+        // coexist across a broad natural transition.  This is deliberately
+        // identical to the CPU grass-population mask so material and blades
+        // share one boundary rather than exposing independent concentric bands.
+        float rootAngle=atan2(hit.z,hit.x);
+        float rootSharedOffset=.055*sin(5*rootAngle+.60)+
+                               .035*sin(9*rootAngle-1.20);
+        float rootLoamCore=1.14+rootSharedOffset;
+        float rootLoamMeadow=1.95+rootSharedOffset+
+                             .060*sin(3*rootAngle+1.70);
+        float rootLoamMask=1-smoothstep(rootLoamCore,rootLoamMeadow,rootDistance);
         float slopeBare=smoothstep(.075,.23,slope)*smoothstep(.60,.78,soilMacro);
         float flatBare=smoothstep(.78,.90,.65*soilMacro+.35*soilFine)*(1-smoothstep(.10,.22,slope));
-        float soilStructure=max(rootCore,max(rootFringe*.82,max(slopeBare*.68,flatBare*.62)));
+        float soilStructure=max(slopeBare*.68,flatBare*.62);
         float biomeBare=smoothstep(.62,.82,
             biomeExposure*.58+(1-terrainMoisture)*.42);
         biomeBare*=1-lushMask*.72;
@@ -1372,6 +1383,12 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float sandWeight=biomeBare*soilDryness*(1-smoothstep(.08,.24,slope));
         soil=lerp(soil,float3(.185,.135,.068),sandWeight*.70);
         albedo=lerp(meadow,soil,soilMask);
+        float rootLoamVariation=filteredFbmWorld(
+            hit.xz+float2(41.7,-26.3),.31,footprint);
+        float3 rootLoam=lerp(float3(.074,.043,.018),float3(.032,.024,.011),
+                             saturate(.22+.68*terrainMoisture));
+        rootLoam*=lerp(.88,1.12,rootLoamVariation);
+        albedo=lerp(albedo,rootLoam,rootLoamMask);
 
         float highGround=smoothstep(18.0,92.0,hit.y)*smoothstep(760,1040,rootDistance);
         float mountainStone=saturate(highGround*(.34+.90*slope)+smoothstep(.28,.62,slope)*.38);
@@ -1385,6 +1402,9 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
                                       filteredValueNoise(hit.xz+float2(-29.1,44.6),.061,footprint))-.5;
             float2 groundUvA=float2(dot(hit.xz,float2(.963,.269)),dot(hit.xz,float2(.269,-.963)))*.5+textureWarp*.48;
             float2 groundUvB=float2(dot(hit.xz,float2(.526,-.851)),dot(hit.xz,float2(.851,.526)))*.2681+float2(.37,.19)+textureWarp.yx*.31;
+            float2 groundUvRoot=float2(dot(hit.xz,float2(.819,.574)),
+                                       dot(hit.xz,float2(-.574,.819)))*.5+
+                                float2(.23,.61)+textureWarp.yx*.21;
             float textureFootprint=min(pixelWorld*pow(grazing,.25),.38);
             float groundLodA=clamp(log2(max(textureFootprint*512.0,1.0))-.85,0.0,10.0);
             float groundLodB=clamp(log2(max(textureFootprint*274.5,1.0))-.85,0.0,10.0);
@@ -1394,46 +1414,77 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             float4 coarseAlbedo=sampleGroundAlbedo(groundUvB,1u,groundLodB);
             float4 denseNormal=sampleGroundNormal(groundUvA,0u,normalLodA);
             float4 coarseNormal=sampleGroundNormal(groundUvB,1u,normalLodB);
-            float4 textureAlbedo=lerp(coarseAlbedo,denseAlbedo,grassBlend);
-            float4 textureNormal=lerp(coarseNormal,denseNormal,grassBlend);
-            float4 textureLow=lerp(sampleGroundAlbedo(groundUvB,1u,groundLodB+3.25),
-                                   sampleGroundAlbedo(groundUvA,0u,groundLodA+3.25),grassBlend);
+            float4 denseLow=sampleGroundAlbedo(groundUvA,0u,groundLodA+3.25);
+            float4 coarseLow=sampleGroundAlbedo(groundUvB,1u,groundLodB+3.25);
+            float3 denseFrequency=clamp(
+                denseAlbedo.rgb/max(denseLow.rgb,.012),.76,1.28)*
+                lerp(.96,1.04,denseNormal.b);
+            float3 coarseFrequency=clamp(
+                coarseAlbedo.rgb/max(coarseLow.rgb,.012),.76,1.28)*
+                lerp(.96,1.04,coarseNormal.b);
+            float3 materialFrequency=lerp(coarseFrequency,denseFrequency,grassBlend);
+            float2 materialSlope=lerp(coarseNormal.rg,denseNormal.rg,grassBlend)*2-1;
+            float layerRoughness=lerp(coarseAlbedo.a,denseAlbedo.a,grassBlend);
+            float materialHeight=lerp(coarseNormal.b,denseNormal.b,grassBlend);
+            float materialCavity=lerp(coarseNormal.a,denseNormal.a,grassBlend);
             float cloverDriver=filteredFbmWorld(hit.xz+float2(-54.2,16.8),.18,footprint);
-            float cloverWeight=smoothstep(.76,.90,cloverDriver)*smoothstep(.48,.72,terrainMoisture)*(1-soilMask)*.58;
+            float cloverWeight=smoothstep(.76,.90,cloverDriver)*
+                smoothstep(.48,.72,terrainMoisture)*(1-soilMask)*(1-rootLoamMask)*.58;
             if(cloverWeight>.01){
                 float4 cloverAlbedo=sampleGroundAlbedo(groundUvB+float2(.31,.17),3u,groundLodB);
                 float4 cloverNormal=sampleGroundNormal(groundUvB+float2(.31,.17),3u,normalLodB);
                 float4 cloverLow=sampleGroundAlbedo(groundUvB+float2(.31,.17),3u,groundLodB+3.25);
-                textureAlbedo=lerp(textureAlbedo,cloverAlbedo,cloverWeight);
-                textureNormal=lerp(textureNormal,cloverNormal,cloverWeight);
-                textureLow=lerp(textureLow,cloverLow,cloverWeight);
+                float3 cloverFrequency=clamp(
+                    cloverAlbedo.rgb/max(cloverLow.rgb,.012),.76,1.28)*
+                    lerp(.96,1.04,cloverNormal.b);
+                materialFrequency=lerp(materialFrequency,cloverFrequency,cloverWeight);
+                materialSlope=lerp(materialSlope,cloverNormal.rg*2-1,cloverWeight);
+                layerRoughness=lerp(layerRoughness,cloverAlbedo.a,cloverWeight);
+                materialHeight=lerp(materialHeight,cloverNormal.b,cloverWeight);
+                materialCavity=lerp(materialCavity,cloverNormal.a,cloverWeight);
             }
             if(soilMask>.01){
                 float4 soilAlbedo=sampleGroundAlbedo(groundUvB+float2(.13,.43),2u,groundLodB);
                 float4 soilNormal=sampleGroundNormal(groundUvB+float2(.13,.43),2u,normalLodB);
                 float4 soilLow=sampleGroundAlbedo(groundUvB+float2(.13,.43),2u,groundLodB+3.25);
-                textureAlbedo=lerp(textureAlbedo,soilAlbedo,soilMask);
-                textureNormal=lerp(textureNormal,soilNormal,soilMask);
-                textureLow=lerp(textureLow,soilLow,soilMask);
+                float3 soilFrequency=clamp(
+                    soilAlbedo.rgb/max(soilLow.rgb,.012),.68,1.42)*
+                    lerp(.92,1.08,soilNormal.b);
+                materialFrequency=lerp(materialFrequency,soilFrequency,soilMask);
+                materialSlope=lerp(materialSlope,soilNormal.rg*2-1,soilMask);
+                layerRoughness=lerp(layerRoughness,soilAlbedo.a,soilMask);
+                materialHeight=lerp(materialHeight,soilNormal.b,soilMask);
+                materialCavity=lerp(materialCavity,soilNormal.a,soilMask);
             }
-            float3 highFrequency=clamp(textureAlbedo.rgb/max(textureLow.rgb,.012),.72,1.34);
-            highFrequency*=lerp(.95,1.05,textureNormal.b);
+            if(rootLoamMask>.001){
+                float4 loamAlbedo=sampleGroundAlbedo(groundUvRoot,4u,groundLodA);
+                float4 loamNormal=sampleGroundNormal(groundUvRoot,4u,normalLodA);
+                float4 loamLow=sampleGroundAlbedo(groundUvRoot,4u,groundLodA+3.25);
+                float3 loamFrequency=clamp(
+                    loamAlbedo.rgb/max(loamLow.rgb,.012),.76,1.28)*
+                    lerp(.96,1.04,loamNormal.b);
+                materialFrequency=lerp(materialFrequency,loamFrequency,rootLoamMask);
+                materialSlope=lerp(materialSlope,loamNormal.rg*2-1,rootLoamMask);
+                layerRoughness=lerp(layerRoughness,loamAlbedo.a,rootLoamMask);
+                materialHeight=lerp(materialHeight,loamNormal.b,rootLoamMask);
+                materialCavity=lerp(materialCavity,loamNormal.a,rootLoamMask);
+            }
             float materialDetail=saturate(nearTextureWeight*
                 clamp(camera.groundSettings.y,0.0,2.0)*.84);
-            albedo*=lerp(float3(1,1,1),highFrequency,materialDetail);
-            terrainRoughness=textureAlbedo.a;
-            terrainCavity=textureNormal.a*nearTextureWeight*.55;
-            terrainMicroHeight=textureNormal.b;
+            albedo*=lerp(float3(1,1,1),materialFrequency,materialDetail);
+            terrainRoughness=layerRoughness;
+            terrainCavity=materialCavity*nearTextureWeight*.55;
+            terrainMicroHeight=materialHeight;
             terrainMicroCoverage=nearTextureWeight;
             // The atlas stores physical millimetre-scale turf relief.  Keep
             // its response below the geometric grass silhouette and reserve
             // stronger normal modulation for genuinely exposed soil.  A
             // near-unity multiplier here made short turf look like folded
             // tarpaulin under grazing sun.
-            float turfRelief=lerp(.43,.68,soilMask);
+            float turfRelief=lerp(.43,.68,max(soilMask,rootLoamMask*.72));
             float normalStrength=nearTextureWeight*
                 clamp(camera.groundSettings.x,0.0,2.0)*turfRelief;
-            float2 mapXY=(textureNormal.rg*2-1)*normalStrength;
+            float2 mapXY=materialSlope*normalStrength;
             float mapZ=sqrt(saturate(1-dot(mapXY,mapXY)));
             float3 tangent=normalize(float3(1,-surfaceNormal.x/max(surfaceNormal.y,.12),0));
             float3 bitangent=normalize(cross(surfaceNormal,tangent));

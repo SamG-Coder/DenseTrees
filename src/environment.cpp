@@ -792,6 +792,21 @@ TerrainSurfaceSample EnvironmentGenerator::sampleTerrainSurface(float x,float z)
     return {{worldX,height,worldZ},normalize(cross(p1-p0,p2-p0)),inside};
 }
 
+float EnvironmentGenerator::rootLoamWeight(float x,float z) {
+    const float radius=std::sqrt(x*x+z*z);
+    const float azimuth=std::atan2(z,x);
+    // This formula is intentionally limited to elementary HLSL operations.
+    // The common 5/9-lobe offset breaks the circular boundary while keeping a
+    // guaranteed 1.05 m grass-free core. A separate three-lobe term varies the
+    // transition width between .75 and .87 m without moving that core.
+    const float sharedOffset=.055f*std::sin(5*azimuth+.60f)+
+                             .035f*std::sin(9*azimuth-1.20f);
+    const float coreRadius=1.14f+sharedOffset;
+    const float meadowRadius=1.95f+sharedOffset+
+                             .060f*std::sin(3*azimuth+1.70f);
+    return 1.0f-smoothStep(coreRadius,meadowRadius,radius);
+}
+
 bool EnvironmentGenerator::makeGrassPatch(int cellX,int cellZ,uint32_t seed,
                                            GrassPatchGpu& patch) {
     Rng rng(worldGrassHash(cellX,cellZ,seed));
@@ -801,7 +816,8 @@ bool EnvironmentGenerator::makeGrassPatch(int cellX,int cellZ,uint32_t seed,
     if(!surface.insideBounds)return false;
 
     const float heroRadius=std::sqrt(x*x+z*z);
-    if(heroRadius<1.05f)return false;
+    const float rootGrassSuitability=1.0f-rootLoamWeight(x,z);
+    if(rootGrassSuitability<=0)return false;
     const Vec3 normal=surface.normal;
     const float slope=std::sqrt(normal.x*normal.x+normal.z*normal.z)/
                       std::max(normal.y,.20f);
@@ -848,6 +864,7 @@ bool EnvironmentGenerator::makeGrassPatch(int cellX,int cellZ,uint32_t seed,
     suitability*=smoothStep(.80f,.93f,normal.y);
     suitability*=smoothStep(1.8f,9.0f,bankDistance);
     suitability*=mownTurfDensity(colour);
+    suitability*=rootGrassSuitability;
     if(rng.unit()>clamp(suitability,0.0f,1.0f))return false;
 
     const float coarseHabitat=clamp(.25f*meadow+.65f*riparian+
@@ -1182,7 +1199,8 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         const float x=-grassHalfExtent+(ix+grassRng.range(.13f,.87f))*cell;
         const float z=-grassHalfExtent+(iz+grassRng.range(.13f,.87f))*cell;
         const float radius=std::sqrt(x*x+z*z);
-        if(radius>grassHalfExtent-.25f||radius<1.05f)continue;
+        const float rootGrassSuitability=1.0f-rootLoamWeight(x,z);
+        if(radius>grassHalfExtent-.25f||rootGrassSuitability<=0)continue;
         const MeadowColourFields colour=meadowColourFields(x,z);
 
         float islandStrength=0;
@@ -1199,7 +1217,8 @@ EnvironmentMesh EnvironmentGenerator::build(uint32_t seed) const {
         const bool coarse=grassRng.unit()<
             coarseTurfProbability(colour,islandStrength);
         const float canopyShade=1.0f-.26f*(1.0f-smoothStep(5.0f,11.0f,radius));
-        const float density=canopyShade*mownTurfDensity(colour);
+        const float density=canopyShade*mownTurfDensity(colour)*
+                            rootGrassSuitability;
         if(grassRng.unit()>density)continue;
 
         const float baseY=terrainHeight(x,z)+.006f;

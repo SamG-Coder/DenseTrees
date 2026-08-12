@@ -14,6 +14,10 @@ enum class GroundMaterialTile : uint32_t {
     UplandShortTurf = 1,
     ExposedRockSoil = 2,
     RiparianMoss = 3,
+    // Local detail material beneath the hero oak.  This is deliberately not
+    // part of the four-way biome mixture: roots disturb the existing biome
+    // instead of defining a fifth landscape biome.
+    RootLoam = 4,
     DenseShortTurf = MeadowTurf,
     CoarseMeadow = UplandShortTurf,
     WornSoil = ExposedRockSoil,
@@ -28,13 +32,15 @@ struct GroundTextureMip {
 };
 
 struct GroundTextureAtlas {
-    static constexpr uint32_t atlasWidth = 2048;
-    static constexpr uint32_t atlasHeight = 2048;
     static constexpr uint32_t tileSize = 1024;
-    static constexpr uint32_t tileCount = 4;
-    // A 2x2 atlas can retain four isolated materials down to a 2x2 mip, where
-    // each material owns one texel. A 1x1 mip cannot represent four materials
-    // without bleeding and is therefore deliberately omitted.
+    static constexpr uint32_t biomeMaterialCount = 4;
+    static constexpr uint32_t tileCount = 5;
+    // CPU generation uses a horizontal staging strip.  Each material is
+    // downsampled independently, then uploaded as one Texture2DArray slice.
+    // At the coarsest 5x1 staging mip every slice still owns one isolated
+    // texel, so no material can bleed into a neighbour.
+    static constexpr uint32_t atlasWidth = tileSize * tileCount;
+    static constexpr uint32_t atlasHeight = tileSize;
     static constexpr uint32_t tileSafeMipCount = 11;
     static constexpr float tileWorldSizeMetres = 2.0f;
 
@@ -49,7 +55,7 @@ struct GroundTextureAtlas {
     // a close-cropped millimetre-scale mat; large amplitudes turn its normal
     // map into a woven tarpaulin under grazing light.  Mineral plates retain
     // centimetre-scale relief, while moss/silt remains soft and shallow.
-    std::array<float,tileCount> heightAmplitudeMetres{.0035f,.0048f,.028f,.0065f};
+    std::array<float,tileCount> heightAmplitudeMetres{.0035f,.0048f,.028f,.0065f,.0050f};
 };
 
 struct GroundBiomeInput {
@@ -65,12 +71,11 @@ struct GroundBiomeInput {
 };
 
 struct GroundBiomeWeights {
-    std::array<float,GroundTextureAtlas::tileCount> material{};
+    std::array<float,GroundTextureAtlas::biomeMaterialCount> material{};
 };
 
-// Atlas quadrants are ordered top-left, top-right, bottom-left, bottom-right,
-// matching GroundMaterialTile's numeric values. Every tile and every mip is
-// generated independently from the supplied seed.
+// Atlas staging tiles run left-to-right in GroundMaterialTile numeric order.
+// Every tile and every mip is generated independently from the supplied seed.
 [[nodiscard]] GroundTextureAtlas makeGroundTextureAtlas(uint32_t seed = 0x67726f75u);
 
 // Produces a normalized, smoothly blended biome mixture.  It deliberately

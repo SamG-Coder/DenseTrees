@@ -62,14 +62,15 @@ int main() {
     require(groundAtlas.albedoRoughness.size()==dense::GroundTextureAtlas::tileSafeMipCount&&
                 groundAtlas.normalHeightCavity.size()==dense::GroundTextureAtlas::tileSafeMipCount,
             "runtime ground material mip inventory is incomplete");
-    uint32_t expectedAtlasSize=dense::GroundTextureAtlas::atlasWidth;
+    uint32_t expectedAtlasWidth=dense::GroundTextureAtlas::atlasWidth;
+    uint32_t expectedAtlasHeight=dense::GroundTextureAtlas::atlasHeight;
     for(size_t level=0;level<groundAtlas.albedoRoughness.size();++level){
         const auto&albedoMip=groundAtlas.albedoRoughness[level];
         const auto&normalMip=groundAtlas.normalHeightCavity[level];
-        require(albedoMip.width==expectedAtlasSize&&albedoMip.height==expectedAtlasSize&&
-                    normalMip.width==expectedAtlasSize&&normalMip.height==expectedAtlasSize&&
-                    albedoMip.pixels.size()==static_cast<size_t>(expectedAtlasSize)*expectedAtlasSize&&
-                    normalMip.pixels.size()==static_cast<size_t>(expectedAtlasSize)*expectedAtlasSize,
+        require(albedoMip.width==expectedAtlasWidth&&albedoMip.height==expectedAtlasHeight&&
+                    normalMip.width==expectedAtlasWidth&&normalMip.height==expectedAtlasHeight&&
+                    albedoMip.pixels.size()==static_cast<size_t>(expectedAtlasWidth)*expectedAtlasHeight&&
+                    normalMip.pixels.size()==static_cast<size_t>(expectedAtlasWidth)*expectedAtlasHeight,
                 "runtime ground material mip dimensions are invalid");
         const size_t stride=std::max<size_t>(1,normalMip.pixels.size()/257);
         for(size_t sample=0;sample<normalMip.pixels.size();sample+=stride){
@@ -79,13 +80,17 @@ int main() {
             require(nx*nx+ny*ny<=1.02f,
                     "runtime ground normal contains a non-reconstructable tangent vector");
         }
-        expectedAtlasSize=std::max(2u,expectedAtlasSize/2);
+        expectedAtlasWidth=std::max(dense::GroundTextureAtlas::tileCount,
+                                    expectedAtlasWidth/2);
+        expectedAtlasHeight=std::max(1u,expectedAtlasHeight/2);
     }
     const auto&coarsestGround=groundAtlas.albedoRoughness.back();
-    require(coarsestGround.width==2&&coarsestGround.height==2&&
+    require(coarsestGround.width==dense::GroundTextureAtlas::tileCount&&
+                coarsestGround.height==1&&
                 coarsestGround.pixels[0]!=coarsestGround.pixels[1]&&
                 coarsestGround.pixels[0]!=coarsestGround.pixels[2]&&
-                coarsestGround.pixels[2]!=coarsestGround.pixels[3],
+                coarsestGround.pixels[2]!=coarsestGround.pixels[3]&&
+                coarsestGround.pixels[2]!=coarsestGround.pixels[4],
             "runtime ground atlas bled distinct materials together at its coarsest mip");
     const auto repeatedGroundAtlas=dense::makeGroundTextureAtlas(0x1234abcdu);
     for(size_t level=0;level<groundAtlas.albedoRoughness.size();++level){

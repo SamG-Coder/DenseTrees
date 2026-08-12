@@ -293,12 +293,51 @@ MaterialSample cloverMoss(float u,float v,uint32_t seed) {
     return sample;
 }
 
+MaterialSample rootLoam(float u,float v,uint32_t seed) {
+    // Compacted organic soil at the root collar is a fine crumb aggregate,
+    // not the broad mineral plates used by exposed rock.  Overlapping FBM
+    // bands provide continuous pore structure; sparse cellular fragments are
+    // used only as finite pieces of leaf litter, never as Voronoi boundaries.
+    const float humus=periodicFbm(u,v,3,6,seed^0x48c31ad7u);
+    const float crumbs=periodicFbm(u,v,23,4,seed^0xa7429f15u);
+    const float granules=periodicFbm(u,v,83,3,seed^0x16dd78e9u);
+    const float moisture=periodicFbm(u,v,5,5,seed^0xcd856f31u);
+    const CellularSample litterA=periodicCellular(u,v,31,seed^0xb2095a63u);
+    const CellularSample litterB=periodicCellular(u,v,47,seed^0x726cd4b9u);
+    const float litter=saturate(cellularStemFragment(litterA,.42f,.075f,.58f)+
+                                cellularStemFragment(litterB,.34f,.060f,.70f)*.72f);
+    const float damp=smoothStep(.43f,.72f,moisture+.08f*(humus-.5f));
+    const float crumbCrown=smoothStep(.47f,.75f,.62f*crumbs+.38f*granules);
+    const float porous=smoothStep(.56f,.80f,.58f*(1-crumbs)+.42f*(1-granules));
+
+    const float dryR=mix(.070f,.122f,humus),dryG=mix(.044f,.078f,humus);
+    const float dryB=mix(.020f,.038f,crumbs);
+    const float wetR=mix(.032f,.066f,humus),wetG=mix(.024f,.045f,humus);
+    const float wetB=mix(.012f,.024f,crumbs);
+    MaterialSample sample;
+    sample.red=mix(dryR,wetR,damp);
+    sample.green=mix(dryG,wetG,damp);
+    sample.blue=mix(dryB,wetB,damp);
+    // Small ochre leaf and bark fragments sit on the loam without becoming a
+    // second raised tessellation pattern.
+    sample.red=mix(sample.red,.145f,litter*.48f);
+    sample.green=mix(sample.green,.091f,litter*.48f);
+    sample.blue=mix(sample.blue,.033f,litter*.48f);
+    sample.roughness=saturate(.955f-.035f*damp-.030f*crumbCrown-
+                              .025f*litter+.012f*porous);
+    sample.height=saturate(.47f+.075f*(humus-.5f)+.080f*(crumbs-.5f)+
+                           .045f*(granules-.5f)+.035f*crumbCrown+.028f*litter);
+    sample.cavity=saturate(.13f+.22f*porous+.080f*(1-humus)-.035f*litter);
+    return sample;
+}
+
 MaterialSample evaluateMaterial(GroundMaterialTile material,float u,float v,uint32_t seed) {
     switch(material) {
     case GroundMaterialTile::MeadowTurf:return denseTurf(u,v,seed);
     case GroundMaterialTile::UplandShortTurf:return coarseMeadow(u,v,seed);
     case GroundMaterialTile::ExposedRockSoil:return wornSoil(u,v,seed);
     case GroundMaterialTile::RiparianMoss:return cloverMoss(u,v,seed);
+    case GroundMaterialTile::RootLoam:return rootLoam(u,v,seed);
     }
     return {};
 }
@@ -329,7 +368,7 @@ GroundTextureMip makeTopAlbedoMip(std::array<std::vector<float>,2>& tileFields,
         heights.resize(static_cast<size_t>(size)*size);cavities.resize(static_cast<size_t>(size)*size);
         const uint32_t tileSeed=mixBits(seed^(0x9e3779b9u*(tile+1)));
         const auto material=static_cast<GroundMaterialTile>(tile);
-        const uint32_t originX=(tile&1u)*size,originY=(tile>>1u)*size;
+        const uint32_t originX=tile*size,originY=0;
         for(uint32_t y=0;y<size;++y)for(uint32_t x=0;x<size;++x) {
             const float u=(static_cast<float>(x)+.5f)/size;
             const float v=(static_cast<float>(y)+.5f)/size;
@@ -361,10 +400,11 @@ GroundTextureMip makeTopAlbedoMip(std::array<std::vector<float>,2>& tileFields,
 GroundTextureMip downsampleAlbedoIsolated(const GroundTextureMip& source) {
     const uint32_t width=source.width/2,height=source.height/2;
     GroundTextureMip result{width,height,std::vector<uint32_t>(static_cast<size_t>(width)*height)};
-    const uint32_t sourceTile=source.width/2,destinationTile=width/2;
+    const uint32_t sourceTile=source.width/GroundTextureAtlas::tileCount;
+    const uint32_t destinationTile=width/GroundTextureAtlas::tileCount;
     for(uint32_t tile=0;tile<GroundTextureAtlas::tileCount;++tile) {
-        const uint32_t sx0=(tile&1u)*sourceTile,sy0=(tile>>1u)*sourceTile;
-        const uint32_t dx0=(tile&1u)*destinationTile,dy0=(tile>>1u)*destinationTile;
+        const uint32_t sx0=tile*sourceTile,sy0=0;
+        const uint32_t dx0=tile*destinationTile,dy0=0;
         for(uint32_t y=0;y<destinationTile;++y)for(uint32_t x=0;x<destinationTile;++x) {
             uint32_t sums[4]{};
             for(uint32_t oy=0;oy<2;++oy)for(uint32_t ox=0;ox<2;++ox) {
@@ -382,10 +422,11 @@ GroundTextureMip downsampleAlbedoIsolated(const GroundTextureMip& source) {
 GroundTextureMip downsampleNormalIsolated(const GroundTextureMip& source) {
     const uint32_t width=source.width/2,height=source.height/2;
     GroundTextureMip result{width,height,std::vector<uint32_t>(static_cast<size_t>(width)*height)};
-    const uint32_t sourceTile=source.width/2,destinationTile=width/2;
+    const uint32_t sourceTile=source.width/GroundTextureAtlas::tileCount;
+    const uint32_t destinationTile=width/GroundTextureAtlas::tileCount;
     for(uint32_t tile=0;tile<GroundTextureAtlas::tileCount;++tile) {
-        const uint32_t sx0=(tile&1u)*sourceTile,sy0=(tile>>1u)*sourceTile;
-        const uint32_t dx0=(tile&1u)*destinationTile,dy0=(tile>>1u)*destinationTile;
+        const uint32_t sx0=tile*sourceTile,sy0=0;
+        const uint32_t dx0=tile*destinationTile,dy0=0;
         for(uint32_t y=0;y<destinationTile;++y)for(uint32_t x=0;x<destinationTile;++x) {
             float nx=0,ny=0,nz=0,heightSum=0,cavitySum=0,cavityMaximum=0;
             for(uint32_t oy=0;oy<2;++oy)for(uint32_t ox=0;ox<2;++ox) {
@@ -415,7 +456,7 @@ GroundTextureAtlas makeGroundTextureAtlas(uint32_t seed) {
     GroundTextureMip normalTop;
     atlas.albedoRoughness.push_back(makeTopAlbedoMip(tileFields,atlas,seed,normalTop));
     atlas.normalHeightCavity.push_back(std::move(normalTop));
-    while(atlas.albedoRoughness.back().width>2) {
+    while(atlas.albedoRoughness.back().height>1) {
         atlas.albedoRoughness.push_back(downsampleAlbedoIsolated(atlas.albedoRoughness.back()));
         atlas.normalHeightCavity.push_back(downsampleNormalIsolated(atlas.normalHeightCavity.back()));
     }

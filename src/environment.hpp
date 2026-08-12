@@ -107,6 +107,12 @@ public:
     static Vec3 terrainNormal(float x, float z);
     static TerrainSurfaceSample sampleTerrainSurface(float x, float z);
 
+    // World-stable material mask around the origin-centred hero oak. One is
+    // exposed root loam and zero is uninterrupted meadow. The exact analytic
+    // profile is shared with the terrain shader so grass density and material
+    // blending cannot form two different rings around the same buttresses.
+    static float rootLoamWeight(float x, float z);
+
     // Deterministic map contract shared by terrain tests and the renderer's
     // persistent river pass.  The main river flows toward increasing Z.
     static float riverCenterX(float z);
