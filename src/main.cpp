@@ -1,16 +1,20 @@
+#include "aoe_world.hpp"
 #include "dxr_renderer.hpp"
 #include "first_person_camera.hpp"
+#include "launch_options.hpp"
 #include "rtx_caps.hpp"
 #include "tree.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -104,6 +108,8 @@ struct App {
     dense::EnvironmentSimulation environment;
     dense::FirstPersonCameraController firstPersonCamera;
     dense::PlayerLocalLight playerLocalLight;
+    dense::SceneMode sceneMode{dense::SceneMode::VisualTest};
+    std::shared_ptr<dense::AoeWorldScene> aoeWorld;
 
     float yaw = .55f;
     float pitch = .18f;
@@ -144,6 +150,22 @@ struct App {
     std::chrono::steady_clock::time_point nextPerformanceTitleUpdate{};
     std::chrono::steady_clock::time_point lastEnvironmentUpdate{};
     std::chrono::steady_clock::time_point lastCameraUpdate{};
+
+    App(dense::SceneMode mode,std::int64_t seed):sceneMode(mode) {
+        if(sceneMode==dense::SceneMode::AiRpgWorld) {
+            aoeWorld=std::make_shared<dense::AoeWorldScene>(
+                dense::AoeWorldGenerator::generate(seed));
+            dense::FirstPersonCameraSettings settings;
+            settings.horizontalHalfExtent=aoeWorld->traversalHalfExtent();
+            const auto world=aoeWorld;
+            firstPersonCamera=dense::FirstPersonCameraController(settings,
+                [world](float x,float z){return world->sampleTerrain(x,z);});
+            const dense::Vec3 spawn=aoeWorld->spawn();
+            firstPersonCamera.reset(spawn.x,spawn.z,0.35f,-.12f);
+            yaw=.72f;pitch=.48f;distance=55.0f;
+            debugSettings.grassDensity=2.2f;
+        }
+    }
 
     ~App() {
         releaseFirstPersonCapture();
@@ -308,12 +330,16 @@ struct App {
             view.grassInteractionEnabled=true;
             return view;
         }
-        const dense::Vec3 target{0,4.1f,0};
+        const dense::Vec3 target=aoeWorld?
+            dense::Vec3{aoeWorld->spawn().x,aoeWorld->spawn().y+3.0f,
+                        aoeWorld->spawn().z}:dense::Vec3{0,4.1f,0};
         dense::Vec3 eye=target+dense::Vec3{
             std::sin(yaw)*std::cos(pitch)*distance,
             std::sin(pitch)*distance,
             -std::cos(yaw)*std::cos(pitch)*distance};
-        eye.y=std::max(eye.y,dense::EnvironmentGenerator::terrainHeight(eye.x,eye.z)+.34f);
+        const float terrain=aoeWorld?aoeWorld->sampleTerrain(eye.x,eye.z).position.y:
+                                     dense::EnvironmentGenerator::terrainHeight(eye.x,eye.z);
+        eye.y=std::max(eye.y,terrain+.34f);
         return {eye,dense::normalize(target-eye)};
     }
 
@@ -324,6 +350,17 @@ struct App {
     }
 
     void regenerate(HWND window,bool nextSeed = true) {
+        if(aoeWorld) {
+            dense::TreeMesh emptyTree;
+            renderer.setTree(emptyTree);
+            std::wstringstream title;
+            title<<L"AI RPG AOE World 3D \u2014 seed "<<aoeWorld->seed()
+                 <<L" \u2014 "<<aoeWorld->terrainTileCount()<<L" terrain tiles / "
+                 <<aoeWorld->waterTileCount()<<L" water tiles / "
+                 <<aoeWorld->treeCount()<<L" trees \u2014 "<<gpu.adapter<<L" / DXR "
+                 <<gpu.rayTracingTier/10<<L'.'<<gpu.rayTracingTier%10;
+            sceneTitle=title.str();refreshInteractionTitle();return;
+        }
         if(nextSeed)params.seed = 5080+generation++;
         const auto start = std::chrono::steady_clock::now();
         auto nodes = generator.grow(params);
@@ -372,10 +409,10 @@ struct App {
             } else DestroyWindow(window);
             return true;
         }
-        if(key=='R'||(key==VK_SPACE&&cameraMode==CameraMode::Orbit)){
+        if(!aoeWorld&&(key=='R'||(key==VK_SPACE&&cameraMode==CameraMode::Orbit))){
             regenerate(window);return true;
         }
-        if(key>='1'&&key<='5'){
+        if(!aoeWorld&&key>='1'&&key<='5'){
             setSpecies(window,static_cast<dense::TreeSpecies>(key-'1'));
             return true;
         }
@@ -897,8 +934,12 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         }
         return 0;
     case WM_MOUSEWHEEL:
-        if(app&&app->cameraMode==CameraMode::Orbit)app->distance=std::clamp(app->distance-
-            static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam))/120.0f,7.0f,30.0f);
+        if(app&&app->cameraMode==CameraMode::Orbit) {
+            const float wheel=static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam))/120.0f;
+            const float maximum=app->aoeWorld?240.0f:30.0f;
+            const float speed=app->aoeWorld?4.0f:1.0f;
+            app->distance=std::clamp(app->distance-wheel*speed,7.0f,maximum);
+        }
         return 0;
     case WM_INPUT:
         if(app)app->handleRawMouse(reinterpret_cast<HRAWINPUT>(lParam));
@@ -955,6 +996,22 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
+    int argumentCount=0;
+    wchar_t**arguments=CommandLineToArgvW(GetCommandLineW(),&argumentCount);
+    const dense::LaunchOptions options=dense::parseLaunchOptions(
+        argumentCount,arguments);
+    if(arguments)LocalFree(arguments);
+    if(options.showHelp) {
+        MessageBoxW(nullptr,dense::launchUsage(),L"Dense Trees launch options",
+                    MB_OK|MB_ICONINFORMATION);
+        return 0;
+    }
+    if(!options.valid) {
+        const std::wstring message=options.error+L"\n\n"+dense::launchUsage();
+        MessageBoxW(nullptr,message.c_str(),L"Dense Trees launch error",
+                    MB_OK|MB_ICONERROR);
+        return 1;
+    }
     INITCOMMONCONTROLSEX commonControls{sizeof(commonControls),ICC_BAR_CLASSES|ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&commonControls);
 
@@ -981,13 +1038,31 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     SetProcessDPIAware();
     RECT rectangle{0,0,1440,900};
     AdjustWindowRect(&rectangle,WS_OVERLAPPEDWINDOW,FALSE);
-    HWND window = CreateWindowExW(0,mainClass.lpszClassName,L"Dense Trees",
+    const wchar_t*initialTitle=options.scene==dense::SceneMode::AiRpgWorld?
+        L"AI RPG AOE World 3D":L"Dense Trees Visual Test";
+    HWND window = CreateWindowExW(0,mainClass.lpszClassName,initialTitle,
         WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,
         rectangle.right-rectangle.left,rectangle.bottom-rectangle.top,
         nullptr,nullptr,instance,nullptr);
     if(!window)return 2;
 
-    app=std::make_unique<App>();
+    ShowWindow(window,show);
+    UpdateWindow(window);
+    SetCursor(LoadCursor(nullptr,IDC_WAIT));
+    try {
+        app=std::make_unique<App>(options.scene,options.seed);
+    } catch(const std::exception&error) {
+        const std::string detail=error.what();
+        const std::wstring message=L"World generation failed.\n\n"+
+            std::wstring(detail.begin(),detail.end());
+        MessageBoxW(window,message.c_str(),L"AI RPG AOE World 3D",MB_ICONERROR);
+        return 3;
+    } catch(...) {
+        MessageBoxW(window,L"World generation failed with an unknown error.",
+                    L"AI RPG AOE World 3D",MB_ICONERROR);
+        return 3;
+    }
+    SetCursor(LoadCursor(nullptr,IDC_ARROW));
     app->gpu=dense::queryGpuCapabilities();
     RAWINPUTDEVICE mouseDevice{};
     mouseDevice.usUsagePage=0x01;
@@ -1004,14 +1079,17 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         MessageBoxW(window,app->renderer.error(),L"Dense Trees DXR renderer error",MB_ICONERROR);
         return 3;
     }
+    if(app->aoeWorld) {
+        const auto world=app->aoeWorld;
+        app->renderer.setWorld(world->takeMesh(),
+            [world](float x,float z){return world->sampleWater(x,z);});
+    }
     if(!app->createDebugPanelWindow(window,instance)) {
         MessageBoxW(window,L"The renderer controls could not be created.",
             L"Dense Trees debug controls",MB_ICONWARNING);
     }
     app->regenerate(window);
-    ShowWindow(window,show);
-    UpdateWindow(window);
-    app->showDebugPanel(true);
+    app->showDebugPanel(options.scene==dense::SceneMode::VisualTest);
 
     MSG message{};
     bool running=true;

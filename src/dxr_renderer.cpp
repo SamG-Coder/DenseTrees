@@ -311,7 +311,7 @@ struct DxrRenderer::Impl{
     void*visibleGrassMapped{};bool visibleGrassGpuReady{};
     ID3D12Resource*raygenTable{};ID3D12Resource*missTable{};ID3D12Resource*hitTable{};
     UINT vertexCount{},indexCount{},treeVertexCount{},treeIndexCount{},grassPatchCount{};
-    float treeHeight=1.0f;bool treeWindWasActive=false;
+    float treeHeight=1.0f;bool treeWindWasActive=false;bool hasDynamicTree=true;
     UINT visibleNearGrassPatchCount{},visibleFarGrassPatchCount{};
     struct GrassChunk{
         std::vector<GrassPatchGpu>patches;
@@ -321,6 +321,8 @@ struct DxrRenderer::Impl{
     uint64_t grassStreamEpoch{};
     std::vector<GrassPatchGpu>streamedGrassPatches;
     bool grassStreamValid{};
+    WaterSampler waterSampler;
+    bool customWorld{};
     float grassStreamCenterX=std::numeric_limits<float>::quiet_NaN();
     float grassStreamCenterZ=std::numeric_limits<float>::quiet_NaN();
     float grassStreamRadius{};
@@ -331,9 +333,9 @@ struct DxrRenderer::Impl{
     bool begin(){wait();if(FAILED(allocator->Reset()))return false;if(FAILED(list->Reset(allocator,nullptr)))return false;return true;}
     bool execute(){if(FAILED(list->Close()))return false;ID3D12CommandList*commands[]={list};queue->ExecuteCommandLists(1,commands);wait();return true;}
     ID3D12Resource*makeBuffer(UINT64 bytes,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE){ID3D12Resource*r{};auto h=heap(type);auto d=bufferDesc(std::max<UINT64>(bytes,256),flags);if(FAILED(device->CreateCommittedResource(&h,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,__uuidof(ID3D12Resource),reinterpret_cast<void**>(&r))))return nullptr;return r;}
-    template<class T>ID3D12Resource*upload(const std::vector<T>&data){ID3D12Resource*r=makeBuffer(data.size()*sizeof(T),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!r)return nullptr;void*mapped{};if(FAILED(r->Map(0,nullptr,&mapped))){release(r);return nullptr;}std::memcpy(mapped,data.data(),data.size()*sizeof(T));r->Unmap(0,nullptr);return r;}
-    template<class T>ID3D12Resource*uploadDefault(const std::vector<T>&data){const UINT64 bytes=std::max<UINT64>(data.size()*sizeof(T),256);ID3D12Resource*destination=makeBuffer(bytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST),*staging=makeBuffer(bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!destination||!staging){release(destination);release(staging);return nullptr;}void*mapped{};if(FAILED(staging->Map(0,nullptr,&mapped))){release(destination);release(staging);return nullptr;}std::memcpy(mapped,data.data(),data.size()*sizeof(T));staging->Unmap(0,nullptr);if(!begin()){release(destination);release(staging);return nullptr;}list->CopyBufferRegion(destination,0,staging,0,data.size()*sizeof(T));auto barrier=transition(destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_GENERIC_READ);list->ResourceBarrier(1,&barrier);if(!execute()){release(destination);release(staging);return nullptr;}release(staging);return destination;}
-    template<class T>ID3D12Resource*uploadDefaultUav(const std::vector<T>&data){const UINT64 bytes=std::max<UINT64>(data.size()*sizeof(T),256);ID3D12Resource*destination=makeBuffer(bytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),*staging=makeBuffer(bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!destination||!staging){release(destination);release(staging);return nullptr;}void*mapped{};if(FAILED(staging->Map(0,nullptr,&mapped))){release(destination);release(staging);return nullptr;}std::memcpy(mapped,data.data(),data.size()*sizeof(T));staging->Unmap(0,nullptr);if(!begin()){release(destination);release(staging);return nullptr;}list->CopyBufferRegion(destination,0,staging,0,data.size()*sizeof(T));auto barrier=transition(destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);list->ResourceBarrier(1,&barrier);if(!execute()){release(destination);release(staging);return nullptr;}release(staging);return destination;}
+    template<class T>ID3D12Resource*upload(const std::vector<T>&data){ID3D12Resource*r=makeBuffer(data.size()*sizeof(T),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!r)return nullptr;void*mapped{};if(FAILED(r->Map(0,nullptr,&mapped))){release(r);return nullptr;}if(!data.empty())std::memcpy(mapped,data.data(),data.size()*sizeof(T));r->Unmap(0,nullptr);return r;}
+    template<class T>ID3D12Resource*uploadDefault(const std::vector<T>&data){const UINT64 copyBytes=data.size()*sizeof(T),bytes=std::max<UINT64>(copyBytes,256);ID3D12Resource*destination=makeBuffer(bytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST),*staging=makeBuffer(bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!destination||!staging){release(destination);release(staging);return nullptr;}void*mapped{};if(FAILED(staging->Map(0,nullptr,&mapped))){release(destination);release(staging);return nullptr;}if(copyBytes)std::memcpy(mapped,data.data(),copyBytes);staging->Unmap(0,nullptr);if(!begin()){release(destination);release(staging);return nullptr;}if(copyBytes)list->CopyBufferRegion(destination,0,staging,0,copyBytes);auto barrier=transition(destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_GENERIC_READ);list->ResourceBarrier(1,&barrier);if(!execute()){release(destination);release(staging);return nullptr;}release(staging);return destination;}
+    template<class T>ID3D12Resource*uploadDefaultUav(const std::vector<T>&data){const UINT64 copyBytes=data.size()*sizeof(T),bytes=std::max<UINT64>(copyBytes,256);ID3D12Resource*destination=makeBuffer(bytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),*staging=makeBuffer(bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!destination||!staging){release(destination);release(staging);return nullptr;}void*mapped{};if(FAILED(staging->Map(0,nullptr,&mapped))){release(destination);release(staging);return nullptr;}if(copyBytes)std::memcpy(mapped,data.data(),copyBytes);staging->Unmap(0,nullptr);if(!begin()){release(destination);release(staging);return nullptr;}if(copyBytes)list->CopyBufferRegion(destination,0,staging,0,copyBytes);auto barrier=transition(destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);list->ResourceBarrier(1,&barrier);if(!execute()){release(destination);release(staging);return nullptr;}release(staging);return destination;}
     uint32_t terrainRetentionByte(float worldX,float worldZ)const{
         constexpr int resolution=EnvironmentGenerator::terrainResolution;
         constexpr int centre=(resolution-1)/2;
@@ -383,6 +385,12 @@ struct DxrRenderer::Impl{
         return static_cast<uint32_t>(clamp(value+0.5f,0.0f,255.0f));
     }
     void rebuildGrassStream(const Vec3&eye,float drawDistance){
+        if(customWorld){
+            streamedGrassPatches=environment.grassPatches;
+            grassStreamCenterX=eye.x;grassStreamCenterZ=eye.z;
+            grassStreamRadius=drawDistance+22.0f;grassStreamValid=true;
+            return;
+        }
         constexpr int chunkCells=32;
         constexpr float snap=12.0f,guardBand=22.0f;
         const float centreX=std::round(eye.x/snap)*snap;
@@ -714,18 +722,32 @@ struct DxrRenderer::Impl{
         grassStreamRadius=0;
         if(environment.terrainVertices.empty())environment=EnvironmentGenerator{}.build();
 
+        hasDynamicTree=!tree.branchIndices.empty()||!tree.leafIndices.empty();
         std::vector<MeshVertex>treeVertices=tree.branchVertices;
         treeVertices.insert(treeVertices.end(),tree.leafVertices.begin(),tree.leafVertices.end());
-        std::vector<MeshVertex>vertices=treeVertices;std::vector<uint32_t>indices;
+        std::vector<uint32_t>treeIndices=tree.branchIndices;
+        const uint32_t leafBase=static_cast<uint32_t>(tree.branchVertices.size());
+        for(uint32_t index:tree.leafIndices)treeIndices.push_back(leafBase+index);
+        // The generated-world mode has no hero tree, but DXR still keeps a
+        // separately refittable instance for the legacy wind path. A tiny
+        // hidden triangle makes that BLAS structurally valid without adding
+        // a visible object or special-casing the shader table/TLAS layout.
+        if(treeVertices.empty()||treeIndices.empty()){
+            constexpr float hidden=-4096.0f;
+            treeVertices={
+                {{0,hidden,0},{0,1,0},0xff000000u,3.0f,0,0},
+                {{1,hidden,0},{0,1,0},0xff000000u,3.0f,0,0},
+                {{0,hidden,1},{0,1,0},0xff000000u,3.0f,0,0}};
+            treeIndices={0,1,2};
+        }
+        std::vector<MeshVertex>vertices=treeVertices;
+        std::vector<uint32_t>indices=treeIndices;
         vertices.reserve(tree.branchVertices.size()+tree.leafVertices.size()+
                          environment.terrainVertices.size()+environment.riverVertices.size()+
                          environment.detailVertices.size());
         indices.reserve(tree.branchIndices.size()+tree.leafIndices.size()+
                         environment.terrainIndices.size()+environment.riverIndices.size()+
                         environment.detailIndices.size());
-        indices=tree.branchIndices;
-        const uint32_t leafBase=static_cast<uint32_t>(tree.branchVertices.size());
-        for(uint32_t index:tree.leafIndices)indices.push_back(leafBase+index);
         treeVertexCount=static_cast<UINT>(treeVertices.size());
         treeIndexCount=static_cast<UINT>(indices.size());treeHeight=.5f;
         for(const MeshVertex&vertex:treeVertices)treeHeight=std::max(treeHeight,vertex.position.y);
@@ -827,6 +849,7 @@ struct DxrRenderer::Impl{
         frameIndex=0;treeWindWasActive=false;return true;
     }
     bool recordTreeWind(const EnvironmentCB&environmentConstants){
+        if(!hasDynamicTree)return true;
         const bool active=environmentConstants.windSpeed>.001f&&
                           environmentConstants.windStrength>.001f;
         if(!active&&!treeWindWasActive)return true;
@@ -906,6 +929,13 @@ bool DxrRenderer::initialize(HWND window,int width,int height){auto&i=*impl_;i.w
     D3D12_DESCRIPTOR_HEAP_DESC rh{};rh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;rh.NumDescriptors=2;i.device->CreateDescriptorHeap(&rh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.rtvHeap));i.rtvSize=i.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);D3D12_DESCRIPTOR_HEAP_DESC dh{};dh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;dh.NumDescriptors=1;i.device->CreateDescriptorHeap(&dh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.dsvHeap));D3D12_DESCRIPTOR_HEAP_DESC gh{};gh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;gh.NumDescriptors=7;gh.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;i.device->CreateDescriptorHeap(&gh,__uuidof(ID3D12DescriptorHeap),reinterpret_cast<void**>(&i.gpuHeap));i.srvSize=i.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);i.device->CreateFence(0,D3D12_FENCE_FLAG_NONE,__uuidof(ID3D12Fence),reinterpret_cast<void**>(&i.fence));i.fenceEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!i.createBackBuffers()||!i.createOutputs()||!i.createBarkNormal()||!i.createGroundMaterials()||!i.createPipeline()||!i.createGrassPipeline()||!i.createTreeWindPipeline())return false;i.cameraBuffer=i.makeBuffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);i.environmentBuffer=i.makeBuffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);if(!i.cameraBuffer||!i.environmentBuffer||FAILED(i.cameraBuffer->Map(0,nullptr,&i.cameraMapped))||FAILED(i.environmentBuffer->Map(0,nullptr,&i.environmentMapped)))return false;i.initialized=true;return true;}
 void DxrRenderer::resize(int width,int height){auto&i=*impl_;if(!i.initialized||width<=0||height<=0)return;i.wait();i.width=width;i.height=height;for(auto&b:i.backBuffers)release(b);if(SUCCEEDED(i.swap->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,0))){i.createBackBuffers();i.createOutputs();}}
 void DxrRenderer::setTree(const TreeMesh&tree){if(impl_->initialized&&!impl_->buildAcceleration(tree))MessageBoxW(impl_->window,impl_->lastError.c_str(),L"Dense Trees DXR geometry error",MB_ICONERROR);}
+
+void DxrRenderer::setWorld(EnvironmentMesh world,WaterSampler waterSampler){
+    auto&i=*impl_;
+    i.environment=std::move(world);
+    i.waterSampler=std::move(waterSampler);
+    i.customWorld=true;
+}
 void DxrRenderer::render(const CameraView&requestedView,
                          const DebugRenderSettings&settings,
                          const EnvironmentCB&environment,
@@ -929,8 +959,8 @@ void DxrRenderer::render(const CameraView&requestedView,
     // only tells the ray-generation path which participating medium contains
     // the camera.  Querying the same authored cross-section that builds the
     // mesh keeps the transition at the visible waterline.
-    const PersistentWaterSample water=EnvironmentGenerator::persistentWater(
-        eye.x,eye.z);
+    const PersistentWaterSample water=i.waterSampler?
+        i.waterSampler(eye.x,eye.z):EnvironmentGenerator::persistentWater(eye.x,eye.z);
     const bool cameraUnderwater=water.inside&&eye.y<water.surfaceHeight;
     const float cameraImmersion=cameraUnderwater?
         water.surfaceHeight-eye.y:0.0f;
@@ -1008,8 +1038,9 @@ void DxrRenderer::render(const CameraView&requestedView,
         std::ceil(grassDensity*34.0f),1.0f,128.0f));
     const UINT farGrassStride=static_cast<UINT>(clamp(
         std::ceil(std::min(grassDensity,1.8f)*24.0f),1.0f,44.0f));
-    const auto visibleGrass=i.compactVisibleGrass(
-        eye,forward,right,up,tanHalf,static_cast<float>(i.width)/i.height,settings);
+    const auto visibleGrass=grassDensity>.001f?
+        i.compactVisibleGrass(eye,forward,right,up,tanHalf,
+            static_cast<float>(i.width)/i.height,settings):std::pair<UINT,UINT>{};
     i.visibleNearGrassPatchCount=visibleGrass.first;
     i.visibleFarGrassPatchCount=visibleGrass.second;
     struct Camera{

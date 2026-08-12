@@ -1272,6 +1272,8 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float3 hit=WorldRayOrigin()+WorldRayDirection()*RayTCurrent();float3 albedo=srgbToLinear(unpackColor(a.color)*bary.x+unpackColor(b.color)*bary.y+unpackColor(c.color)*bary.z);
     float material=a.material;float kind=floor(material+.001);
     bool riverSurface=kind>5.5&&kind<6.5;
+    bool generatedWorldWater=riverSurface&&frac(material)>.05;
+    bool generatedWorldTerrain=kind>6.5&&kind<7.5;
     bool thinFoliage=(kind>.5&&kind<1.5)||(kind>3.5&&kind<4.5);uint2 pixel=DispatchRaysIndex().xy;float2 random=float2(hash(pixel+camera.frameIndex*13),hash(pixel.yx+camera.frameIndex*29));
     float barkCavity=0,barkPlateTone=.5;
     if(kind<.5){
@@ -1625,6 +1627,60 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         }
         materialRoughness=terrainRoughness;
     }
+    if(generatedWorldTerrain){
+        // AI RPG AOE's generated terrain carries its classified biome in the
+        // fractional material channel and a biome palette in vertex colour.
+        // Keep this independent from the legacy lawn atlas: otherwise snow,
+        // beach, desert, wetland and forest floor all regress to meadow.
+        float biome=round(frac(material)*100.0);
+        float terrainDistance=distance(camera.eye,hit);
+        float pixelWorld=2*terrainDistance*camera.tanHalfFov/
+                         max(1.0,(float)camera.resolution.y);
+        float grazing=rcp(max(abs(dot(surfaceNormal,-WorldRayDirection())),.22));
+        float footprint=min(pixelWorld*sqrt(grazing),2.0);
+        float broad=filteredFbmWorld(hit.xz+float2(71.3,-29.7),.055,footprint);
+        float detail=filteredValueNoise(hit.xz+float2(-13.1,47.9),1.35,
+                                         min(footprint,.45));
+        float mineral=smoothstep(.58,.88,
+            filteredFbmWorld(hit.xz+float2(19.7,83.2),.22,footprint));
+        float isSand=saturate(1-abs(biome-4.0))+
+                     saturate(1-abs(biome-14.0));
+        float isRock=max(saturate(1-abs(biome-11.0)),
+                         saturate(1-abs(biome-10.0))*.55);
+        float isSnow=saturate(1-abs(biome-13.0));
+        float isMud=max(saturate(1-abs(biome-7.0)),
+                        saturate(1-abs(biome-3.0))*.7);
+        float isForest=max(saturate(1-abs(biome-8.0)),
+                           saturate(1-abs(biome-9.0)));
+        float energy=lerp(.88,1.12,broad)*lerp(.94,1.06,detail);
+        albedo*=energy;
+        albedo=lerp(albedo,albedo*float3(1.09,1.04,.91),isSand*mineral*.22);
+        albedo=lerp(albedo,albedo*float3(.80,.86,.78),isForest*mineral*.18);
+        albedo=lerp(albedo,albedo*float3(.72,.76,.78),isRock*mineral*.24);
+        albedo=lerp(albedo,float3(.70,.76,.80)*lerp(.86,1.04,broad),
+                    isSnow*.28);
+        materialRoughness=lerp(.87,.76,isSand);
+        materialRoughness=lerp(materialRoughness,.94,isForest);
+        materialRoughness=lerp(materialRoughness,.82,isRock);
+        materialRoughness=lerp(materialRoughness,.96,isSnow);
+        materialRoughness=lerp(materialRoughness,.54,isMud);
+        // Fine procedural relief is intentionally weaker than the actual
+        // heightfield so distant biomes stay continuous rather than tiled.
+        float slopeStrength=lerp(.055,.18,max(isRock,isSand*.45))*
+                            (1-smoothstep(.18,.75,footprint));
+        float epsilon=.12;
+        float heightX=filteredValueNoise(hit.xz+float2(epsilon,0)+
+                                         float2(-13.1,47.9),1.35,
+                                         min(footprint,.45));
+        float heightZ=filteredValueNoise(hit.xz+float2(0,epsilon)+
+                                         float2(-13.1,47.9),1.35,
+                                         min(footprint,.45));
+        float2 mapSlope=float2(detail-heightX,detail-heightZ)*slopeStrength/epsilon;
+        float3 tangent=normalize(float3(1,-surfaceNormal.x/
+                                            max(surfaceNormal.y,.12),0));
+        float3 bitangent=normalize(cross(surfaceNormal,tangent));
+        n=normalize(surfaceNormal+tangent*mapSlope.x+bitangent*mapSlope.y);
+    }
     if(riverSurface){
         float riverDistance=distance(camera.eye,hit);
         float pixelWorld=2*riverDistance*camera.tanHalfFov/
@@ -1662,11 +1718,14 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         materialRoughness=lerp(resolvedWaterRoughness,.14,
                                1-riverReflectionDetail);
 
-        // The generated strip is shallow at its banks and deepest at the
-        // centre. Beer-Lambert attenuation exposes a muted gravel bed near
-        // shore while the channel becomes blue-green through scattering.
-        riverCentreDepth=pow(saturate(1-abs(uv.x*2-1)),1.12);
-        float depth=lerp(.018,2.40,riverCentreDepth);
+        // The legacy strip stores a cross-river coordinate. Generated-world
+        // water instead stores normalized physical depth in U, so lakes,
+        // oceans and irregular rivers do not acquire a false repeated centre
+        // line on every triangulated tile.
+        riverCentreDepth=generatedWorldWater?saturate(uv.x):
+            pow(saturate(1-abs(uv.x*2-1)),1.12);
+        float depth=lerp(.018,generatedWorldWater?3.20:2.40,
+                         riverCentreDepth);
         float opticalPath=depth/max(abs(dot(puddleNormal,
                                              -WorldRayDirection())),.18);
         float3 transmission=exp(-float3(1.05,.33,.18)*opticalPath);
@@ -1816,7 +1875,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     // a bounce ray for nearly every screen pixel.  One stochastic sun sample
     // converges on static frames; terrain cavity/normal maps provide the local
     // ground occlusion without another traversal.
-    bool terrainSurface=(kind>1.5&&kind<2.5)||riverSurface;
+    bool terrainSurface=(kind>1.5&&kind<2.5)||generatedWorldTerrain||riverSurface;
     VisibilityPayload ao;ao.visible=1;if(payload.depth==0&&!terrainSurface){ao.visible=0;RayDesc ar;ar.Origin=hit+surfaceNormal*.015;ar.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*47),hash(pixel.yx+camera.frameIndex*71)));ar.TMin=.01;ar.TMax=1.35;TraceRay(Scene,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0x1,1,0,1,ar,ao);}
     float3 keyRadiance=keyLightRadiance();
     float ndl=saturate(dot(n,sunDir));float occlusion=lerp(.76,1.0,float(ao.visible));float3 ambient=skyIrradiance(n)*(.48+.16*saturate(n.y))*occlusion;float cloudShade=1-cloudTransmission;ambient=ambient*lerp(1.0,1.10,cloudShade)+float3(.014,.022,.034)*daylightAmount()*cloudShade;ambient+=lerp(float3(.010,.014,.020),float3(.20,.17,.12),daylightAmount())*(.08+.14*saturate(-n.y));ambient+=lightningRadiance()*(.16+.14*saturate(n.y));float3 direct=keyRadiance*ndl*visibility*1.28;float3 unmodulated=0;

@@ -1,7 +1,9 @@
 #pragma once
+#include "environment.hpp"
 #include "environment_simulation.hpp"
 #include "tree.hpp"
 #include <windows.h>
+#include <functional>
 #include <memory>
 
 namespace dense {
@@ -46,9 +48,13 @@ struct PlayerLocalLight {
 
 class DxrRenderer {
 public:
+    using WaterSampler=std::function<PersistentWaterSample(float,float)>;
     DxrRenderer();~DxrRenderer();DxrRenderer(const DxrRenderer&)=delete;DxrRenderer& operator=(const DxrRenderer&)=delete;
     bool initialize(HWND window,int width,int height);
     void resize(int width,int height);
+    // Must be called before setTree(). The visual-test scene may omit this and
+    // retain the original EnvironmentGenerator defaults.
+    void setWorld(EnvironmentMesh world,WaterSampler waterSampler);
     void setTree(const TreeMesh& tree);
     void render(const CameraView& view,const DebugRenderSettings& settings,
                 const EnvironmentCB& environment,const PlayerLocalLight& localLight);
