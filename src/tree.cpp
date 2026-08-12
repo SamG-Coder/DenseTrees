@@ -10,17 +10,49 @@
 namespace dense {
 namespace {
 
-uint32_t rgba(unsigned r,unsigned g,unsigned b,unsigned a=255) { return r|(g<<8)|(b<<16)|(a<<24); }
+constexpr uint32_t rgba(unsigned r,unsigned g,unsigned b,unsigned a=255) { return r|(g<<8)|(b<<16)|(a<<24); }
 unsigned channel(uint32_t c,int shift) { return (c>>shift)&255u; }
 uint32_t vary(uint32_t c,float amount) {
     auto v=[&](int shift){return static_cast<unsigned>(clamp(channel(c,shift)*amount,0,255));};
     return rgba(v(0),v(8),v(16),channel(c,24));
 }
 
+uint32_t blendColor(uint32_t a,uint32_t b,float amount) {
+    amount=clamp(amount,0,1);
+    auto blended=[&](int shift) {
+        return static_cast<unsigned>(clamp(
+            channel(a,shift)+(channel(b,shift)-static_cast<float>(channel(a,shift)))*amount,
+            0,255));
+    };
+    return rgba(blended(0),blended(8),blended(16),blended(24));
+}
+
 void basis(Vec3 axis,Vec3& side,Vec3& up) {
     axis=normalize(axis);const Vec3 helper=std::abs(axis.y)<.92f?Vec3{0,1,0}:Vec3{1,0,0};
     side=normalize(cross(helper,axis));up=normalize(cross(axis,side));
 }
+
+struct LeafOutlinePoint {
+    float lateral;
+    float longitudinal;
+};
+
+// A ten-edge Q. robur lamina keeps the former fan topology budget while
+// replacing its radial three-wave scallop with a genuinely pinnate outline.
+// The profile runs from the tapered base, around two rounded right-hand lobes
+// and their sinus, over the broad terminal lobe, then mirrors down the left.
+constexpr std::array<LeafOutlinePoint,10> englishOakLeafOutline{{
+    { .00f,-1.00f},
+    { .48f,-.70f},
+    { .90f,-.34f},
+    { .60f, .04f},
+    { .86f, .48f},
+    { .00f, 1.00f},
+    {-.86f, .48f},
+    {-.60f, .04f},
+    {-.90f,-.34f},
+    {-.48f,-.70f},
+}};
 
 std::vector<Vec3> makeCrown(const TreeParameters& p,const SpeciesTraits& t,Rng& rng) {
     std::vector<Vec3> points;points.reserve(static_cast<size_t>(p.attractionPoints));
@@ -1058,11 +1090,54 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
             center=attachment+u*(.013f+h*.92f);
         }
         else{center=nodes[i].position+Vec3{rng.range(-.09f,.09f),rng.range(-.035f,.11f),rng.range(-.09f,.09f)};facing=normalize(lerp(sun,Vec3{rng.range(-1,1),rng.range(.15f,1),rng.range(-1,1)},.66f));if(p.species==TreeSpecies::UmbrellaAcacia)facing=normalize(lerp(facing,{0,1,0},.5f));basis(facing,s,u);}
-        const float young=clamp(1-static_cast<float>(nodes[i].age)/32,0,1);const uint32_t green=vary(t.leafColor,.66f+.19f*exposure+.08f*young+rng.range(-.035f,.035f));const uint32_t base=static_cast<uint32_t>(mesh.leafVertices.size());const float leafMaterial=1+speciesMaterial;
-        const int outline=p.species==TreeSpecies::NorwaySpruce?4:10;mesh.leafVertices.push_back({center,facing,green,leafMaterial,.5f,.5f});
-        for(int k=0;k<outline;++k){const float angle=2*pi*k/outline;float lobe=1;if(p.species==TreeSpecies::EnglishOak)lobe=.78f+.22f*std::abs(std::sin(angle*3));const Vec3 edge=center+s*(std::cos(angle)*w*lobe)+u*(std::sin(angle)*h);mesh.leafVertices.push_back({edge,facing,green,leafMaterial,.5f+.5f*std::cos(angle),.5f+.5f*std::sin(angle)});}
-        for(int k=0;k<outline;++k){const uint32_t a=base+1+static_cast<uint32_t>(k),b=base+1+static_cast<uint32_t>((k+1)%outline);mesh.leafIndices.insert(mesh.leafIndices.end(),{base,a,b});}
-        mesh.leafCount++;mesh.totalLeafAreaM2+=pi*w*h*.72f;
+        const float young=clamp(1-static_cast<float>(nodes[i].age)/32,0,1);
+        const float leafVariation=rng.range(-.035f,.035f);
+        uint32_t green{};
+        if(p.species==TreeSpecies::EnglishOak) {
+            // Preserve a cool, deep green inside the crown while shifting exposed
+            // and recent leaves modestly toward the yellow-green seen in Q. robur.
+            // Blending distinct pigments varies hue as well as brightness.
+            constexpr uint32_t shadedOak=rgba(29,78,34);
+            constexpr uint32_t exposedOak=rgba(58,116,39);
+            constexpr uint32_t recentOak=rgba(84,137,45);
+            const float exposurePigment=clamp(
+                .12f+.72f*exposure+leafVariation*(.08f/.035f),0,1);
+            const float recentPigment=clamp(
+                young*(.12f+.40f*exposure)+leafVariation,0,.52f);
+            green=blendColor(blendColor(shadedOak,exposedOak,exposurePigment),
+                             recentOak,recentPigment);
+        } else {
+            green=vary(t.leafColor,.66f+.19f*exposure+.08f*young+leafVariation);
+        }
+        const uint32_t base=static_cast<uint32_t>(mesh.leafVertices.size());const float leafMaterial=1+speciesMaterial;
+        const int outline=p.species==TreeSpecies::NorwaySpruce?4:10;
+        std::array<LeafOutlinePoint,10> profile{};
+        if(p.species==TreeSpecies::EnglishOak)profile=englishOakLeafOutline;
+        else for(int k=0;k<outline;++k) {
+            const float angle=2*pi*k/outline;
+            profile[static_cast<size_t>(k)]={std::cos(angle),std::sin(angle)};
+        }
+        mesh.leafVertices.push_back({center,facing,green,leafMaterial,.5f,.5f});
+        for(int k=0;k<outline;++k) {
+            const LeafOutlinePoint point=profile[static_cast<size_t>(k)];
+            const Vec3 edge=center+s*(point.lateral*w)+u*(point.longitudinal*h);
+            mesh.leafVertices.push_back({edge,facing,green,leafMaterial,
+                                         .5f+.5f*point.lateral,
+                                         .5f+.5f*point.longitudinal});
+        }
+        float twiceNormalizedArea=0;
+        for(int k=0;k<outline;++k) {
+            const int next=(k+1)%outline;
+            const uint32_t a=base+1+static_cast<uint32_t>(k);
+            const uint32_t b=base+1+static_cast<uint32_t>(next);
+            mesh.leafIndices.insert(mesh.leafIndices.end(),{base,a,b});
+            const LeafOutlinePoint current=profile[static_cast<size_t>(k)];
+            const LeafOutlinePoint following=profile[static_cast<size_t>(next)];
+            twiceNormalizedArea+=current.lateral*following.longitudinal-
+                                 following.lateral*current.longitudinal;
+        }
+        mesh.leafCount++;
+        mesh.totalLeafAreaM2+=.5f*std::abs(twiceNormalizedArea)*w*h;
     };
     if(p.species==TreeSpecies::EnglishOak&&p.fullBiologicalInventory) {
         std::vector<size_t> candidates,anchors;
@@ -1071,7 +1146,7 @@ TreeMesh TreeGenerator::buildMesh(std::vector<BranchNode>& nodes,const TreeParam
         }
         if(candidates.empty())for(size_t i=1;i<nodes.size();++i)if(nodes[i].children==0)candidates.push_back(i);
         anchors=candidates;
-        mesh.leafVertices.reserve(anchors.size()*12*11);mesh.leafIndices.reserve(anchors.size()*12*30);
+        mesh.leafVertices.reserve(anchors.size()*11*11);mesh.leafIndices.reserve(anchors.size()*11*30);
         for(size_t anchor:anchors) {
             // Measured mean is 11.2 leaves per Q. robur shoot. Keep every
             // individual shoot within the observed compact population instead

@@ -1717,22 +1717,79 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         unmodulated+=keyRadiance*groundSpecular*(1-terrainRoughness)*.10*visibility;
     }
     if(kind>.5&&kind<1.5){
-        float2 leafPoint=uv-.5;
-        float midrib=exp(-abs(leafPoint.x)*145);
-        float veinWarp=(valueNoise(uv*float2(9.7,12.3)+
-                                    float2(hit.x+hit.z,hit.y)*.17)-.5)*.11;
-        float secondary=exp(-abs(frac((uv.y+abs(leafPoint.x)*.68+
-                                       veinWarp)*5.65)-.5)*31);
-        secondary*=smoothstep(.045,.18,abs(leafPoint.x))*(1-smoothstep(.39,.51,abs(leafPoint.x)));
-        float veins=saturate(midrib*.78+secondary*.22);
-        float edge=saturate(length(leafPoint*float2(1.25,1.0))*2);
-        float pigment=valueNoise(uv*float2(17.0,13.0)+hit.xz*.11);
-        float chlorophyll=lerp(1.06,.78,edge)*lerp(1,.68,veins);
-        albedo*=lerp(.90,1.07,pigment);
-        albedo*=upperFace?float3(.88,.98,.80):float3(1.04,1.12,.91);
-        albedo=lerp(albedo,float3(.18,.285,.085),veins*.24);
-        float pathLength=(.24+.28*chlorophyll)/max(abs(dot(geometricNormal,sunDir)),.16);float3 absorption=float3(2.55,.72,3.25);float3 transmittance=exp(-absorption*pathLength);float back=saturate(dot(-n,sunDir));unmodulated+=transmittance*keyRadiance*back*visibility*.68;
-        float roughness=upperFace?.34:.58;float3 viewDirection=normalize(camera.eye-hit),halfVector=normalize(sunDir+viewDirection);float ndh=saturate(dot(n,halfVector));float fresnel=.022+.978*pow(1-saturate(dot(n,viewDirection)),5);unmodulated+=keyRadiance*fresnel*pow(ndh,lerp(70,18,roughness))*(upperFace?.42:.12);
+        float species=round(frac(material)*10);
+        if(species<.5){
+            // Oak UV.y follows the petiole and midrib from base to tip; UV.x
+            // crosses the lamina. Five mirrored, forward-rising vein pairs
+            // therefore meet the lobe stations instead of forming periodic
+            // stripes. This analytic mask replaces one noise evaluation and
+            // requires no leaf texture or vertex-layout change.
+            float2 leafPoint=uv-.5;
+            float across=abs(leafPoint.x);
+            float edge=saturate(length(leafPoint*float2(1.25,1.0))*2);
+            float midribWidth=lerp(.020,.009,saturate(uv.y));
+            float midrib=(1-smoothstep(midribWidth,midribWidth+.013,across))*
+                          smoothstep(.006,.055,uv.y)*(1-smoothstep(.945,.998,uv.y));
+            float rising=across*.40;
+            float lateralDistance=abs(leafPoint.y-(-.33+rising));
+            lateralDistance=min(lateralDistance,abs(leafPoint.y-(-.17+rising)));
+            lateralDistance=min(lateralDistance,abs(leafPoint.y-( .00+rising)));
+            lateralDistance=min(lateralDistance,abs(leafPoint.y-( .17+rising)));
+            lateralDistance=min(lateralDistance,abs(leafPoint.y-( .33+rising)));
+            float lateral=(1-smoothstep(.006,.020,lateralDistance))*
+                          smoothstep(.026,.064,across)*(1-smoothstep(.34,.47,across))*
+                          (1-smoothstep(.80,1.0,edge));
+            float structure=saturate(midrib*.92+lateral*.52);
+
+            float pigment=valueNoise(uv*float2(17.0,13.0)+hit.xz*.11);
+            float3 pigmentTint=lerp(float3(.945,.975,.91),
+                                    float3(1.035,1.045,.94),pigment);
+            albedo*=pigmentTint;
+            if(upperFace)albedo*=float3(.94,1.015,.87);
+            else{
+                float undersideLuminance=dot(albedo,float3(.2126,.7152,.0722));
+                albedo=lerp(albedo,undersideLuminance.xxx,.14)*float3(1.00,1.07,.86);
+            }
+            float3 veinReflectance=srgbToLinear(float3(.43,.56,.20))*
+                                   lerp(1.0,.66,wetness);
+            albedo=lerp(albedo,veinReflectance,saturate(midrib*.36+lateral*.17));
+
+            float chlorophyll=lerp(1.05,.77,edge)*lerp(1.025,.94,pigment);
+            float pathLength=(.20+.31*chlorophyll)/
+                             max(abs(dot(geometricNormal,sunDir)),.18);
+            float3 transmittance=exp(-float3(2.05,.58,3.40)*pathLength);
+            // Fibrous veins are paler in reflection yet optically thicker in
+            // transmission, so they remain visible against a glowing lamina.
+            transmittance*=1-saturate(midrib*.58+lateral*.27);
+            float back=saturate(dot(-n,sunDir));
+            unmodulated+=transmittance*keyRadiance*back*visibility*.66;
+
+            float roughness=(upperFace?lerp(.30,.39,pigment):lerp(.56,.65,pigment));
+            roughness=lerp(roughness,.68,structure*.48);
+            float3 viewDirection=normalize(camera.eye-hit),halfVector=normalize(sunDir+viewDirection);
+            float ndh=saturate(dot(n,halfVector));
+            float fresnel=.022+.978*pow(1-saturate(dot(n,viewDirection)),5);
+            float glossStrength=(upperFace?.38:.095)*lerp(1.06,.90,pigment)*
+                                lerp(1.0,.62,structure);
+            unmodulated+=keyRadiance*fresnel*pow(ndh,lerp(82,18,roughness))*glossStrength;
+        } else {
+            float2 leafPoint=uv-.5;
+            float midrib=exp(-abs(leafPoint.x)*145);
+            float veinWarp=(valueNoise(uv*float2(9.7,12.3)+
+                                        float2(hit.x+hit.z,hit.y)*.17)-.5)*.11;
+            float secondary=exp(-abs(frac((uv.y+abs(leafPoint.x)*.68+
+                                           veinWarp)*5.65)-.5)*31);
+            secondary*=smoothstep(.045,.18,abs(leafPoint.x))*(1-smoothstep(.39,.51,abs(leafPoint.x)));
+            float veins=saturate(midrib*.78+secondary*.22);
+            float edge=saturate(length(leafPoint*float2(1.25,1.0))*2);
+            float pigment=valueNoise(uv*float2(17.0,13.0)+hit.xz*.11);
+            float chlorophyll=lerp(1.06,.78,edge)*lerp(1,.68,veins);
+            albedo*=lerp(.90,1.07,pigment);
+            albedo*=upperFace?float3(.88,.98,.80):float3(1.04,1.12,.91);
+            albedo=lerp(albedo,float3(.18,.285,.085),veins*.24);
+            float pathLength=(.24+.28*chlorophyll)/max(abs(dot(geometricNormal,sunDir)),.16);float3 absorption=float3(2.55,.72,3.25);float3 transmittance=exp(-absorption*pathLength);float back=saturate(dot(-n,sunDir));unmodulated+=transmittance*keyRadiance*back*visibility*.68;
+            float roughness=upperFace?.34:.58;float3 viewDirection=normalize(camera.eye-hit),halfVector=normalize(sunDir+viewDirection);float ndh=saturate(dot(n,halfVector));float fresnel=.022+.978*pow(1-saturate(dot(n,viewDirection)),5);unmodulated+=keyRadiance*fresnel*pow(ndh,lerp(70,18,roughness))*(upperFace?.42:.12);
+        }
     }
     if(kind>3.5&&kind<4.5){
         float species=round(frac(material)*10);float mottling=valueNoise(float2(hit.x*1.7+hit.y*.53,hit.z*1.9-hit.y*.37));

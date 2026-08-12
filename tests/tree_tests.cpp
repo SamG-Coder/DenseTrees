@@ -449,6 +449,93 @@ int main() {
     require(!mesh.leafVertices.empty() && mesh.leafIndices.size() % 3 == 0,
             "generic leaf mesh is empty or has incomplete triangles");
 
+    // Q. robur leaves keep a bounded ten-triangle fan, but their UV/profile is
+    // a pinnately lobed lamina rather than a radial scallop. Inspect the local
+    // leaf coordinates so this remains valid for every world-space orientation.
+    constexpr size_t oakOutlineVertices = 10;
+    constexpr size_t oakVerticesPerLeaf = oakOutlineVertices + 1;
+    constexpr size_t oakIndicesPerLeaf = oakOutlineVertices * 3;
+    require(mesh.leafCount > 0 &&
+                mesh.leafVertices.size() == static_cast<size_t>(mesh.leafCount) * oakVerticesPerLeaf &&
+                mesh.leafIndices.size() == static_cast<size_t>(mesh.leafCount) * oakIndicesPerLeaf,
+            "English-oak leaf topology escaped its ten-triangle performance budget");
+
+    double emittedLeafArea = 0;
+    for(size_t leaf=0;leaf<mesh.leafCount;++leaf) {
+        const size_t vertexBase=leaf*oakVerticesPerLeaf;
+        const size_t indexBase=leaf*oakIndicesPerLeaf;
+        const auto& center=mesh.leafVertices[vertexBase];
+        require(std::abs(center.u-.5f)<1.0e-6f&&std::abs(center.v-.5f)<1.0e-6f,
+                "English-oak leaf fan lost its midrib-centred UV origin");
+        for(size_t edge=0;edge<oakOutlineVertices;++edge) {
+            const uint32_t expectedA=static_cast<uint32_t>(vertexBase);
+            const uint32_t expectedB=static_cast<uint32_t>(vertexBase+1+edge);
+            const uint32_t expectedC=static_cast<uint32_t>(vertexBase+1+(edge+1)%oakOutlineVertices);
+            require(mesh.leafIndices[indexBase+edge*3]==expectedA&&
+                        mesh.leafIndices[indexBase+edge*3+1]==expectedB&&
+                        mesh.leafIndices[indexBase+edge*3+2]==expectedC,
+                    "English-oak leaf is no longer one ordered ten-edge fan");
+            const dense::Vec3 sideA=mesh.leafVertices[expectedB].position-center.position;
+            const dense::Vec3 sideB=mesh.leafVertices[expectedC].position-center.position;
+            emittedLeafArea+=.5*static_cast<double>(dense::length(dense::cross(sideA,sideB)));
+            const float ua=mesh.leafVertices[expectedB].u-.5f;
+            const float va=mesh.leafVertices[expectedB].v-.5f;
+            const float ub=mesh.leafVertices[expectedC].u-.5f;
+            const float vb=mesh.leafVertices[expectedC].v-.5f;
+            require(ua*vb-ub*va>1.0e-4f,
+                    "English-oak outline is no longer star-shaped about its fan centre");
+        }
+
+        auto lateral=[&](size_t edge) {
+            return (mesh.leafVertices[vertexBase+1+edge].u-.5f)*2;
+        };
+        auto longitudinal=[&](size_t edge) {
+            return (mesh.leafVertices[vertexBase+1+edge].v-.5f)*2;
+        };
+        require(std::abs(lateral(0))<1.0e-5f&&longitudinal(0)<-.95f&&
+                    std::abs(lateral(5))<1.0e-5f&&longitudinal(5)>.95f,
+                "English-oak lamina lost its tapered base or terminal lobe");
+        for(size_t right=1;right<=4;++right) {
+            const size_t left=oakOutlineVertices-right;
+            require(std::abs(lateral(right)+lateral(left))<1.0e-5f&&
+                        std::abs(longitudinal(right)-longitudinal(left))<1.0e-5f,
+                    "English-oak lateral lobe pairs are no longer symmetric about the midrib");
+            require(longitudinal(right)>longitudinal(right-1),
+                    "English-oak outline no longer progresses monotonically from base to tip");
+        }
+        const float basalShoulder=std::abs(lateral(1));
+        const float lowerLobe=std::abs(lateral(2));
+        const float sinus=std::abs(lateral(3));
+        const float upperLobe=std::abs(lateral(4));
+        require(basalShoulder<lowerLobe*.55f&&sinus<lowerLobe*.68f&&
+                    sinus<upperLobe*.72f,
+                "English-oak outline lost its tapered shoulder, paired lobes, or intervening sinus");
+        auto cornerCosine=[&](size_t edge) {
+            const size_t previous=(edge+oakOutlineVertices-1)%oakOutlineVertices;
+            const size_t next=(edge+1)%oakOutlineVertices;
+            const float ax=lateral(previous)-lateral(edge);
+            const float ay=longitudinal(previous)-longitudinal(edge);
+            const float bx=lateral(next)-lateral(edge);
+            const float by=longitudinal(next)-longitudinal(edge);
+            return (ax*bx+ay*by)/std::sqrt((ax*ax+ay*ay)*(bx*bx+by*by));
+        };
+        require(cornerCosine(2)<.10f&&cornerCosine(4)<.10f&&
+                    cornerCosine(6)<.10f&&cornerCosine(8)<.10f,
+                "English-oak lateral lobes became pointed instead of broadly rounded");
+        const float terminalDx=lateral(4)-lateral(5);
+        const float terminalDy=longitudinal(4)-longitudinal(5);
+        const float oppositeDx=lateral(6)-lateral(5);
+        const float oppositeDy=longitudinal(6)-longitudinal(5);
+        const float terminalCosine=(terminalDx*oppositeDx+terminalDy*oppositeDy)/
+            std::sqrt((terminalDx*terminalDx+terminalDy*terminalDy)*
+                      (oppositeDx*oppositeDx+oppositeDy*oppositeDy));
+        require(terminalCosine<-.35f,
+                "English-oak terminal lobe became pointed instead of broadly rounded");
+    }
+    require(std::abs(emittedLeafArea-mesh.totalLeafAreaM2)<=
+                std::max(1.0e-6,emittedLeafArea*2.0e-5),
+            "reported English-oak leaf area no longer matches emitted lamina triangles");
+
     for (auto species : {dense::TreeSpecies::EnglishOak, dense::TreeSpecies::NorwaySpruce,
                          dense::TreeSpecies::SilverBirch, dense::TreeSpecies::WeepingWillow,
                          dense::TreeSpecies::UmbrellaAcacia}) {
