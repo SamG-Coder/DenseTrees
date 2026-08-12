@@ -162,23 +162,27 @@ struct App {
     std::chrono::steady_clock::time_point lastEnvironmentUpdate{};
     std::chrono::steady_clock::time_point lastCameraUpdate{};
 
-    App(dense::SceneMode mode,std::int64_t seed):sceneMode(mode),aoeSeed(seed) {
-        if(sceneMode==dense::SceneMode::AiRpgWorld) {
-            aoeWorld=std::make_shared<dense::AoeWorldScene>(
-                dense::AoeWorldGenerator::generate(seed));
-            streamState=dense::AoeSceneStreamState(
-                aoeWorld->sourceCenterX(),aoeWorld->sourceCenterZ());
-            dense::FirstPersonCameraSettings settings;
-            settings.horizontalHalfExtent=aoeWorld->traversalHalfExtent();
-            const auto world=aoeWorld;
-            firstPersonCamera=dense::FirstPersonCameraController(settings,
-                [world](float x,float z){return world->sampleTerrain(x,z);});
-            const dense::Vec3 spawn=aoeWorld->spawn();
-            firstPersonCamera.reset(spawn.x,spawn.z,0.35f,-.12f);
-            orbitTarget={spawn.x,spawn.y+3.0f,spawn.z};
-            yaw=.72f;pitch=.48f;distance=55.0f;
-            debugSettings.grassDensity=2.2f;
-        }
+    // The visual-test launch path is deliberately a separate constructor.
+    // It cannot invoke the AOE generator, horizon builder, dressing pass or
+    // streaming setup before constructing the retained legacy scene.
+    App()=default;
+
+    explicit App(std::int64_t seed):sceneMode(dense::SceneMode::AiRpgWorld),
+        aoeSeed(seed) {
+        aoeWorld=std::make_shared<dense::AoeWorldScene>(
+            dense::AoeWorldGenerator::generate(seed));
+        streamState=dense::AoeSceneStreamState(
+            aoeWorld->sourceCenterX(),aoeWorld->sourceCenterZ());
+        dense::FirstPersonCameraSettings settings;
+        settings.horizontalHalfExtent=aoeWorld->traversalHalfExtent();
+        const auto world=aoeWorld;
+        firstPersonCamera=dense::FirstPersonCameraController(settings,
+            [world](float x,float z){return world->sampleTerrain(x,z);});
+        const dense::Vec3 spawn=aoeWorld->spawn();
+        firstPersonCamera.reset(spawn.x,spawn.z,0.35f,-.12f);
+        orbitTarget={spawn.x,spawn.y+3.0f,spawn.z};
+        yaw=.72f;pitch=.48f;distance=55.0f;
+        debugSettings.grassDensity=2.2f;
     }
 
     ~App() {
@@ -1143,11 +1147,17 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         nullptr,nullptr,instance,nullptr);
     if(!window)return 2;
 
-    ShowWindow(window,show);
-    UpdateWindow(window);
+    const bool showWhileLoading=options.scene==dense::SceneMode::AiRpgWorld;
+    if(showWhileLoading) {
+        ShowWindow(window,show);
+        UpdateWindow(window);
+    }
     SetCursor(LoadCursor(nullptr,IDC_WAIT));
     try {
-        app=std::make_unique<App>(options.scene,options.seed);
+        if(options.scene==dense::SceneMode::VisualTest)
+            app=std::make_unique<App>();
+        else
+            app=std::make_unique<App>(options.seed);
     } catch(const std::exception&error) {
         const std::string detail=error.what();
         const std::wstring message=L"World generation failed.\n\n"+
@@ -1186,6 +1196,10 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
             L"Dense Trees debug controls",MB_ICONWARNING);
     }
     app->regenerate(window);
+    if(!showWhileLoading) {
+        ShowWindow(window,show);
+        UpdateWindow(window);
+    }
     app->showDebugPanel(options.scene==dense::SceneMode::VisualTest);
 
     MSG message{};
