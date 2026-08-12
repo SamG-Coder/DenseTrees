@@ -189,6 +189,22 @@ int main() {
                     dense::EnvironmentGenerator::traversalEdgeMargin,
             "first-person traversal did not preserve the terrain-edge margin");
 
+    // Water is a traversable volume rather than an invisible collision lid.
+    // The deep main channel leaves the controller on its physical bed and
+    // carries the standing eye below the persistent surface at mid-channel.
+    constexpr float riverWalkZ=0.0f;
+    const float riverWalkX=dense::EnvironmentGenerator::riverCenterX(riverWalkZ);
+    dense::FirstPersonCameraController riverWalker;
+    riverWalker.reset(riverWalkX,riverWalkZ,0,0);
+    const auto riverWater=dense::EnvironmentGenerator::persistentWater(
+        riverWalkX,riverWalkZ);
+    require(riverWater.inside&&riverWater.depth>2.35f&&
+                near(riverWalker.state().footPosition.y,
+                     dense::EnvironmentGenerator::terrainHeight(riverWalkX,riverWalkZ),
+                     2.0e-3f)&&
+                riverWalker.pose().eye.y<riverWater.surfaceHeight-.55f,
+            "first-person camera walks over the river instead of entering its volume");
+
     const dense::TerrainSurfaceSampler steepStrip=[](float x,float z) {
         const bool steep=x>.55f;
         const dense::Vec3 normal=steep?dense::normalize(dense::Vec3{-2,1,0}):

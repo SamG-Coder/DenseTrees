@@ -13,6 +13,9 @@ struct Camera {
     // xz: player foot position, zw: horizontal velocity. groundSettings.w is
     // the explicit first-person interaction gate.
     float4 grassInteraction;
+    // x: camera underwater, y: persistent-water surface Y,
+    // z: camera immersion depth, w: inside authored river footprint.
+    float4 waterState;
 };
 
 struct GrassPatch {
@@ -656,6 +659,19 @@ float4 PSMain(VSOutput input) : SV_Target0 {
     float3 result=(albedo*(ambient+direct)+unmodulated)*fade;
     float3 rayDirection=normalize(input.worldPosition-camera.eye);
     result=applyAerialPerspective(result,input.worldPosition,rayDirection);
+    if(camera.waterState.x>.5){
+        float waterDistance=distance(input.worldPosition,camera.eye);
+        // Looking out through the surface only accumulates attenuation until
+        // the ray exits the river.  Blades below or beside the camera remain
+        // in the medium for their full camera distance.
+        if(rayDirection.y>1e-4){
+            float exitDistance=(camera.waterState.y-camera.eye.y)/rayDirection.y;
+            waterDistance=min(waterDistance,max(exitDistance,0.0));
+        }
+        float3 waterTransmission=exp(-float3(.82,.25,.12)*waterDistance);
+        float3 waterScatter=float3(.012,.052,.066)*(1-waterTransmission);
+        result=result*waterTransmission+waterScatter;
+    }
     float3 displayColor=linearToSrgb(colorGrade(tonemap(result*camera.exposure)));
     // Conventional alpha blending gives the fine ribbons a dense lawn read
     // without random black pinholes. Depth writing deliberately keeps this to a

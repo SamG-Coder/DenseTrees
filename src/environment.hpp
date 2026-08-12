@@ -75,14 +75,25 @@ struct EnvironmentMesh {
     float maximumHeight{};
 };
 
-// Exact sample of the triangle surface emitted by EnvironmentGenerator::build.
-// Queries outside the finite terrain square are clamped to its edge and marked
-// invalid so callers can keep collision state finite without treating the
-// clamped point as traversable ground.
+// Exact analytic sample of the authored terrain.  The fine river-bed ribbons
+// emitted by build() use this same height/normal contract; queries outside the
+// finite terrain square are clamped to its edge and marked invalid.
 struct TerrainSurfaceSample {
     Vec3 position{};
     Vec3 normal{0,1,0};
     bool insideBounds{};
+};
+
+// Analytic persistent-water contract shared by terrain construction, the
+// river mesh, camera submersion and water shading.  shoreCoordinate is zero on
+// the channel centreline and one at the true hydraulic shoreline.  The small
+// render lift is included in surfaceHeight so camera and renderer decisions
+// agree exactly with the emitted surface.
+struct PersistentWaterSample {
+    float surfaceHeight{};
+    float depth{};
+    float shoreCoordinate{};
+    bool inside{};
 };
 
 class EnvironmentGenerator {
@@ -129,6 +140,7 @@ public:
     static float tributaryBedHeight(float x);
     static float tributarySurfaceHeight(float x);
     static float tributaryWaterHalfWidth(float x);
+    static PersistentWaterSample persistentWater(float x,float z);
     // Deterministically materializes one absolute world-grid grass patch.
     // Returns false for permanent water, exposed dirt/mineral ground, steep
     // slopes and other biomes that should not carry meadow grass.

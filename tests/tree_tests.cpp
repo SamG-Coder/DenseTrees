@@ -106,10 +106,13 @@ int main() {
     const auto environment = environmentGenerator.build(0x1234abcdu);
     const auto environmentCopy = environmentGenerator.build(0x1234abcdu);
     constexpr size_t terrainSide=dense::EnvironmentGenerator::terrainResolution;
-    require(environment.terrainVertices.size()==terrainSide*terrainSide,
-            "hill terrain vertex inventory changed unexpectedly");
-    require(environment.terrainIndices.size()==(terrainSide-1)*(terrainSide-1)*6,
-            "hill terrain index inventory changed unexpectedly");
+    const size_t coarseTerrainVertexCount=terrainSide*terrainSide;
+    require(environment.terrainVertices.size()>coarseTerrainVertexCount+10000&&
+                environment.terrainVertices.size()<coarseTerrainVertexCount+250000,
+            "matched river-bed terrain ribbons are absent or outside budget");
+    require(environment.terrainIndices.size()>
+                (terrainSide-1)*(terrainSide-1)*4,
+            "terrain replacement left too little covered landscape");
     require(environment.grassPatches.size()>=400000&&environment.grassPatches.size()<=520000,
             "procedural grass patch inventory escaped its performance budget");
     require(dense::EnvironmentGenerator::grassHalfExtent>=222.0f,
@@ -135,7 +138,9 @@ int main() {
     require(environment.minimumHeight<-11.0f&&environment.minimumHeight>-25.0f&&
                 environment.maximumHeight>170.0f&&environment.maximumHeight<390.0f,
             "valley-and-mountain terrain height envelope is implausible");
-    for(const auto& vertex:environment.terrainVertices){
+    for(size_t terrainVertexIndex=0;
+        terrainVertexIndex<coarseTerrainVertexCount;++terrainVertexIndex){
+        const auto&vertex=environment.terrainVertices[terrainVertexIndex];
         require(finite(vertex.position)&&finite(vertex.normal),
                 "terrain emitted non-finite geometry");
         require(std::abs(dense::length(vertex.normal)-1.0f)<.002f&&vertex.normal.y>.12f&&
@@ -166,8 +171,10 @@ int main() {
                 std::abs(dense::EnvironmentGenerator::tributarySurfaceHeight(confluenceX)-
                          dense::EnvironmentGenerator::riverSurfaceHeight(confluenceZ))<1.0e-4f,
             "tributary does not join the main river continuously");
+    const float tributaryJoinShoreX=confluenceX-
+        dense::EnvironmentGenerator::riverWaterHalfWidth(confluenceZ);
     float previousTributarySurface=std::numeric_limits<float>::max();
-    for(float x=-2600.0f;x<=confluenceX;x+=35.0f){
+    for(float x=-2600.0f;x<=tributaryJoinShoreX;x+=35.0f){
         const float surface=dense::EnvironmentGenerator::tributarySurfaceHeight(x);
         require(surface<previousTributarySurface,
                 "tributary surface does not descend toward its confluence");
@@ -185,8 +192,17 @@ int main() {
             const float bank=dense::EnvironmentGenerator::terrainHeight(
                 center+side*wetHalfWidth,z);
             const float depth=dense::EnvironmentGenerator::riverSurfaceHeight(z)-bank;
-            require(depth>.075f&&depth<.085f,
-                    "main river analytic shoreline is detached from its shallow bank");
+            require(std::abs(depth)<.003f,
+                    "main river analytic shoreline does not meet its bank");
+            const auto shoreWater=dense::EnvironmentGenerator::persistentWater(
+                center+side*wetHalfWidth,z);
+            require(shoreWater.inside&&shoreWater.depth>.009f&&shoreWater.depth<.016f,
+                    "main river camera-water contract misses the visible shoreline");
+            const float outsideBank=dense::EnvironmentGenerator::terrainHeight(
+                center+side*(wetHalfWidth+1.0f),z);
+            require(outsideBank>
+                        dense::EnvironmentGenerator::riverSurfaceHeight(z)+.035f,
+                    "main river bank does not bury the hidden water overlap");
         }
     }
     constexpr float tributaryBankTestX=-1600.0f;
@@ -202,25 +218,32 @@ int main() {
         const float bank=dense::EnvironmentGenerator::terrainHeight(tributaryBankTestX,z);
         const float depth=
             dense::EnvironmentGenerator::tributarySurfaceHeight(tributaryBankTestX)-bank;
-        require(depth>.075f&&depth<.085f,
-                "tributary analytic shoreline is detached from its shallow bank");
+        require(std::abs(depth)<.003f,
+                "tributary analytic shoreline does not meet its bank");
+        const auto shoreWater=dense::EnvironmentGenerator::persistentWater(
+            tributaryBankTestX,z);
+        require(shoreWater.inside&&shoreWater.depth>.009f&&shoreWater.depth<.016f,
+                "tributary camera-water contract misses the visible shoreline");
     }
-    const std::array<size_t,5> sampledTerrainTriangles{{
-        0,1,1379,environment.terrainIndices.size()/6,
-        environment.terrainIndices.size()/3-1
-    }};
-    for(const size_t triangle:sampledTerrainTriangles){
-        const size_t first=triangle*3;
-        const auto&p0=environment.terrainVertices[environment.terrainIndices[first]].position;
-        const auto&p1=environment.terrainVertices[environment.terrainIndices[first+1]].position;
-        const auto&p2=environment.terrainVertices[environment.terrainIndices[first+2]].position;
-        constexpr float w0=.19f,w1=.34f,w2=.47f;
-        const dense::Vec3 expected=p0*w0+p1*w1+p2*w2;
-        const auto sampled=dense::EnvironmentGenerator::sampleTerrainSurface(expected.x,expected.z);
-        const dense::Vec3 expectedNormal=dense::normalize(dense::cross(p1-p0,p2-p0));
-        require(sampled.insideBounds&&std::abs(sampled.position.y-expected.y)<2.0e-4f&&
-                    dense::dot(sampled.normal,expectedNormal)>.9999f,
-                "rendered-terrain query disagrees with its emitted triangle");
+    // Query points in both hydraulic corridors must follow the analytic fine
+    // replacement rather than the removed coarse heightfield triangles.
+    for(const float z:std::array<float,5>{-3000.0f,-1500.0f,0.0f,1500.0f,3000.0f}){
+        const float x=dense::EnvironmentGenerator::riverCenterX(z);
+        const auto sampled=dense::EnvironmentGenerator::sampleTerrainSurface(x,z);
+        require(sampled.insideBounds&&
+                    std::abs(sampled.position.y-
+                             dense::EnvironmentGenerator::terrainHeight(x,z))<1.0e-5f&&
+                    dense::dot(sampled.normal,
+                        dense::EnvironmentGenerator::terrainNormal(x,z))>.9999f,
+                "main-river fine terrain query diverged from its authored bed");
+    }
+    for(const float x:std::array<float,4>{-3000.0f,-2200.0f,-1400.0f,-600.0f}){
+        const float z=dense::EnvironmentGenerator::tributaryCenterZ(x);
+        const auto sampled=dense::EnvironmentGenerator::sampleTerrainSurface(x,z);
+        require(sampled.insideBounds&&
+                    std::abs(sampled.position.y-
+                             dense::EnvironmentGenerator::terrainHeight(x,z))<1.0e-5f,
+                "tributary fine terrain query diverged from its authored bed");
     }
     const auto outsideTerrain=dense::EnvironmentGenerator::sampleTerrainSurface(
         dense::EnvironmentGenerator::terrainHalfExtent+10.0f,0);
@@ -271,13 +294,27 @@ int main() {
             "runoff bake selected an implausible fraction of the near terrain");
     require(flatLocalMinima>20&&selectedFlatLocalMinima>=flatLocalMinima/20,
             "runoff bake failed to retain representative flat local depressions");
+    // The terrain inventory contains a stitched coarse heightfield plus exact
+    // adaptive replacements. Validate both domains separately because their
+    // vertex ranges deliberately share no triangles.
     validateTriangles(environment.terrainVertices,environment.terrainIndices,"hill terrain");
+    size_t submergedReplacementVertices=0;
+    for(size_t i=coarseTerrainVertexCount;i<environment.terrainVertices.size();++i){
+        const auto&vertex=environment.terrainVertices[i];
+        const auto water=dense::EnvironmentGenerator::persistentWater(
+            vertex.position.x,vertex.position.z);
+        if(!water.inside)continue;
+        ++submergedReplacementVertices;
+        require(vertex.position.y<=water.surfaceHeight-.007f,
+                "adaptive river terrain vertex rose through persistent water");
+    }
+    require(submergedReplacementVertices>5000,
+            "adaptive terrain did not resolve enough persistent-water bed vertices");
     require(environment.riverVertices.size()>25000&&
                 environment.riverIndices.size()/3>45000&&
                 environment.riverIndices.size()/3<60000,
             "persistent river mesh is absent or outside its close-view tessellation budget");
     float minimumRiverClearance=std::numeric_limits<float>::max();
-    float maximumBankClearance=0;
     for(size_t i=0;i<environment.riverVertices.size();++i){
         const auto&vertex=environment.riverVertices[i];
         require(finite(vertex.position)&&finite(vertex.normal)&&
@@ -288,13 +325,13 @@ int main() {
             vertex.position.x,vertex.position.z);
         const float clearance=vertex.position.y-ground.position.y;
         minimumRiverClearance=std::min(minimumRiverClearance,clearance);
-        if(vertex.u<1.0e-5f||vertex.u>1.0f-1.0e-5f)
-            maximumBankClearance=std::max(maximumBankClearance,clearance);
-        require(ground.insideBounds&&clearance>=.029f,
-                "persistent river surface intersects its rendered terrain");
+        const auto water=dense::EnvironmentGenerator::persistentWater(
+            vertex.position.x,vertex.position.z);
+        if(water.inside&&std::abs(vertex.position.y-water.surfaceHeight)<.04f){
+            require(ground.insideBounds&&clearance>.007f,
+                    "persistent river surface intersects its visible bed");
+        }
     }
-    require(maximumBankClearance<.30f,
-            "adaptive river correction left a visibly suspended bank edge");
     validateTriangles(environment.riverVertices,environment.riverIndices,"river water");
     uint32_t decodedCoarsePatches=0,waterRetainingGrassPatches=0;
     for(size_t i=0;i<environment.grassPatches.size();++i){

@@ -924,6 +924,17 @@ void DxrRenderer::render(const CameraView&requestedView,
     else right=normalize(right);
     const Vec3 up=normalize(cross(forward,right));
 
+    // Persistent river water is a volume, not a collision plane.  The
+    // first-person controller continues to follow the carved bed; this state
+    // only tells the ray-generation path which participating medium contains
+    // the camera.  Querying the same authored cross-section that builds the
+    // mesh keeps the transition at the visible waterline.
+    const PersistentWaterSample water=EnvironmentGenerator::persistentWater(
+        eye.x,eye.z);
+    const bool cameraUnderwater=water.inside&&eye.y<water.surfaceHeight;
+    const float cameraImmersion=cameraUnderwater?
+        water.surfaceHeight-eye.y:0.0f;
+
     PlayerLocalLight localLight=requestedLocalLight;
     localLight.intensity=std::isfinite(localLight.intensity)?
         clamp(localLight.intensity,0.0f,2048.0f):60.0f;
@@ -1007,6 +1018,7 @@ void DxrRenderer::render(const CameraView&requestedView,
         float exposure,localLightIntensity,localLightRange,localLightInnerCos;
         UINT resolution[2];UINT environmentIndexOffset;float localLightOuterCos;
         float grassSettings[4];float groundSettings[4];float grassInteraction[4];
+        float waterState[4];
     }c{{eye.x,eye.y,eye.z},tanHalf,
        {forward.x,forward.y,forward.z},static_cast<float>(i.width)/i.height,
        {right.x,right.y,right.z},shaderFrame,{up.x,up.y,up.z},temporalFrames,
@@ -1020,12 +1032,15 @@ void DxrRenderer::render(const CameraView&requestedView,
          {settings.groundNormalStrength,settings.groundDetailStrength,
           static_cast<float>(nearGrassStride),view.grassInteractionEnabled?1.0f:0.0f},
          {view.grassInteractionPosition.x,view.grassInteractionPosition.z,
-          view.grassInteractionVelocity.x,view.grassInteractionVelocity.z}};
-    static_assert(sizeof(Camera)==144);
+          view.grassInteractionVelocity.x,view.grassInteractionVelocity.z},
+         {cameraUnderwater?1.0f:0.0f,water.surfaceHeight,cameraImmersion,
+          water.inside?1.0f:0.0f}};
+    static_assert(sizeof(Camera)==160);
     static_assert(offsetof(Camera,localLightIntensity)==68);
     static_assert(offsetof(Camera,resolution)==80);
     static_assert(offsetof(Camera,grassSettings)==96);
     static_assert(offsetof(Camera,grassInteraction)==128);
+    static_assert(offsetof(Camera,waterState)==144);
     // The mapped constants are single-buffered.  begin() waits for the prior
     // submission before we overwrite them, preventing the previous frame's
     // ray/compute work from observing partially updated camera or wind data.

@@ -12,6 +12,9 @@ struct Camera {
     float4 grassSettings;
     float4 groundSettings;
     float4 grassInteraction;
+    // x: camera is below persistent river surface, y: local surface height,
+    // z: immersion depth, w: camera is inside the authored river footprint.
+    float4 waterState;
 };
 struct RadiancePayload {
     float3 color;
@@ -110,34 +113,45 @@ float2 safeWindDirection2() {
                                   float2(.819,.574);
 }
 
-float2 waterNoiseGradient(float2 p,float epsilon) {
-    float inverseSpan=.5/max(epsilon,1e-4);
-    return float2(valueNoise(p+float2(epsilon,0))-valueNoise(p-float2(epsilon,0)),
-                  valueNoise(p+float2(0,epsilon))-valueNoise(p-float2(0,epsilon)))*
-           inverseSpan;
+// A world-continuous directional spectrum forms the small-wave normal. Detail
+// amplitude is footprint-filtered instead of relying on ray differentials,
+// which are unavailable in this DXR closest-hit path.
+float2 directionalWaterSlope(float2 worldPosition,float2 direction,
+                             float wavelength,float slopeAmplitude,
+                             float angularSpeed,float phase,
+                             float footprint) {
+    const float twoPi=6.28318530718;
+    float filter=1-smoothstep(wavelength*.10,wavelength*.42,footprint);
+    float angle=dot(worldPosition,direction)*(twoPi/wavelength)+
+                max(g_Time,0.0)*angularSpeed+phase;
+    return direction*(cos(angle)*slopeAmplitude*filter);
 }
 
-// Two decorrelated, world-space scrolling fields form a stable small-wave
-// normal. Detail amplitude is footprint-filtered instead of relying on ray
-// differentials, which are unavailable in this DXR closest-hit path.
 float2 scrollingWaterSlope(float2 worldPosition,float footprint,
                            float2 flowDirection,float flowSpeed) {
+    // A previous version translated a square value-noise lattice by the
+    // per-triangle reconstructed flow direction. Multiplying tiny direction
+    // differences by absolute simulation time eventually gave adjacent
+    // triangles different phases, exposing the tessellation as large diagonal
+    // tiles. These incommensurate wave bands depend only on absolute world
+    // position and global time, so every triangle samples one continuous
+    // surface. flowSpeed changes cadence only; flowDirection is deliberately
+    // excluded from phase-space translation.
     float2 wind=safeWindDirection2(),crossWind=float2(-wind.y,wind.x);
-    float flowLength=length(flowDirection);
-    float2 flow=flowLength>1e-5?flowDirection/flowLength:float2(0,0);
-    float simulationTime=max(g_Time,0.0);
-    float coarseFade=1-smoothstep(.28,.90,footprint);
-    float fineFade=1-smoothstep(.075,.32,footprint);
+    float2 d0=normalize(wind*.94+crossWind*.34);
+    float2 d1=normalize(wind*.57-crossWind*.82);
+    float2 d2=normalize(wind*.18+crossWind*.98);
+    float2 d3=normalize(-wind*.76+crossWind*.65);
+    float2 d4=normalize(-wind*.31-crossWind*.95);
     float motion=max(g_WindSpeed,0.0)*saturate(g_WindStrength);
-    float2 uvA=worldPosition*.62+wind*(simulationTime*.038*motion)-
-               flow*(simulationTime*max(flowSpeed,0.0)*.62);
-    float2 flowB=normalize(crossWind*.87-wind*.49);
-    float2 uvB=worldPosition*1.47+flowB*(simulationTime*.061*motion)-
-               flow*(simulationTime*max(flowSpeed,0.0)*1.47)+
-               float2(37.2,-19.7);
-    float2 slopeA=waterNoiseGradient(uvA,.035)*.62*.037*coarseFade;
-    float2 slopeB=waterNoiseGradient(uvB,.045)*1.47*.016*fineFade;
-    return (slopeA+slopeB)*lerp(.58,1.35,saturate(g_WindStrength));
+    float cadence=.72+.075*motion+.38*max(flowSpeed,0.0);
+    float2 slope=0;
+    slope+=directionalWaterSlope(worldPosition,d0,9.70,.0180,.31*cadence,.4,footprint);
+    slope+=directionalWaterSlope(worldPosition,d1,5.27,.0140,.47*cadence,2.1,footprint);
+    slope+=directionalWaterSlope(worldPosition,d2,2.83,.0105,.71*cadence,4.7,footprint);
+    slope+=directionalWaterSlope(worldPosition,d3,1.41,.0070,1.03*cadence,1.3,footprint);
+    slope+=directionalWaterSlope(worldPosition,d4,.73,.0040,1.46*cadence,5.5,footprint);
+    return slope*lerp(.68,1.30,saturate(g_WindStrength));
 }
 
 struct RainImpactSample {
@@ -907,6 +921,24 @@ void RayGen() {
         RadiancePayload payload;payload.color=0;payload.depth=0;payload.primaryT=SceneRayMaximum;
         payload.primaryKeyVisibility=1;
         TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,ray,payload);
+        if(camera.waterState.x>.5&&camera.waterState.w>.5){
+            // The camera-to-first-hit segment lies inside the river. Upward
+            // rays leave at the supplied local surface height; downward rays
+            // remain submerged until they meet the actual bed. This gives all
+            // underwater objects consistent distance fog, not just pixels
+            // that happen to hit the underside of the water mesh.
+            float mediumDistance=payload.primaryT;
+            if(ray.Direction.y>.001)
+                mediumDistance=min(mediumDistance,
+                    camera.waterState.z/max(ray.Direction.y,.001));
+            mediumDistance=min(max(mediumDistance,0.0),36.0);
+            float3 mediumTransmission=exp(-float3(.72,.22,.105)*mediumDistance);
+            float3 underwaterScatter=srgbToLinear(float3(.025,.145,.185))*
+                (skyIrradiance(float3(0,1,0))*.52+keyLightRadiance()*.014+
+                 float3(.035,.055,.072));
+            payload.color=payload.color*mediumTransmission+
+                          underwaterScatter*(1-mediumTransmission);
+        }
         frameColor+=payload.color;
         frameKeyVisibility+=payload.primaryKeyVisibility;
         sceneDepth=min(sceneDepth,payload.primaryT*max(dot(ray.Direction,camera.forward),.001));
@@ -922,7 +954,9 @@ void RayGen() {
     // buffer.  Composite low optical depth in linear HDR before exposure and
     // tone mapping, so animated streaks neither leave trails nor clip white.
     float3 displayRadiance=accumulated;
-    if(g_RainIntensity>.001){
+    // Screen-space rain belongs to the air volume.  Rendering those streaks
+    // after the underwater medium would make drops appear inside the river.
+    if(g_RainIntensity>.001&&camera.waterState.x<.5){
         PrecipitationFlux precipitation=
             evaluatePrecipitationFlux(g_RainIntensity);
         float rainTransmission=1.0;
@@ -1160,7 +1194,7 @@ void GrassIntersection() {
 
 [shader("closesthit")]
 void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
-    if(payload.depth==0)payload.primaryT=RayTCurrent();
+    if(payload.primaryT>=SceneRayMaximum)payload.primaryT=RayTCurrent();
     GrassPatch patch=GrassPatches[PrimitiveIndex()];uint bladeIndex=(uint)floor(attr.encoded.x);
     BladeData blade=makeBlade(patch,bladeIndex);uint plane=attr.encoded.y>=1.5?1u:0u;
     float along=saturate(attr.encoded.y-2.0*plane);
@@ -1225,7 +1259,10 @@ void GrassRadianceHit(inout RadiancePayload payload,in GrassAttributes attr) {
 
 [shader("closesthit")]
 void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAttributes attr) {
-    if(payload.depth==0)payload.primaryT=RayTCurrent();
+    // Secondary transmission/reflection payloads also use primaryT as their
+    // local segment length. The caller owns a distinct payload, so recording
+    // it here cannot overwrite RayGen's primary scene depth.
+    if(payload.primaryT>=SceneRayMaximum)payload.primaryT=RayTCurrent();
     uint primitive=PrimitiveIndex();
     uint indexBase=InstanceID()==0u?0u:camera.environmentIndexOffset;
     uint i0=Indices[indexBase+primitive*3],i1=Indices[indexBase+primitive*3+1],
@@ -1301,6 +1338,8 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
     float3 puddleNormal=float3(0,1,0);
     float puddleImpactBright=0,puddleImpactDark=0,puddleImpactCrown=0;
     float riverCentreDepth=0;
+    float3 riverTransmissionRadiance=0;
+    float riverTransmissionBlend=0;
     // A primary-ray water footprint is retained for reflection filtering.
     // Puddles keep full local detail; the kilometre-scale river progressively
     // becomes a rough, level aggregate once its waves are sub-pixel.
@@ -1593,27 +1632,22 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         float grazing=rcp(max(abs(dot(surfaceNormal,-WorldRayDirection())),.20));
         float footprint=min(pixelWorld*sqrt(grazing),.60);
 
-        // uv.y is authored monotonically downstream for both the main river
-        // and tributary. Reconstruct dP/dv so the procedural wave field flows
-        // through bends instead of sliding along a fixed world axis.
-        float3 edge1=b.position-a.position,edge2=c.position-a.position;
-        float2 delta1=b.uv-a.uv,delta2=c.uv-a.uv;
-        float determinant=delta1.x*delta2.y-delta1.y*delta2.x;
-        float2 downstream=float2(0,1);
-        if(abs(determinant)>1e-8){
-            float3 dPdv=(edge2*delta1.x-edge1*delta2.x)/determinant;
-            if(dot(dPdv.xz,dPdv.xz)>1e-8)downstream=normalize(dPdv.xz);
-        }
+        // Phase is world-continuous. Local downstream directions may still
+        // control cadence in a future velocity field, but must never translate
+        // phase independently per triangle.
         WaterSurfaceSample waterSurface=evaluateWaterSurface(
-            hit.xz,footprint,downstream,.46,1.0);
+            hit.xz,footprint,float2(0,1),.46,1.0);
         // At a grazing angle a single screen pixel covers many centimetres of
         // river. Sampling one procedural wave normal there produces coherent
         // glint stripes that look like texture tiling. Converge both the
         // normal and the reflection direction toward the filtered mean plane
         // before those waves become sub-pixel.
         riverReflectionDetail=1-smoothstep(.055,.42,footprint);
-        float3 levelRiverNormal=normalize(lerp(
-            surfaceNormal,upperFace?float3(0,1,0):float3(0,-1,0),.92));
+        // Clearance correction belongs to the coarse terrain/water fit, not
+        // the optical wave surface. Retaining even a small fraction of those
+        // per-vertex normals reveals the rectangular mesh through specular
+        // reflection, so the filtered mean is an exact analytic level plane.
+        float3 levelRiverNormal=upperFace?float3(0,1,0):float3(0,-1,0);
         float3 detailedRiverNormal=upperFace?waterSurface.normal:
                                              -waterSurface.normal;
         puddleMask=1.0;
@@ -1631,16 +1665,80 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         // The generated strip is shallow at its banks and deepest at the
         // centre. Beer-Lambert attenuation exposes a muted gravel bed near
         // shore while the channel becomes blue-green through scattering.
-        riverCentreDepth=pow(saturate(1-abs(uv.x*2-1)),.70);
-        float depth=lerp(.055,.72,riverCentreDepth);
+        riverCentreDepth=pow(saturate(1-abs(uv.x*2-1)),1.12);
+        float depth=lerp(.018,2.40,riverCentreDepth);
         float opticalPath=depth/max(abs(dot(puddleNormal,
                                              -WorldRayDirection())),.18);
-        float3 transmission=exp(-float3(2.30,.72,.38)*opticalPath);
+        float3 transmission=exp(-float3(1.05,.33,.18)*opticalPath);
         // Shallow water reveals a wet gravel/silt bed. The previous near-black
         // bed albedo made the shoreline look like an unlit geometry strip.
         float3 riverBed=srgbToLinear(float3(.205,.168,.105));
-        float3 bodyScatter=srgbToLinear(float3(.034,.108,.137));
+        float3 bodyScatter=srgbToLinear(float3(.032,.125,.158));
         albedo=riverBed*transmission+bodyScatter*(1-transmission);
+
+        // Nearby primary water gets real parallax and depth: refract through
+        // the dielectric sheet and shade the actual terrain hit. Farther
+        // pixels converge smoothly to the analytic cross-section above, where
+        // another traversal would be sub-pixel and wasteful.
+        float nearTransmission=(payload.depth==0&&upperFace)?
+            1-smoothstep(155.0,260.0,riverDistance):0;
+        // Avoid spending a second traversal where the water transmits almost
+        // no energy at a grazing angle. The smooth Fresnel term also makes the
+        // traversal boundary invisible because its omitted contribution is
+        // already below the reflected share.
+        float entryCosine=saturate(dot(puddleNormal,normalize(camera.eye-hit)));
+        float entryFresnel=.0204+.9796*pow(1-entryCosine,5);
+        nearTransmission*=1-smoothstep(.82,.96,entryFresnel);
+        if(nearTransmission>.015){
+            float3 incident=normalize(WorldRayDirection());
+            float3 refractedDirection=refract(incident,puddleNormal,1.0/1.333);
+            if(dot(refractedDirection,refractedDirection)>1e-6){
+                RadiancePayload transmitted;
+                transmitted.color=0;transmitted.depth=1;
+                transmitted.primaryT=SceneRayMaximum;
+                transmitted.primaryKeyVisibility=1;
+                RayDesc transmissionRay;
+                transmissionRay.Origin=hit-puddleNormal*.028;
+                transmissionRay.Direction=normalize(refractedDirection);
+                transmissionRay.TMin=.018;transmissionRay.TMax=18.0;
+                TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,
+                         transmissionRay,transmitted);
+                float bedDistance=transmitted.primaryT<SceneRayMaximum?
+                                  transmitted.primaryT:depth;
+                // Beer-Lambert extinction is applied to already shaded bed
+                // radiance, then low-energy blue-green in-scatter fills only
+                // energy removed by the medium. It is composed later as
+                // radiance and is therefore never lit a second time.
+                float3 bedTransmission=exp(-float3(1.05,.33,.18)*bedDistance);
+                float3 inScatter=bodyScatter*
+                    (skyIrradiance(float3(0,1,0))*.34+keyLightRadiance()*.018);
+                riverTransmissionRadiance=
+                    transmitted.color*bedTransmission+inScatter*(1-bedTransmission);
+                riverTransmissionBlend=nearTransmission;
+            }
+        }
+        if(payload.depth==0&&camera.waterState.x>.5&&
+           camera.waterState.w>.5&&!upperFace){
+            // From inside the river the underside is an exit interface, not a
+            // blue opaque ceiling. Trace the refracted view into air; total
+            // internal reflection naturally leaves this term at zero so the
+            // reflection path below owns the pixel.
+            float3 exitDirection=refract(normalize(WorldRayDirection()),
+                                         puddleNormal,1.333);
+            if(dot(exitDirection,exitDirection)>1e-6){
+                RadiancePayload exited;
+                exited.color=0;exited.depth=1;
+                exited.primaryT=SceneRayMaximum;
+                exited.primaryKeyVisibility=1;
+                RayDesc exitRay;
+                exitRay.Origin=hit-puddleNormal*.028;
+                exitRay.Direction=normalize(exitDirection);
+                exitRay.TMin=.018;exitRay.TMax=SceneRayMaximum;
+                TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,exitRay,exited);
+                riverTransmissionRadiance=exited.color;
+                riverTransmissionBlend=1.0;
+            }
+        }
     }
     if(kind>2.5&&kind<3.5){
         float rockVariant=round(frac(material)*10);
@@ -1872,6 +1970,12 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         }
     }
     float3 result=albedo*(ambient+direct)+unmodulated;
+    if(riverSurface&&riverTransmissionBlend>.001){
+        // Replace the analytic, diffusely lit fallback with traced bed/exit
+        // radiance rather than adding the two. The reflection lerp below owns
+        // the Fresnel split exactly once for both sources.
+        result=lerp(result,riverTransmissionRadiance,riverTransmissionBlend);
+    }
     if(payload.depth==0&&puddleMask>.05){
         float3 viewDirection=normalize(camera.eye-hit);
         float waterFresnel=.0204+.9796*
@@ -1881,7 +1985,9 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         // The bounded wave normal supplies distortion. Blend back toward a
         // nearly level reflection whenever that distortion approaches the
         // terrain horizon so a ripple cannot launch a ray into the ground.
-        float3 levelNormal=normalize(lerp(surfaceNormal,float3(0,1,0),.94));
+        float3 levelNormal=riverSurface?
+            (upperFace?float3(0,1,0):float3(0,-1,0)):
+            normalize(lerp(surfaceNormal,float3(0,1,0),.94));
         float3 levelReflection=normalize(reflect(WorldRayDirection(),levelNormal));
         float3 waveReflection=normalize(reflect(WorldRayDirection(),puddleNormal));
         float horizonSafety=smoothstep(.012,.105,dot(waveReflection,levelNormal));
@@ -1900,16 +2006,24 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         // Near-normal Fresnel contributions do not justify a full traversal.
         // Preserve the physical sky term cheaply; use an exact DXR reflection
         // once the contribution is large enough to reveal scene geometry.
-        // A sharp secondary ray cannot represent a sub-pixel lobe. Once a
-        // distant river footprint has integrated the wave field, use the
-        // already filtered environment instead of aliasing geometry into
-        // horizontal sparkle bands. Nearby water and all puddles retain the
-        // exact DXR reflection path.
-        bool exactWaterReflection=!riverSurface||riverReflectionDetail>.16;
-        if(reflectionWeight>.022&&exactWaterReflection)
-            TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,reflectedRay,reflection);
-        else if(reflectionWeight>.004)
-            reflection.color=environmentRadiance(reflectionDirection);
+        // A sharp secondary ray cannot represent a sub-pixel lobe. Blend its
+        // result continuously into the footprint-filtered environment instead
+        // of switching two unrelated radiance values at one LOD threshold.
+        // The branch now only skips a traversal after its blend is negligible.
+        float exactReflectionBlend=riverSurface?
+            smoothstep(.075,.28,riverReflectionDetail):1.0;
+        if(reflectionWeight>.004){
+            float3 filteredReflection=environmentRadiance(reflectionDirection);
+            reflection.color=filteredReflection;
+            if(reflectionWeight>.022&&exactReflectionBlend>.015){
+                RadiancePayload exactReflection=reflection;
+                exactReflection.primaryT=SceneRayMaximum;
+                TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,
+                         reflectedRay,exactReflection);
+                reflection.color=lerp(filteredReflection,exactReflection.color,
+                                      exactReflectionBlend);
+            }
+        }
         result=lerp(result,reflection.color,reflectionWeight);
     }
     if(payload.depth==0&&!terrainSurface){RadiancePayload bounce;bounce.color=0;bounce.depth=1;bounce.primaryT=6;bounce.primaryKeyVisibility=1;RayDesc br;br.Origin=hit+surfaceNormal*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=6;TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}
