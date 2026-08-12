@@ -102,6 +102,28 @@ void FirstPersonCameraController::reset(float x,float z,float yaw,float pitch) {
     jumpInputHeld_=false;jumpQueued_=false;
 }
 
+void FirstPersonCameraController::rebaseHorizontal(float deltaX,float deltaZ) {
+    if(!std::isfinite(deltaX)||!std::isfinite(deltaZ))return;
+    const float limit=movementLimit();
+    state_.footPosition.x=std::clamp(state_.footPosition.x+deltaX,-limit,limit);
+    state_.footPosition.z=std::clamp(state_.footPosition.z+deltaZ,-limit,limit);
+    const GroundContact contact=groundContact(state_.footPosition.x,
+                                               state_.footPosition.z);
+    if(contact.valid&&state_.grounded) {
+        state_.footPosition.y=contact.supportHeight;
+        state_.cameraEyeY=state_.footPosition.y+settings_.eyeHeight;
+    } else if(!contact.valid)state_.grounded=false;
+    accumulator_=0.0f;
+}
+
+void FirstPersonCameraController::setTerrainSampler(
+    TerrainSurfaceSampler terrainSampler) {
+    terrainSampler_=std::move(terrainSampler);
+    if(!terrainSampler_)terrainSampler_=[](float x,float z) {
+        return EnvironmentGenerator::sampleTerrainSurface(x,z);
+    };
+}
+
 void FirstPersonCameraController::setHorizontalHalfExtent(float halfExtent) {
     settings_.horizontalHalfExtent=positiveFinite(
         halfExtent,settings_.horizontalHalfExtent,settings_.capsuleRadius+.01f);

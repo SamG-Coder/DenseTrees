@@ -1065,7 +1065,8 @@ void DxrRenderer::render(const CameraView&requestedView,
          {view.grassInteractionPosition.x,view.grassInteractionPosition.z,
           view.grassInteractionVelocity.x,view.grassInteractionVelocity.z},
          {cameraUnderwater?1.0f:0.0f,water.surfaceHeight,cameraImmersion,
-          water.inside?1.0f:0.0f}};
+          i.customWorld?(water.inside?-2.0f:-1.0f):
+                        (water.inside?1.0f:0.0f)}};
     static_assert(sizeof(Camera)==160);
     static_assert(offsetof(Camera,localLightIntensity)==68);
     static_assert(offsetof(Camera,resolution)==80);

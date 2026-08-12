@@ -1,4 +1,5 @@
 #include "aoe_world.hpp"
+#include "aoe_dressing.hpp"
 
 #include <algorithm>
 #include <array>
@@ -345,6 +346,40 @@ SceneSnapshot inspectShowcaseScene(bool validateCompleteMesh) {
     require(snapshot.biome==dense::AoeBiome::Forest&&!snapshot.water.inside,
             "showcase spawn is not dry forest terrain");
 
+    // The C# source filters four biome-label samples per tile with a Gaussian
+    // kernel. The 3D port retains that continuous field for material colour,
+    // water contours and forest-edge decisions while keeping the authoritative
+    // discrete biome probes above unchanged.
+    bool foundMixedBiome=false;
+    bool foundSmoothShore=false;
+    for(float z=scene.minimumBound()+2;z<scene.maximumBound()-2;z+=1.0f) {
+        for(float x=scene.minimumBound()+2;x<scene.maximumBound()-2;x+=1.0f) {
+            const dense::AoeBiomeWeights weights=scene.sampleBiomeWeights(x,z);
+            float total=0.0f;
+            int active=0;
+            for(float weight:weights.values) {
+                require(std::isfinite(weight)&&weight>=0.0f&&weight<=1.0f,
+                        "biome blend contains an invalid channel");
+                total+=weight;
+                if(weight>.025f)++active;
+            }
+            require(near(total,1.0f,2.0e-4f),
+                    "biome blend does not remain normalized");
+            foundMixedBiome|=active>=2;
+            const float shore=scene.sampleShoreDistance(x,z);
+            require(std::isfinite(shore)&&shore>=-8.001f&&shore<=8.001f,
+                    "signed shoreline distance escaped its encoded range");
+            const dense::PersistentWaterSample water=scene.sampleWater(x,z);
+            require(water.inside==(shore>=0.0f),
+                    "water sampler disagrees with the blended water contour");
+            foundSmoothShore|=std::abs(shore)<1.15f;
+        }
+    }
+    require(foundMixedBiome,
+            "showcase scene contains no softened biome transition");
+    require(foundSmoothShore,
+            "showcase scene contains no continuous shoreline samples");
+
     const dense::TerrainSurfaceSample outside=scene.sampleTerrain(
         scene.maximumBound()+.25f,0.0f);
     const dense::PersistentWaterSample outsideWater=scene.sampleWater(
@@ -367,8 +402,15 @@ SceneSnapshot inspectShowcaseScene(bool validateCompleteMesh) {
             "generated scene tile/biome statistics are inconsistent");
     require(snapshot.stats.waterTiles>1000&&
                 snapshot.stats.waterTiles<snapshot.stats.terrainTiles&&
-                snapshot.stats.trees>100&&snapshot.stats.grassPatches>1000,
+                snapshot.stats.trees>100&&snapshot.stats.grassPatches>1000&&
+                snapshot.stats.worldFeatures>=4&&
+                snapshot.stats.gameplayMarkers>=3,
             "showcase scene omitted water or vegetation populations");
+    require(scene.dressing()!=nullptr&&
+                scene.dressing()->trees.size()==snapshot.stats.trees&&
+                scene.dressing()->trails.size()==snapshot.stats.trails&&
+                scene.dressing()->features.size()==snapshot.stats.worldFeatures,
+            "source tree metadata or native gameplay dressing was not retained");
     for(dense::AoeBiome required:{dense::AoeBiome::RiverWater,
                                   dense::AoeBiome::Beach,
                                   dense::AoeBiome::Forest,
@@ -382,18 +424,19 @@ SceneSnapshot inspectShowcaseScene(bool validateCompleteMesh) {
 
     dense::EnvironmentMesh mesh=scene.takeMesh();
     snapshot.mesh=countsOf(mesh);
-    require(mesh.terrainIndices.size()==
+    require(mesh.terrainIndices.size()>=
                 static_cast<std::size_t>(snapshot.stats.terrainTiles)*6&&
                 mesh.terrainVertices.size()>=
                     static_cast<std::size_t>(dense::AoeWorldScene::gridResolution)*
                     dense::AoeWorldScene::gridResolution,
-            "generated terrain is not a complete two-triangle heightfield");
+            "generated terrain or its stitched horizon coverage is incomplete");
     require(mesh.grassPatches.size()==snapshot.stats.grassPatches&&
                 !mesh.riverVertices.empty()&&!mesh.riverIndices.empty()&&
                 !mesh.detailVertices.empty()&&!mesh.detailIndices.empty(),
             "generated render mesh inventory disagrees with scene statistics");
 
     float minimumWaterU=1.0f,maximumWaterU=0.0f;
+    bool foundFractionalShoreVertex=false;
     for(const dense::MeshVertex& vertex:mesh.terrainVertices) {
         require(finite(vertex.position)&&finite(vertex.normal)&&
                     std::isfinite(vertex.material)&&vertex.material>=7.0f&&
@@ -412,9 +455,49 @@ SceneSnapshot inspectShowcaseScene(bool validateCompleteMesh) {
                 "generated water did not use material 6.1 and normalized depth U");
         minimumWaterU=std::min(minimumWaterU,vertex.u);
         maximumWaterU=std::max(maximumWaterU,vertex.u);
+        const float localX=vertex.position.x+dense::AoeWorldScene::halfExtent;
+        const float localZ=vertex.position.z+dense::AoeWorldScene::halfExtent;
+        const float fractionX=std::abs(localX-std::round(localX));
+        const float fractionZ=std::abs(localZ-std::round(localZ));
+        foundFractionalShoreVertex|=fractionX>1.0e-3f||fractionZ>1.0e-3f;
     }
     require(maximumWaterU>.20f&&maximumWaterU-minimumWaterU>.10f,
             "generated water U does not carry meaningful physical depth");
+    require(foundFractionalShoreVertex,
+            "water still ends only on square tile boundaries");
+
+    // The water contour and terrain bed share one signed-distance zero. Edge
+    // vertices must therefore be shallow, and neighbouring one-metre terrain
+    // samples may not form the former metre-deep black shoreline wall.
+    std::size_t contourVertices=0,shoreSteps=0;
+    for(const dense::MeshVertex& vertex:mesh.riverVertices) {
+        if(std::abs(vertex.position.x)>dense::AoeWorldScene::halfExtent||
+           std::abs(vertex.position.z)>dense::AoeWorldScene::halfExtent)
+            continue;
+        const float shore=scene.sampleShoreDistance(vertex.position.x,
+                                                     vertex.position.z);
+        if(std::abs(shore)>.035f)continue;
+        require(vertex.u<.0035f,
+                "shoreline water vertex retained a deep vertical edge");
+        ++contourVertices;
+    }
+    for(float z=scene.minimumBound()+2;z<scene.maximumBound()-2;z+=.5f) {
+        for(float x=scene.minimumBound()+2;x<scene.maximumBound()-2;x+=.5f) {
+            if(std::abs(scene.sampleShoreDistance(x,z))>.25f)continue;
+            const auto centre=scene.sampleTerrain(x,z);
+            for(const dense::Vec3 direction:std::array<dense::Vec3,4>{
+                dense::Vec3{.5f,0,0},dense::Vec3{-.5f,0,0},
+                dense::Vec3{0,0,.5f},dense::Vec3{0,0,-.5f}}) {
+                const auto neighbour=scene.sampleTerrain(
+                    x+direction.x,z+direction.z);
+                require(std::abs(centre.position.y-neighbour.position.y)<.16f,
+                        "shoreline terrain contains a dark vertical slab");
+                ++shoreSteps;
+            }
+        }
+    }
+    require(contourVertices>100&&shoreSteps>100,
+            "showcase scene did not exercise the shoreline wall regression");
 
     // Query a triangle centroid with the greatest encoded depth. A centroid
     // avoids the ambiguous ownership of a shoreline vertex shared by dry and
@@ -426,10 +509,13 @@ SceneSnapshot inspectShowcaseScene(bool validateCompleteMesh) {
         const dense::MeshVertex& a=mesh.riverVertices[mesh.riverIndices[index]];
         const dense::MeshVertex& b=mesh.riverVertices[mesh.riverIndices[index+1]];
         const dense::MeshVertex& c=mesh.riverVertices[mesh.riverIndices[index+2]];
+        const dense::Vec3 centroid=(a.position+b.position+c.position)/3.0f;
+        if(std::abs(centroid.x)>dense::AoeWorldScene::halfExtent||
+           std::abs(centroid.z)>dense::AoeWorldScene::halfExtent)continue;
         const float encoded=(a.u+b.u+c.u)/3.0f;
         if(encoded>deepest) {
             deepest=encoded;
-            deepPoint=(a.position+b.position+c.position)/3.0f;
+            deepPoint=centroid;
             deepSurface=(a.position.y+b.position.y+c.position.y)/3.0f;
         }
     }
@@ -471,6 +557,9 @@ bool sameSceneSnapshot(const SceneSnapshot& left,const SceneSnapshot& right) {
            left.stats.shrubs==right.stats.shrubs&&
            left.stats.rocks==right.stats.rocks&&
            left.stats.grassPatches==right.stats.grassPatches&&
+           left.stats.trails==right.stats.trails&&
+           left.stats.worldFeatures==right.stats.worldFeatures&&
+           left.stats.gameplayMarkers==right.stats.gameplayMarkers&&
            left.stats.minimumHeight==right.stats.minimumHeight&&
            left.stats.maximumHeight==right.stats.maximumHeight&&
            left.terrain.position.x==right.terrain.position.x&&
@@ -492,6 +581,15 @@ bool sameSceneSnapshot(const SceneSnapshot& left,const SceneSnapshot& right) {
 
 int main() {
     checkAuthoritativeGoldens();
+    dense::AoeWorldScene shifted=dense::AoeWorldGenerator::generateWindow(
+        8675309,96,-64);
+    require(near(shifted.sourceCenterX(),96.0f)&&
+                near(shifted.sourceCenterZ(),-64.0f)&&
+                shifted.sampleTerrain(0,0).insideBounds&&
+                shifted.terrainTileCount()==
+                    dense::AoeWorldScene::tileResolution*
+                    dense::AoeWorldScene::tileResolution,
+            "camera-centred generated window lost its absolute source origin");
     const LegacySignature legacyBefore=legacySignature();
     validateLegacySignature(legacyBefore);
 

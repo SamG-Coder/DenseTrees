@@ -78,6 +78,11 @@ public:
 
     void resetToDefaultDrop();
     void reset(float x,float z,float yaw,float pitch);
+    void setTerrainSampler(TerrainSurfaceSampler terrainSampler);
+    // Shift a camera into a recentered render-local coordinate system without
+    // changing its orientation or horizontal motion. The next fixed step
+    // resolves support against the replacement terrain sampler.
+    void rebaseHorizontal(float deltaX,float deltaZ);
     void update(float elapsedSeconds,const FirstPersonCameraInput& input);
     void setHorizontalHalfExtent(float halfExtent);
 

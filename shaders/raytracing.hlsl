@@ -43,7 +43,10 @@ SamplerState GroundSampler : register(s0);
 RWTexture2D<float4> Output : register(u0);
 RWTexture2D<float4> Accumulation : register(u1);
 ConstantBuffer<Camera> camera : register(b0);
-static const float SceneRayMaximum=7200.0;
+// The generated world's final terrain LOD reaches 16 km. Keep primary and
+// environment rays long enough to meet it so the horizon cannot fall back to
+// black between the former 512 m scene and the sky.
+static const float SceneRayMaximum=24000.0;
 
 float3 srgbToLinear(float3 c) { c=saturate(c);return lerp(c/12.92,pow((c+.055)/1.055,2.4),step(.04045,c)); }
 float3 unpackColor(uint packed) { return float3(packed&255,(packed>>8)&255,(packed>>16)&255)/255.0; }
@@ -837,6 +840,30 @@ float3 applyAerialPerspective(float3 radiance,float3 rayOrigin,float3 hit,
     return radiance*transmittance+clearSkyAirlight(rayDirection)*(1-transmittance);
 }
 
+// A finite streamed mesh cannot cover every grazing ray. Continue the ocean
+// analytically beyond the 16 km LOD shell so those misses meet the same level
+// water horizon instead of punching through to sky between distant islands.
+// This is deliberately restricted to the generated world: the authored visual
+// test scene keeps its existing sky/mountain silhouette.
+float3 generatedWorldHorizon(float3 direction) {
+    float3 d=normalize(direction);
+    if(d.y>=-.0005)return environmentRadiance(d);
+    // The generated ocean is authored at a fixed 1.2 cm render lift. Do not
+    // reuse the local water sampler here: on land it intentionally reports an
+    // empty sample whose zero-initialized height is not the rendered surface.
+    float t=(.012-camera.eye.y)/d.y;
+    if(t<=0||t>=SceneRayMaximum)return environmentRadiance(d);
+    float3 hit=camera.eye+d*t;
+    float3 viewDirection=-d;
+    float fresnel=.0204+.9796*pow(1-saturate(viewDirection.y),5);
+    float3 reflected=environmentRadiance(reflect(d,float3(0,1,0)));
+    float depthFade=saturate((t-9000.0)/12000.0);
+    float3 waterBody=srgbToLinear(float3(.19,.34,.39));
+    float3 water=lerp(waterBody,reflected,lerp(.36,.92,fresnel));
+    water=lerp(water,clearSkyAirlight(d),depthFade*.92);
+    return applyAerialPerspective(water,camera.eye,hit,d);
+}
+
 // Returns optical alpha, camera-forward depth in metres and a mild per-drop
 // radiance variation.  Layers are evaluated front-to-back in RayGen.
 float3 rainStreakLayer(uint2 pixel,uint layerIndex,PrecipitationFlux flux) {
@@ -921,7 +948,8 @@ void RayGen() {
         RadiancePayload payload;payload.color=0;payload.depth=0;payload.primaryT=SceneRayMaximum;
         payload.primaryKeyVisibility=1;
         TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,ray,payload);
-        if(camera.waterState.x>.5&&camera.waterState.w>.5){
+        if(camera.waterState.x>.5&&
+           (camera.waterState.w>.5||camera.waterState.w<-1.5)){
             // The camera-to-first-hit segment lies inside the river. Upward
             // rays leave at the supplied local surface height; downward rays
             // remain submerged until they meet the actual bed. This gives all
@@ -989,7 +1017,9 @@ void RayGen() {
 
 [shader("miss")]
 void RadianceMiss(inout RadiancePayload payload) {
-    payload.color=environmentRadiance(WorldRayDirection());
+    payload.color=camera.waterState.w<-.5?
+        generatedWorldHorizon(WorldRayDirection()):
+        environmentRadiance(WorldRayDirection());
     if(payload.depth==0){payload.primaryT=SceneRayMaximum;payload.primaryKeyVisibility=1;}
 }
 [shader("miss")]
@@ -1777,7 +1807,7 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
             }
         }
         if(payload.depth==0&&camera.waterState.x>.5&&
-           camera.waterState.w>.5&&!upperFace){
+           (camera.waterState.w>.5||camera.waterState.w<-1.5)&&!upperFace){
             // From inside the river the underside is an exit interface, not a
             // blue opaque ceiling. Trace the refracted view into air; total
             // internal reflection naturally leaves this term at zero so the
@@ -2086,6 +2116,20 @@ void RadianceHit(inout RadiancePayload payload,in BuiltInTriangleIntersectionAtt
         result=lerp(result,reflection.color,reflectionWeight);
     }
     if(payload.depth==0&&!terrainSurface){RadiancePayload bounce;bounce.color=0;bounce.depth=1;bounce.primaryT=6;bounce.primaryKeyVisibility=1;RayDesc br;br.Origin=hit+surfaceNormal*.018;br.Direction=cosineHemisphere(n,float2(hash(pixel+camera.frameIndex*89),hash(pixel.yx+camera.frameIndex*113)));br.TMin=.01;br.TMax=6;TraceRay(Scene,RAY_FLAG_NONE,0x1,0,0,0,br,bounce);result+=albedo*bounce.color*.075;}
+    // The streamed near scene is surrounded by a finite 16 km LOD shell.
+    // At grazing angles its last few heightfield cells would otherwise retain
+    // enough saturated land colour to reveal the square mesh boundary as
+    // disconnected "floating" plates against the sky. Real landscapes lose
+    // this contrast long before the geometric horizon. Converge generated
+    // terrain and water into the same directional airlight over the outer
+    // shell; the local 4 km remains untouched and legacy test-world materials
+    // keep their established atmosphere.
+    if(generatedWorldTerrain||generatedWorldWater){
+        float generatedDistance=distance(camera.eye,hit);
+        float horizonMerge=smoothstep(4200.0,14200.0,generatedDistance);
+        horizonMerge*=horizonMerge;
+        result=lerp(result,clearSkyAirlight(WorldRayDirection()),horizonMerge);
+    }
     payload.color=applyAerialPerspective(result,WorldRayOrigin(),hit,
                                           WorldRayDirection());
 }

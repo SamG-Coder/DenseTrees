@@ -2,9 +2,14 @@
 
 The default window is a native C++ and DirectX Raytracing 3D translation of the
 deterministic world-generation model from `C:\AI RPG AOE`. It turns that
-project's terrain, climate biomes, hydrology, shorelines, and vegetation into a
-walkable heightfield with separate water volume geometry. The original Dense
-Trees ecosystem laboratory remains available as the visual test world.
+project’s terrain, climate biomes, hydrology, shorelines, and vegetation into a
+walkable heightfield with separate water volume geometry. The generated window
+recentres in deterministic 32 m source chunks as the player travels, while
+stitched terrain and water LODs continue to a 16 km horizon. Source-style biome
+weights soften material and shoreline boundaries; native procedural dressing
+adds varied forests, trails, a starter camp, landmarks, and stable gameplay
+markers. The original Dense Trees ecosystem laboratory remains available as
+the visual test world.
 
 ## Run
 
@@ -48,7 +53,12 @@ Controls:
 
 - `tree.cpp`: platform-independent growth simulation and CPU tree mesh generation
 - `aoe_world.cpp`: deterministic AOE-derived terrain, climate, hydrology,
-  water-volume, and vegetation conversion to 3D
+  biome weights, water-volume, and vegetation conversion to 3D
+- `aoe_streaming.cpp`: signed 32 m chunk addressing, recenter hysteresis, and
+  stale asynchronous-window rejection
+- `aoe_horizon.cpp`: crack-free, contour-blended terrain/water LOD rings to 16 km
+- `aoe_dressing.cpp`: source-family tree metadata, volumetric native tree
+  archetypes, forest-edge thinning, trails, camps, landmarks, and markers
 - `launch_options.cpp`: default generated-world and `--test-world` selection
 - `environment.cpp`: deterministic terrain, mountain, meadow, shrub, rock, and background-forest generation
 - `environment_simulation.cpp`: CPU day/night, sun/moon, wind, rain, wetness, puddle, fog, storm, and lightning state
@@ -59,7 +69,10 @@ Controls:
 - `tests/tree_tests.cpp`: tree morphology plus terrain and grass invariants
 - `tests/environment_simulation_tests.cpp`: environment ABI, solar cycle, weather integration, storm, and determinism checks
 - `tests/aoe_world_tests.cpp`: generated-world determinism, seams, biome
-  coverage, water depth, mesh, and sampling contracts
+  coverage, shoreline grade, water depth, mesh, and sampling contracts
+- `tests/aoe_streaming_tests.cpp`, `tests/aoe_horizon_tests.cpp`, and
+  `tests/aoe_dressing_tests.cpp`: streaming, far-field contour, forest ecology,
+  world-feature, and procedural silhouette regressions
 
 The generator port is based on the MIT-licensed source algorithms in
 `C:\AI RPG AOE` (source revision `3e76dcd`). It does not load that directory at

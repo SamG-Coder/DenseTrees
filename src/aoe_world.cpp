@@ -1,4 +1,6 @@
 #include "aoe_world.hpp"
+#include "aoe_dressing.hpp"
+#include "aoe_horizon.hpp"
 
 // This file is a C++ 3D port of the deterministic world-generation
 // algorithms in the MIT-licensed C:\AI RPG AOE project at revision 3e76dcd.
@@ -479,83 +481,180 @@ std::uint32_t biomeColor(AoeBiome biome) {
     }
 }
 
-float treeChance(AoeWorldBiome region,float elevation) {
-    float chance=0.0f;
-    switch(region) {
-    case AoeWorldBiome::Rainforest:chance=.31f;break;
-    case AoeWorldBiome::TemperateForest:chance=.23f;break;
-    case AoeWorldBiome::Taiga:chance=.19f;break;
-    case AoeWorldBiome::Wetland:chance=.13f;break;
-    case AoeWorldBiome::Savanna:chance=.065f;break;
-    case AoeWorldBiome::Alpine:chance=.045f;break;
-    case AoeWorldBiome::Coast:chance=.012f;break;
-    case AoeWorldBiome::Tundra:chance=.025f;break;
-    case AoeWorldBiome::Desert:chance=.009f;break;
-    default:break;
+constexpr int biomeBlendSamplesPerTile=4;
+constexpr int biomeBlendKernelRadius=10;
+constexpr float biomeBlendKernelSigma=4.6f;
+constexpr float shoreDistanceMaximum=8.0f;
+constexpr float shoreLinearDistance=1.5f;
+constexpr float shoreNaturalDistance=4.0f;
+constexpr float shoreFullDepthDistance=6.0f;
+constexpr float shoreGrade=.055f;
+
+std::array<float,2*biomeBlendKernelRadius+1> biomeBlendKernel() {
+    std::array<float,2*biomeBlendKernelRadius+1> kernel{};
+    float total=0.0f;
+    for(int offset=-biomeBlendKernelRadius;
+        offset<=biomeBlendKernelRadius;++offset) {
+        const float value=std::exp(-(offset*offset)/
+            (2.0f*biomeBlendKernelSigma*biomeBlendKernelSigma));
+        kernel[static_cast<std::size_t>(offset+biomeBlendKernelRadius)]=value;
+        total+=value;
     }
-    return region==AoeWorldBiome::Alpine?
-        chance*clamp((12.0f-elevation)/4.0f,0.0f,1.0f):chance;
+    for(float& value:kernel)value/=total;
+    return kernel;
 }
 
-void appendTree(EnvironmentMesh& mesh,Vec3 base,float height,float radius,
-                std::uint32_t seed,AoeWorldBiome region) {
-    constexpr int sides=5;
-    const std::uint32_t trunkBase=static_cast<std::uint32_t>(
-        mesh.detailVertices.size());
-    const std::uint32_t wood=packColor(.22f,.13f,.065f);
-    for(int layer=0;layer<2;++layer)for(int side=0;side<sides;++side) {
-        const float angle=2.0f*pi*side/sides;
-        const float r=layer==0?radius:radius*.68f;
-        const Vec3 normal{std::cos(angle),0,std::sin(angle)};
-        mesh.detailVertices.push_back({base+Vec3{normal.x*r,
-            layer==0?0.0f:height*.62f,normal.z*r},normal,wood,5.0f,
-            static_cast<float>(side)/sides,static_cast<float>(layer)});
+// Collapse the source's four-samples-per-tile Gaussian into tile offsets for
+// an integer vertex. This is mathematically identical to filtering the full
+// sample texture, while letting a generated scene classify its small halo
+// once instead of invoking hydrology hundreds of times per vertex.
+std::array<float,7> biomeBlendTileKernel() {
+    static const auto sampleKernel=biomeBlendKernel();
+    std::array<float,7> tileKernel{};
+    for(int offset=-biomeBlendKernelRadius;
+        offset<=biomeBlendKernelRadius;++offset) {
+        const int tileOffset=floorDiv(offset,biomeBlendSamplesPerTile);
+        tileKernel[static_cast<std::size_t>(tileOffset+3)]+=
+            sampleKernel[static_cast<std::size_t>(
+                offset+biomeBlendKernelRadius)];
     }
-    for(int side=0;side<sides;++side) {
-        const std::uint32_t next=(side+1)%sides;
-        mesh.detailIndices.insert(mesh.detailIndices.end(),{
-            trunkBase+static_cast<std::uint32_t>(side),trunkBase+next,
-            trunkBase+sides+static_cast<std::uint32_t>(side),
-            trunkBase+next,trunkBase+sides+next,
-            trunkBase+sides+static_cast<std::uint32_t>(side)});
+    return tileKernel;
+}
+
+std::uint32_t blendedBiomeColor(const AoeBiomeWeights& weights) {
+    Vec3 blended{};
+    for(std::size_t channel=0;channel<weights.values.size();++channel) {
+        const std::uint32_t color=biomeColor(static_cast<AoeBiome>(channel));
+        blended+=Vec3{static_cast<float>(color&255u),
+                      static_cast<float>((color>>8)&255u),
+                      static_cast<float>((color>>16)&255u)}*
+                 (weights.values[channel]/255.0f);
     }
-    const float conifer=(region==AoeWorldBiome::Taiga||
-                         region==AoeWorldBiome::Tundra||
-                         region==AoeWorldBiome::Alpine)?1.0f:0.0f;
-    const float warm=(region==AoeWorldBiome::Savanna||
-                      region==AoeWorldBiome::Desert)?1.0f:0.0f;
-    const float tint=.88f+.18f*unitHash(seed,0,0,631);
-    const std::uint32_t foliage=conifer>.5f?
-        packColor(.095f*tint,.235f*tint,.095f*tint):
-        (warm>.5f?packColor(.24f*tint,.38f*tint,.075f*tint):
-                    packColor(.13f*tint,.36f*tint,.095f*tint));
-    const int crownCount=conifer>.5f?3:2;
-    for(int crown=0;crown<crownCount;++crown) {
-        const float t=static_cast<float>(crown)/(std::max(1,crownCount-1));
-        const float crownY=height*(.58f+.18f*t);
-        const float crownRadius=height*(conifer>.5f?mix(.24f,.11f,t):
-                                                    mix(.25f,.20f,t));
-        const float crownHeight=height*(conifer>.5f?.30f:.22f);
-        const std::uint32_t first=static_cast<std::uint32_t>(
-            mesh.detailVertices.size());
-        mesh.detailVertices.push_back({base+Vec3{0,crownY+crownHeight,0},
-            {0,1,0},foliage,4.0f,.5f,1.0f});
-        mesh.detailVertices.push_back({base+Vec3{0,crownY-crownHeight*.72f,0},
-            {0,-1,0},foliage,4.0f,.5f,0.0f});
-        for(int side=0;side<6;++side) {
-            const float angle=2*pi*side/6.0f;
-            const Vec3 radial{std::cos(angle),.08f,std::sin(angle)};
-            mesh.detailVertices.push_back({base+Vec3{radial.x*crownRadius,
-                crownY+radial.y*crownRadius,radial.z*crownRadius},
-                normalize(radial),foliage,4.0f,
-                .5f+.5f*radial.x,.5f+.5f*radial.z});
-        }
-        for(int side=0;side<6;++side) {
-            const std::uint32_t a=first+2+side,b=first+2+(side+1)%6;
-            mesh.detailIndices.insert(mesh.detailIndices.end(),
-                {first,a,b,first+1,b,a});
+    return packColor(blended.x,blended.y,blended.z);
+}
+
+float waterCoverageAt(const std::vector<AoeBiomeWeights>& weights,
+                      int x,int z) {
+    const int clampedX=std::clamp(x,0,AoeWorldScene::gridResolution-1);
+    const int clampedZ=std::clamp(z,0,AoeWorldScene::gridResolution-1);
+    return weights[static_cast<std::size_t>(clampedZ)*
+                   AoeWorldScene::gridResolution+clampedX].waterCoverage();
+}
+
+float signedShoreDistance(const std::vector<AoeBiomeWeights>& weights,
+                          int x,int z) {
+    const bool water=waterCoverageAt(weights,x,z)>=.5f;
+    float closest=shoreDistanceMaximum;
+    constexpr int searchRadius=9;
+    for(int dz=-searchRadius;dz<=searchRadius;++dz) {
+        for(int dx=-searchRadius;dx<=searchRadius;++dx) {
+            if(dx==0&&dz==0)continue;
+            const bool sampleWater=waterCoverageAt(weights,x+dx,z+dz)>=.5f;
+            if(sampleWater==water)continue;
+            closest=std::min(closest,std::sqrt(static_cast<float>(dx*dx+dz*dz)));
         }
     }
+    return water?closest:-closest;
+}
+
+struct WaterContourVertex {
+    float x{},z{},depth{},shore{};
+};
+
+WaterContourVertex interpolateWaterContour(const WaterContourVertex& a,
+                                           const WaterContourVertex& b) {
+    const float denominator=b.shore-a.shore;
+    const float amount=std::abs(denominator)>1.0e-6f?
+        clamp(-a.shore/denominator,0.0f,1.0f):.5f;
+    // The clipped water edge and its terrain vertex share the zero of the
+    // same signed field.  Encoding zero depth here keeps refraction from
+    // revealing a dark vertical sheet at an otherwise exact shoreline.
+    return {mix(a.x,b.x,amount),mix(a.z,b.z,amount),
+            0.0f,0.0f};
+}
+
+void appendClippedWaterTriangle(
+    EnvironmentMesh& mesh,
+    const std::array<WaterContourVertex,3>& triangle) {
+    std::vector<WaterContourVertex> polygon;
+    polygon.reserve(5);
+    const auto pushUnique=[&](WaterContourVertex point) {
+        if(!polygon.empty()) {
+            const float dx=polygon.back().x-point.x;
+            const float dz=polygon.back().z-point.z;
+            if(dx*dx+dz*dz<1.0e-10f)return;
+        }
+        polygon.push_back(point);
+    };
+    for(std::size_t edge=0;edge<triangle.size();++edge) {
+        const std::size_t previous=(edge+triangle.size()-1)%triangle.size();
+        const bool inside=triangle[edge].shore>=0.0f;
+        const bool previousInside=triangle[previous].shore>=0.0f;
+        if(inside!=previousInside)pushUnique(interpolateWaterContour(
+            triangle[previous],triangle[edge]));
+        if(inside)pushUnique(triangle[edge]);
+    }
+    if(polygon.size()>1) {
+        const float dx=polygon.front().x-polygon.back().x;
+        const float dz=polygon.front().z-polygon.back().z;
+        if(dx*dx+dz*dz<1.0e-10f)polygon.pop_back();
+    }
+    if(polygon.size()<3)return;
+    float twiceArea=0.0f;
+    for(std::size_t point=0;point<polygon.size();++point) {
+        const WaterContourVertex& a=polygon[point];
+        const WaterContourVertex& b=polygon[(point+1)%polygon.size()];
+        twiceArea+=a.x*b.z-a.z*b.x;
+    }
+    if(std::abs(twiceArea)<1.0e-6f)return;
+    const std::uint32_t first=static_cast<std::uint32_t>(
+        mesh.riverVertices.size());
+    for(const WaterContourVertex& point:polygon) {
+        mesh.riverVertices.push_back({{
+            point.x-AoeWorldScene::halfExtent,
+            AoeWorldScene::waterSurfaceHeight,
+            point.z-AoeWorldScene::halfExtent},{0,1,0},
+            packColor(.34f,.55f,.64f),6.1f,
+            clamp(point.depth/3.2f,0.0f,1.0f),0});
+    }
+    for(std::uint32_t point=1;point+1<polygon.size();++point)
+        mesh.riverIndices.insert(mesh.riverIndices.end(),{
+            first,first+point+1,first+point});
+}
+
+float shorelineTerrainHeight(float renderedHeight,float signedDistance,
+                             float nominalDepth) {
+    if(signedDistance>=0.0f) {
+        // Both sides use the same linear grade through the first metre and a
+        // half. Any edge crossing signedDistance==0 therefore interpolates to
+        // the exact water surface, independent of triangle orientation.
+        const float edgeDepth=shoreGrade*std::min(
+            signedDistance,shoreLinearDistance);
+        const float fullDepth=std::max(edgeDepth,nominalDepth);
+        const float depth=mix(edgeDepth,fullDepth,smoothStep(
+            shoreLinearDistance,shoreFullDepthDistance,signedDistance));
+        return AoeWorldScene::waterSurfaceHeight-depth;
+    }
+    const float dryDistance=-signedDistance;
+    const float edgeHeight=AoeWorldScene::waterSurfaceHeight+shoreGrade*
+        std::min(dryDistance,shoreLinearDistance);
+    if(dryDistance<=shoreLinearDistance)return edgeHeight;
+    return mix(edgeHeight,renderedHeight,smoothStep(
+        shoreLinearDistance,shoreNaturalDistance,dryDistance));
+}
+
+std::array<float,4> terrainInterpolationWeights(int cellX,int cellZ,
+                                                float tx,float tz) {
+    std::array<float,4> weights{};
+    if(((cellX+cellZ)&1)==0) {
+        if(tz>=tx)weights={1.0f-tz,0.0f,tx,tz-tx};
+        else weights={1.0f-tx,tx-tz,tz,0.0f};
+    } else if(tx+tz<=1.0f) {
+        weights={1.0f-tx-tz,tx,0.0f,tz};
+    } else {
+        weights={0.0f,1.0f-tz,tx+tz-1.0f,1.0f-tx};
+    }
+    return weights;
 }
 
 void appendRock(EnvironmentMesh& mesh,Vec3 base,float radius,std::uint32_t color) {
@@ -659,11 +758,15 @@ Vec3 AoeWorldGenerator::nearestPlayableSpawn(std::int64_t seed) {
 }
 
 AoeWorldScene AoeWorldGenerator::generate(std::int64_t seed) {
+    const Vec3 sourceSpawn=nearestPlayableSpawn(seed);
+    return generateWindow(seed,static_cast<int>(std::floor(sourceSpawn.x)),
+                          static_cast<int>(std::floor(sourceSpawn.z)));
+}
+
+AoeWorldScene AoeWorldGenerator::generateWindow(
+    std::int64_t seed,int centerX,int centerZ) {
     AoeWorldScene scene;scene.seed_=seed;
     const std::uint64_t bits=seedBits(seed);
-    const Vec3 sourceSpawn=nearestPlayableSpawn(seed);
-    const int centerX=static_cast<int>(std::floor(sourceSpawn.x));
-    const int centerZ=static_cast<int>(std::floor(sourceSpawn.z));
     scene.sourceOriginX_=static_cast<float>(centerX)-AoeWorldScene::halfExtent;
     scene.sourceOriginZ_=static_cast<float>(centerZ)-AoeWorldScene::halfExtent;
     const int firstSourceX=static_cast<int>(scene.sourceOriginX_);
@@ -720,20 +823,76 @@ AoeWorldScene AoeWorldGenerator::generate(std::int64_t seed) {
         }
     }
 
+    scene.vertexBiomeWeights_.resize(static_cast<std::size_t>(
+        AoeWorldScene::gridResolution)*AoeWorldScene::gridResolution);
+    scene.vertexShoreDistances_.resize(scene.vertexBiomeWeights_.size());
+    // Dressing evaluates candidates three tiles beyond the visible window so
+    // spacing remains stable across streamed boundaries.  Keep another three
+    // labels around that halo for the same Gaussian forest-edge field.
+    constexpr int blendKernelHalo=3;
+    constexpr int blendHalo=blendKernelHalo*2;
+    constexpr int blendLabelResolution=AoeWorldScene::gridResolution+
+                                       blendHalo*2;
+    std::vector<AoeBiome> blendLabels(static_cast<std::size_t>(
+        blendLabelResolution)*blendLabelResolution);
+    std::vector<float> blendWaterDepths(blendLabels.size());
+    const auto blendLabelIndex=[](int x,int z) {
+        return static_cast<std::size_t>(z)*blendLabelResolution+x;
+    };
+    for(int z=0;z<blendLabelResolution;++z) {
+        for(int x=0;x<blendLabelResolution;++x) {
+            const int sourceX=firstSourceX+x-blendHalo;
+            const int sourceZ=firstSourceZ+z-blendHalo;
+            const std::size_t index=blendLabelIndex(x,z);
+            const AoeBiome biome=biomeAt(seed,sourceX,sourceZ);
+            blendLabels[index]=biome;
+            if(waterBiome(biome))blendWaterDepths[index]=nominalWaterDepth(
+                biome,hydrology(bits,sourceX,sourceZ),
+                baseElevation(bits,sourceX,sourceZ));
+        }
+    }
+    static const auto blendTileKernel=biomeBlendTileKernel();
+    std::vector<float> vertexWaterDepths(scene.vertexBiomeWeights_.size());
+    for(int z=0;z<AoeWorldScene::gridResolution;++z) {
+        for(int x=0;x<AoeWorldScene::gridResolution;++x) {
+            const std::size_t vertex=scene.vertexIndex(x,z);
+            AoeBiomeWeights& weights=
+                scene.vertexBiomeWeights_[vertex];
+            for(int offsetZ=-blendKernelHalo;
+                offsetZ<=blendKernelHalo;++offsetZ) {
+                const float weightZ=blendTileKernel[static_cast<std::size_t>(
+                    offsetZ+blendKernelHalo)];
+                for(int offsetX=-blendKernelHalo;
+                    offsetX<=blendKernelHalo;++offsetX) {
+                    const std::size_t label=blendLabelIndex(
+                        x+offsetX+blendHalo,z+offsetZ+blendHalo);
+                    const AoeBiome biome=blendLabels[label];
+                    const float kernelWeight=weightZ*blendTileKernel[
+                        static_cast<std::size_t>(offsetX+blendKernelHalo)];
+                    weights.values[static_cast<std::size_t>(biome)]+=
+                        kernelWeight;
+                    vertexWaterDepths[vertex]+=blendWaterDepths[label]*
+                                                     kernelWeight;
+                }
+            }
+            const float waterWeight=weights.waterCoverage();
+            if(waterWeight>1.0e-5f)vertexWaterDepths[vertex]/=waterWeight;
+        }
+    }
+    for(int z=0;z<AoeWorldScene::gridResolution;++z) {
+        for(int x=0;x<AoeWorldScene::gridResolution;++x) {
+            scene.vertexShoreDistances_[scene.vertexIndex(x,z)]=
+                signedShoreDistance(scene.vertexBiomeWeights_,x,z);
+        }
+    }
+
     scene.terrainHeights_=rendered;
     for(int z=0;z<AoeWorldScene::gridResolution;++z) {
         for(int x=0;x<AoeWorldScene::gridResolution;++x) {
-            float adjacentDepth=0.0f;
-            for(int oz=-1;oz<=0;++oz)for(int ox=-1;ox<=0;++ox) {
-                const int tx=x+ox,tz=z+oz;
-                if(tx<0||tz<0||tx>=AoeWorldScene::tileResolution||
-                   tz>=AoeWorldScene::tileResolution)continue;
-                adjacentDepth=std::max(adjacentDepth,
-                    scene.tileWaterDepths_[scene.tileIndex(tx,tz)]);
-            }
-            if(adjacentDepth>0.0f)scene.terrainHeights_[scene.vertexIndex(x,z)]=
-                std::min(scene.terrainHeights_[scene.vertexIndex(x,z)],
-                    AoeWorldScene::waterSurfaceHeight-adjacentDepth);
+            const std::size_t index=scene.vertexIndex(x,z);
+            scene.terrainHeights_[index]=shorelineTerrainHeight(
+                rendered[index],scene.vertexShoreDistances_[index],
+                vertexWaterDepths[index]);
         }
     }
     scene.terrainNormals_.resize(scene.terrainHeights_.size());
@@ -771,55 +930,62 @@ AoeWorldScene AoeWorldGenerator::generate(std::int64_t seed) {
             const std::size_t tile=scene.tileIndex(x,z);
             const AoeBiome biome=scene.tileBiomes_[tile];
             const float material=7.0f+static_cast<float>(biome)*.01f;
-            const std::uint32_t color=biomeColor(biome);
             const std::uint32_t first=static_cast<std::uint32_t>(
                 mesh.terrainVertices.size());
-            const auto vertex=[&](int gx,int gz,float u,float v) {
+            const auto vertex=[&](int gx,int gz) {
                 const std::size_t index=scene.vertexIndex(gx,gz);
+                const AoeBiomeWeights& weights=scene.vertexBiomeWeights_[index];
                 return MeshVertex{{gx-AoeWorldScene::halfExtent,
                     scene.terrainHeights_[index],gz-AoeWorldScene::halfExtent},
-                    scene.terrainNormals_[index],color,material,u,v};
+                    scene.terrainNormals_[index],blendedBiomeColor(weights),
+                    material,weights.waterCoverage(),
+                    scene.vertexShoreDistances_[index]/
+                        (2.0f*shoreDistanceMaximum)+.5f};
             };
-            mesh.terrainVertices.push_back(vertex(x,z,0,0));
-            mesh.terrainVertices.push_back(vertex(x+1,z,1,0));
-            mesh.terrainVertices.push_back(vertex(x+1,z+1,1,1));
-            mesh.terrainVertices.push_back(vertex(x,z+1,0,1));
+            mesh.terrainVertices.push_back(vertex(x,z));
+            mesh.terrainVertices.push_back(vertex(x+1,z));
+            mesh.terrainVertices.push_back(vertex(x+1,z+1));
+            mesh.terrainVertices.push_back(vertex(x,z+1));
             if(((x+z)&1)==0)mesh.terrainIndices.insert(mesh.terrainIndices.end(),
                 {first,first+3,first+2,first,first+2,first+1});
             else mesh.terrainIndices.insert(mesh.terrainIndices.end(),
                 {first,first+3,first+1,first+1,first+3,first+2});
 
-            const float waterDepth=scene.tileWaterDepths_[tile];
-            if(waterDepth>0.0f) {
-                const std::uint32_t waterFirst=static_cast<std::uint32_t>(
-                    mesh.riverVertices.size());
-                const auto waterVertex=[&](int gx,int gz) {
-                    const float depth=AoeWorldScene::waterSurfaceHeight-
-                        scene.terrainHeights_[scene.vertexIndex(gx,gz)];
-                    const float normalizedDepth=clamp(depth/3.2f,0.0f,1.0f);
-                    return MeshVertex{{gx-AoeWorldScene::halfExtent,
-                        AoeWorldScene::waterSurfaceHeight,
-                        gz-AoeWorldScene::halfExtent},{0,1,0},
-                        packColor(.34f,.55f,.64f),6.1f,normalizedDepth,0};
-                };
-                mesh.riverVertices.push_back(waterVertex(x,z));
-                mesh.riverVertices.push_back(waterVertex(x+1,z));
-                mesh.riverVertices.push_back(waterVertex(x+1,z+1));
-                mesh.riverVertices.push_back(waterVertex(x,z+1));
-                mesh.riverIndices.insert(mesh.riverIndices.end(),{
-                    waterFirst,waterFirst+3,waterFirst+2,
-                    waterFirst,waterFirst+2,waterFirst+1});
+            const std::array<float,4> shore{{
+                scene.vertexShoreDistances_[scene.vertexIndex(x,z)],
+                scene.vertexShoreDistances_[scene.vertexIndex(x+1,z)],
+                scene.vertexShoreDistances_[scene.vertexIndex(x+1,z+1)],
+                scene.vertexShoreDistances_[scene.vertexIndex(x,z+1)]}};
+            const std::array<WaterContourVertex,4> corners{{
+                {static_cast<float>(x),static_cast<float>(z),
+                 AoeWorldScene::waterSurfaceHeight-
+                    scene.terrainHeights_[scene.vertexIndex(x,z)],shore[0]},
+                {static_cast<float>(x+1),static_cast<float>(z),
+                 AoeWorldScene::waterSurfaceHeight-
+                    scene.terrainHeights_[scene.vertexIndex(x+1,z)],shore[1]},
+                {static_cast<float>(x+1),static_cast<float>(z+1),
+                 AoeWorldScene::waterSurfaceHeight-
+                    scene.terrainHeights_[scene.vertexIndex(x+1,z+1)],shore[2]},
+                {static_cast<float>(x),static_cast<float>(z+1),
+                 AoeWorldScene::waterSurfaceHeight-
+                    scene.terrainHeights_[scene.vertexIndex(x,z+1)],shore[3]}}};
+            // Clip the exact two terrain triangles against the continuous 50%
+            // water contour. Matching the alternating terrain diagonal avoids
+            // ambiguous marching-squares bridges and keeps CPU queries exact.
+            if(((x+z)&1)==0) {
+                appendClippedWaterTriangle(mesh,{corners[0],corners[3],corners[2]});
+                appendClippedWaterTriangle(mesh,{corners[0],corners[2],corners[1]});
+            } else {
+                appendClippedWaterTriangle(mesh,{corners[0],corners[3],corners[1]});
+                appendClippedWaterTriangle(mesh,{corners[1],corners[3],corners[2]});
             }
         }
     }
 
-    // Translate the source world's deterministic tree catalogue into compact
-    // 3D proxies. Distribution follows the original regional spawn chances;
-    // geometry and materials are native procedural assets.
+    // Populate rocks and grass before the source-faithful tree/dressing pass.
     for(int z=0;z<AoeWorldScene::tileResolution;++z) {
         for(int x=0;x<AoeWorldScene::tileResolution;++x) {
             const std::size_t tile=scene.tileIndex(x,z);
-            if(waterBiome(scene.tileBiomes_[tile]))continue;
             const int sourceX=firstSourceX+x,sourceZ=firstSourceZ+z;
             const float elevation=(rawHeights[haloIndex(x+1,z+1)]+
                                    rawHeights[haloIndex(x+2,z+1)]+
@@ -828,17 +994,12 @@ AoeWorldScene AoeWorldGenerator::generate(std::int64_t seed) {
             const float localX=x-AoeWorldScene::halfExtent+.5f;
             const float localZ=z-AoeWorldScene::halfExtent+.5f;
             const TerrainSurfaceSample ground=scene.sampleTerrain(localX,localZ);
-            if(unitHash(bits,sourceX,sourceZ,91)<
-               treeChance(tileRegions[tile],elevation)) {
-                const float jitterX=(unitHash(bits,sourceX,sourceZ,307)-.5f)*.54f;
-                const float jitterZ=(unitHash(bits,sourceX,sourceZ,311)-.5f)*.54f;
-                const float height=3.2f+unitHash(bits,sourceX,sourceZ,313)*4.8f;
-                appendTree(mesh,{localX+jitterX,ground.position.y,localZ+jitterZ},
-                    height,.11f+height*.018f,
-                    static_cast<std::uint32_t>(unitHash(bits,sourceX,sourceZ,317)*
-                                               4294967295.0f),tileRegions[tile]);
-                ++scene.stats_.trees;
-            } else {
+            const bool centreIsWater=scene.sampleShoreDistance(localX,localZ)>=0.0f;
+            // Source tree selection is materialized below by AoeWorldDressing,
+            // which preserves the original salts/families before applying the
+            // native 3D spacing and forest-edge acceptance pass.
+            if(!centreIsWater&&unitHash(bits,sourceX,sourceZ,91)>=
+               AoeWorldDressing::sourceSpawnChance(tileRegions[tile],elevation)) {
                 const float rockChance=(scene.tileBiomes_[tile]==AoeBiome::Rock||
                     scene.tileBiomes_[tile]==AoeBiome::Highland)?.024f:.0025f;
                 if(unitHash(bits,sourceX,sourceZ,811)<rockChance) {
@@ -850,15 +1011,27 @@ AoeWorldScene AoeWorldGenerator::generate(std::int64_t seed) {
                 }
             }
 
-            const float suitability=grassSuitability(scene.tileBiomes_[tile]);
-            if(suitability<=0.0f)continue;
             for(int subZ=0;subZ<2;++subZ)for(int subX=0;subX<2;++subX) {
                 const int salt=901+subZ*17+subX*31;
-                if(unitHash(bits,sourceX,sourceZ,salt)>=suitability)continue;
                 const float patchX=x-AoeWorldScene::halfExtent+.25f+.5f*subX;
                 const float patchZ=z-AoeWorldScene::halfExtent+.25f+.5f*subZ;
+                if(scene.sampleShoreDistance(patchX,patchZ)>=0.0f)continue;
+                const AoeBiomeWeights patchWeights=
+                    scene.sampleBiomeWeights(patchX,patchZ);
+                float suitability=0.0f;
+                for(std::size_t channel=0;channel<patchWeights.values.size();
+                    ++channel) {
+                    suitability+=patchWeights.values[channel]*grassSuitability(
+                        static_cast<AoeBiome>(channel));
+                }
+                if(unitHash(bits,sourceX,sourceZ,salt)>=suitability)continue;
                 const TerrainSurfaceSample patchGround=scene.sampleTerrain(patchX,patchZ);
-                const float moisture=biomeMoisture(scene.tileBiomes_[tile]);
+                float moisture=0.0f;
+                for(std::size_t channel=0;channel<patchWeights.values.size();
+                    ++channel) {
+                    moisture+=patchWeights.values[channel]*biomeMoisture(
+                        static_cast<AoeBiome>(channel));
+                }
                 const std::uint32_t baseCount=28u+static_cast<std::uint32_t>(
                     unitHash(bits,sourceX*2+subX,sourceZ*2+subZ,937)*7.0f);
                 const std::uint32_t shortCode=13u+static_cast<std::uint32_t>(
@@ -888,9 +1061,126 @@ AoeWorldScene AoeWorldGenerator::generate(std::int64_t seed) {
             }
         }
     }
+    const Vec3 sourceSpawn=nearestPlayableSpawn(seed);
+    AoeDressingConfig dressingConfig{};
+    dressingConfig.seed=seed;
+    dressingConfig.minimumSourceX=firstSourceX;
+    dressingConfig.maximumSourceX=firstSourceX+AoeWorldScene::tileResolution;
+    dressingConfig.minimumSourceZ=firstSourceZ;
+    dressingConfig.maximumSourceZ=firstSourceZ+AoeWorldScene::tileResolution;
+    dressingConfig.localOriginX=static_cast<float>(centerX);
+    dressingConfig.localOriginZ=static_cast<float>(centerZ);
+    dressingConfig.spawnSourceX=static_cast<int>(std::floor(sourceSpawn.x));
+    dressingConfig.spawnSourceZ=static_cast<int>(std::floor(sourceSpawn.z));
+    dressingConfig.includeWorldFeatures=
+        dressingConfig.spawnSourceX>=dressingConfig.minimumSourceX&&
+        dressingConfig.spawnSourceX<dressingConfig.maximumSourceX&&
+        dressingConfig.spawnSourceZ>=dressingConfig.minimumSourceZ&&
+        dressingConfig.spawnSourceZ<dressingConfig.maximumSourceZ;
+
+    const auto dressingSample=[&](int sourceX,int sourceZ) {
+        const float elevation=(heightAt(bits,sourceX,sourceZ)+
+            heightAt(bits,sourceX+1,sourceZ)+
+            heightAt(bits,sourceX+1,sourceZ+1)+
+            heightAt(bits,sourceX,sourceZ+1))/4.0f;
+        const Classification classified=classify(bits,sourceX,sourceZ,elevation);
+        const float localX=sourceX-static_cast<float>(centerX)+.5f;
+        const float localZ=sourceZ-static_cast<float>(centerZ)+.5f;
+        TerrainSurfaceSample terrain=scene.sampleTerrain(localX,localZ);
+        bool blendedWater=waterBiome(classified.biome);
+        if(terrain.insideBounds)
+            blendedWater=scene.sampleShoreDistance(localX,localZ)>=0.0f;
+        if(!terrain.insideBounds) {
+            const float worldX=sourceX+.5f,worldZ=sourceZ+.5f;
+            const float epsilon=.5f;
+            const auto height=[&](float x,float z) {
+                return AoeWorldGenerator::renderedHeightAt(seed,x,z)*
+                       AoeWorldScene::heightScale;
+            };
+            terrain.position={localX,height(worldX,worldZ),localZ};
+            terrain.normal=normalize(Vec3{
+                height(worldX-epsilon,worldZ)-height(worldX+epsilon,worldZ),
+                2.0f*epsilon,
+                height(worldX,worldZ-epsilon)-height(worldX,worldZ+epsilon)});
+        }
+        AoeBiomeWeights weights{};
+        for(int offsetZ=-blendKernelHalo;
+            offsetZ<=blendKernelHalo;++offsetZ) {
+            const float weightZ=blendTileKernel[static_cast<std::size_t>(
+                offsetZ+blendKernelHalo)];
+            for(int offsetX=-blendKernelHalo;
+                offsetX<=blendKernelHalo;++offsetX) {
+                const int labelX=sourceX-firstSourceX+offsetX+blendHalo;
+                const int labelZ=sourceZ-firstSourceZ+offsetZ+blendHalo;
+                if(labelX<0||labelZ<0||labelX>=blendLabelResolution||
+                   labelZ>=blendLabelResolution)continue;
+                const AoeBiome label=blendLabels[blendLabelIndex(labelX,labelZ)];
+                weights.values[static_cast<std::size_t>(label)]+=
+                    weightZ*blendTileKernel[static_cast<std::size_t>(
+                        offsetX+blendKernelHalo)];
+            }
+        }
+        return AoeDressingSample{elevation,classified.biome,classified.region,
+            terrain.position,terrain.normal,
+            clamp(weights[AoeBiome::Forest]+weights[AoeBiome::JungleFloor],
+                  0.0f,1.0f),
+            !blendedWater&&terrain.normal.y>.58f};
+    };
+    scene.dressing_=std::make_shared<AoeDressingResult>(
+        AoeWorldDressing::generate(dressingConfig,dressingSample));
+    scene.dressing_->appendGeometryTo(mesh);
+    scene.stats_.trees=static_cast<std::uint32_t>(scene.dressing_->trees.size());
+    scene.stats_.trails=static_cast<std::uint32_t>(scene.dressing_->trails.size());
+    scene.stats_.worldFeatures=static_cast<std::uint32_t>(
+        scene.dressing_->features.size());
+    scene.stats_.gameplayMarkers=static_cast<std::uint32_t>(std::count_if(
+        scene.dressing_->features.begin(),scene.dressing_->features.end(),
+        [](const AoeWorldFeature3D& feature) {
+            return feature.kind==AoeWorldFeatureKind::SpawnMarker||
+                   feature.kind==AoeWorldFeatureKind::CampfireInteraction||
+                   feature.kind==AoeWorldFeatureKind::ResourceInteraction||
+                   feature.kind==AoeWorldFeatureKind::EncounterMarker||
+                   feature.kind==AoeWorldFeatureKind::QuestMarker;
+        }));
+
+    // Keep the road/camp/landmark footprint readable at ground level.  The
+    // same deterministic feature data remains available to future gameplay.
+    const auto grassReserved=[&](const GrassPatchGpu& patch) {
+        const Vec3 point{(patch.minX+patch.maxX)*.5f,patch.baseY,
+                         (patch.minZ+patch.maxZ)*.5f};
+        for(const AoeWorldFeature3D& feature:scene.dressing_->features) {
+            const bool physical=feature.kind==AoeWorldFeatureKind::StarterCamp||
+                feature.kind==AoeWorldFeatureKind::ForestGrove||
+                feature.kind==AoeWorldFeatureKind::StandingStones||
+                feature.kind==AoeWorldFeatureKind::CoastalBeacon||
+                feature.kind==AoeWorldFeatureKind::WetlandTotem;
+            if(!physical)continue;
+            const float dx=point.x-feature.position.x;
+            const float dz=point.z-feature.position.z;
+            if(dx*dx+dz*dz<(feature.radius+.30f)*(feature.radius+.30f))
+                return true;
+        }
+        for(const AoeTrail3D& trail:scene.dressing_->trails) {
+            for(std::size_t index=0;index+1<trail.points.size();++index) {
+                const Vec3 a=trail.points[index],b=trail.points[index+1];
+                const float dx=b.x-a.x,dz=b.z-a.z;
+                const float denominator=dx*dx+dz*dz;
+                const float amount=denominator>1.0e-6f?clamp(
+                    ((point.x-a.x)*dx+(point.z-a.z)*dz)/denominator,
+                    0.0f,1.0f):0.0f;
+                const float px=point.x-(a.x+dx*amount);
+                const float pz=point.z-(a.z+dz*amount);
+                const float clearance=trail.halfWidth+.22f;
+                if(px*px+pz*pz<clearance*clearance)return true;
+            }
+        }
+        return false;
+    };
+    mesh.grassPatches.erase(std::remove_if(mesh.grassPatches.begin(),
+        mesh.grassPatches.end(),grassReserved),mesh.grassPatches.end());
     scene.stats_.grassPatches=static_cast<std::uint32_t>(mesh.grassPatches.size());
     mesh.grassSeed=static_cast<std::uint32_t>(bits);
-    mesh.backgroundTreeCount=scene.stats_.trees;
+    // appendGeometryTo already records the accepted native tree inventory.
     mesh.rockCount=scene.stats_.rocks;
     mesh.shrubCount=scene.stats_.shrubs;
     mesh.minimumHeight=scene.stats_.minimumHeight;
@@ -898,6 +1188,9 @@ AoeWorldScene AoeWorldGenerator::generate(std::int64_t seed) {
 
     scene.spawn_={sourceSpawn.x-centerX,0,sourceSpawn.z-centerZ};
     scene.spawn_.y=scene.sampleTerrain(scene.spawn_.x,scene.spawn_.z).position.y;
+    [[maybe_unused]] const AoeHorizonStats horizon=AoeHorizonBuilder::append(
+        mesh,seed,centerX,centerZ,
+        [&scene](float x,float z){return scene.sampleTerrain(x,z);});
     return scene;
 }
 
@@ -918,18 +1211,11 @@ TerrainSurfaceSample AoeWorldScene::sampleTerrain(float x,float z) const {
     const std::array<std::size_t,4> corners{
         vertexIndex(cellX,cellZ),vertexIndex(cellX+1,cellZ),
         vertexIndex(cellX+1,cellZ+1),vertexIndex(cellX,cellZ+1)};
-    std::array<float,4> weights{};
     // Match the alternating diagonals emitted by generate(). Collision,
     // water depth, and the ray-traced surface then share the same piecewise
     // planar height instead of disagreeing across bilinear saddle cells.
-    if(((cellX+cellZ)&1)==0) {
-        if(tz>=tx)weights={1.0f-tz,0.0f,tx,tz-tx};
-        else weights={1.0f-tx,tx-tz,tz,0.0f};
-    } else if(tx+tz<=1.0f) {
-        weights={1.0f-tx-tz,tx,0.0f,tz};
-    } else {
-        weights={0.0f,1.0f-tz,tx+tz-1.0f,1.0f-tx};
-    }
+    const std::array<float,4> weights=terrainInterpolationWeights(
+        cellX,cellZ,tx,tz);
     float height=0.0f;
     Vec3 normal{};
     for(std::size_t corner=0;corner<corners.size();++corner) {
@@ -948,17 +1234,63 @@ AoeBiome AoeWorldScene::sampleBiome(float x,float z) const {
     return tileBiomes_[tileIndex(tileX,tileZ)];
 }
 
+AoeBiomeWeights AoeWorldScene::sampleBiomeWeights(float x,float z) const {
+    AoeBiomeWeights result{};
+    if(vertexBiomeWeights_.empty()||!std::isfinite(x)||!std::isfinite(z))
+        return result;
+    x=clamp(x,-halfExtent,halfExtent);
+    z=clamp(z,-halfExtent,halfExtent);
+    const float gridX=x+halfExtent,gridZ=z+halfExtent;
+    const int cellX=std::clamp(static_cast<int>(std::floor(gridX)),
+                               0,tileResolution-1);
+    const int cellZ=std::clamp(static_cast<int>(std::floor(gridZ)),
+                               0,tileResolution-1);
+    const float tx=gridX-cellX,tz=gridZ-cellZ;
+    const std::array<float,4> weights=terrainInterpolationWeights(
+        cellX,cellZ,tx,tz);
+    const std::array<std::size_t,4> corners{{
+        vertexIndex(cellX,cellZ),vertexIndex(cellX+1,cellZ),
+        vertexIndex(cellX+1,cellZ+1),vertexIndex(cellX,cellZ+1)}};
+    for(std::size_t corner=0;corner<corners.size();++corner) {
+        for(std::size_t channel=0;channel<result.values.size();++channel)
+            result.values[channel]+=
+                vertexBiomeWeights_[corners[corner]].values[channel]*weights[corner];
+    }
+    return result;
+}
+
+float AoeWorldScene::sampleShoreDistance(float x,float z) const {
+    if(vertexShoreDistances_.empty()||!std::isfinite(x)||!std::isfinite(z))
+        return -shoreDistanceMaximum;
+    x=clamp(x,-halfExtent,halfExtent);
+    z=clamp(z,-halfExtent,halfExtent);
+    const float gridX=x+halfExtent,gridZ=z+halfExtent;
+    const int cellX=std::clamp(static_cast<int>(std::floor(gridX)),
+                               0,tileResolution-1);
+    const int cellZ=std::clamp(static_cast<int>(std::floor(gridZ)),
+                               0,tileResolution-1);
+    const float tx=gridX-cellX,tz=gridZ-cellZ;
+    const std::array<float,4> weights=terrainInterpolationWeights(
+        cellX,cellZ,tx,tz);
+    const std::array<std::size_t,4> corners{{
+        vertexIndex(cellX,cellZ),vertexIndex(cellX+1,cellZ),
+        vertexIndex(cellX+1,cellZ+1),vertexIndex(cellX,cellZ+1)}};
+    float result=0.0f;
+    for(std::size_t corner=0;corner<corners.size();++corner)
+        result+=vertexShoreDistances_[corners[corner]]*weights[corner];
+    return result;
+}
+
 PersistentWaterSample AoeWorldScene::sampleWater(float x,float z) const {
     if(!std::isfinite(x)||!std::isfinite(z)||x<-halfExtent||x>halfExtent||
-       z<-halfExtent||z>halfExtent||tileWaterDepths_.empty())return {};
-    const int tileX=std::clamp(static_cast<int>(std::floor(
-        clamp(x,-halfExtent,halfExtent-.001f)+halfExtent)),0,tileResolution-1);
-    const int tileZ=std::clamp(static_cast<int>(std::floor(
-        clamp(z,-halfExtent,halfExtent-.001f)+halfExtent)),0,tileResolution-1);
-    if(tileWaterDepths_[tileIndex(tileX,tileZ)]<=0.0f)return {};
+       z<-halfExtent||z>halfExtent||vertexBiomeWeights_.empty())return {};
+    const float shoreDistance=sampleShoreDistance(x,z);
+    if(shoreDistance<0.0f)return {};
     const TerrainSurfaceSample bed=sampleTerrain(x,z);
     const float depth=std::max(0.0f,waterSurfaceHeight-bed.position.y);
-    return {waterSurfaceHeight,depth,1.0f-clamp(depth/3.2f,0.0f,1.0f),true};
+    return {waterSurfaceHeight,depth,
+            clamp(1.0f-shoreDistance/shoreDistanceMaximum,0.0f,1.0f),
+            true};
 }
 
 } // namespace dense

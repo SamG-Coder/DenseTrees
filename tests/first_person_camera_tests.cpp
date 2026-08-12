@@ -48,6 +48,16 @@ int main() {
     require(near(initialPose.eye.y,1.68f)&&near(initialPose.forward.x,0)&&
                 near(initialPose.forward.y,0)&&near(initialPose.forward.z,1),
             "default eye height or level forward direction is wrong");
+    standing.setTerrainSampler([](float x,float z) {
+        return dense::TerrainSurfaceSample{{x,2.0f,z},{0,1,0},true};
+    });
+    standing.rebaseHorizontal(-32.0f,16.0f);
+    require(near(standing.state().footPosition.x,-32.0f)&&
+                near(standing.state().footPosition.z,16.0f)&&
+                near(standing.state().footPosition.y,2.0f)&&
+                near(standing.pose().eye.y,3.68f),
+            "camera recenter did not preserve local pose on replacement terrain");
+    standing.setTerrainSampler(flatTerrain);standing.reset(0,0,0,0);
     require(near(dense::length(initialPose.forward),1)&&near(dense::length(initialPose.right),1)&&
                 near(dense::length(initialPose.up),1)&&
                 std::abs(dense::dot(initialPose.forward,initialPose.right))<1.0e-5f,

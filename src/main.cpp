@@ -1,4 +1,6 @@
 #include "aoe_world.hpp"
+#include "aoe_dressing.hpp"
+#include "aoe_streaming.hpp"
 #include "dxr_renderer.hpp"
 #include "first_person_camera.hpp"
 #include "launch_options.hpp"
@@ -15,9 +17,11 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <future>
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -110,6 +114,12 @@ struct App {
     dense::PlayerLocalLight playerLocalLight;
     dense::SceneMode sceneMode{dense::SceneMode::VisualTest};
     std::shared_ptr<dense::AoeWorldScene> aoeWorld;
+    std::int64_t aoeSeed{};
+    dense::AoeSceneStreamState streamState;
+    std::future<std::pair<std::uint64_t,dense::AoeWorldScene>> streamBuild;
+    bool streamBuildActive{};
+    std::uint64_t streamBuildRequestId{};
+    std::wstring streamBuildError;
 
     float yaw = .55f;
     float pitch = .18f;
@@ -128,6 +138,7 @@ struct App {
     float pendingYawDelta = 0.0f;
     float pendingPitchDelta = 0.0f;
     dense::Vec3 grassWakeVelocity{};
+    dense::Vec3 orbitTarget{};
     uint32_t generation = 0;
 
     HWND mainWindow{};
@@ -151,10 +162,12 @@ struct App {
     std::chrono::steady_clock::time_point lastEnvironmentUpdate{};
     std::chrono::steady_clock::time_point lastCameraUpdate{};
 
-    App(dense::SceneMode mode,std::int64_t seed):sceneMode(mode) {
+    App(dense::SceneMode mode,std::int64_t seed):sceneMode(mode),aoeSeed(seed) {
         if(sceneMode==dense::SceneMode::AiRpgWorld) {
             aoeWorld=std::make_shared<dense::AoeWorldScene>(
                 dense::AoeWorldGenerator::generate(seed));
+            streamState=dense::AoeSceneStreamState(
+                aoeWorld->sourceCenterX(),aoeWorld->sourceCenterZ());
             dense::FirstPersonCameraSettings settings;
             settings.horizontalHalfExtent=aoeWorld->traversalHalfExtent();
             const auto world=aoeWorld;
@@ -162,12 +175,14 @@ struct App {
                 [world](float x,float z){return world->sampleTerrain(x,z);});
             const dense::Vec3 spawn=aoeWorld->spawn();
             firstPersonCamera.reset(spawn.x,spawn.z,0.35f,-.12f);
+            orbitTarget={spawn.x,spawn.y+3.0f,spawn.z};
             yaw=.72f;pitch=.48f;distance=55.0f;
             debugSettings.grassDensity=2.2f;
         }
     }
 
     ~App() {
+        if(streamBuildActive&&streamBuild.valid())streamBuild.wait();
         releaseFirstPersonCapture();
         if(debugPanel && IsWindow(debugPanel))DestroyWindow(debugPanel);
         if(uiFontBold)DeleteObject(uiFontBold);
@@ -320,6 +335,84 @@ struct App {
         grassWakeVelocity=dense::lerp(grassWakeVelocity,targetVelocity,wakeBlend);
     }
 
+    void launchWorldStream(const dense::AoeSceneStreamRequest& request) {
+        const std::int64_t seed=aoeSeed;
+        streamBuildRequestId=request.id;
+        streamBuild=std::async(std::launch::async,[seed,request] {
+            return std::pair<std::uint64_t,dense::AoeWorldScene>{request.id,
+                dense::AoeWorldGenerator::generateWindow(seed,
+                    static_cast<int>(request.centerWorldX),
+                    static_cast<int>(request.centerWorldZ))};
+        });
+        streamBuildActive=true;
+    }
+
+    void updateWorldStreaming() {
+        if(!aoeWorld||cameraMode!=CameraMode::FirstPerson)return;
+        const dense::FirstPersonCameraState& camera=firstPersonCamera.state();
+        const double globalX=streamState.centerWorldX()+camera.footPosition.x;
+        const double globalZ=streamState.centerWorldZ()+camera.footPosition.z;
+        if(streamBuildActive) {
+            // Re-evaluate the destination while the worker runs. Returning to
+            // the retained centre invalidates it; crossing into another
+            // snapped chunk records the newer request without launching a
+            // second generator concurrently.
+            const auto revisedRequest=streamState.requestForCamera(
+                globalX,globalZ);
+            (void)revisedRequest;
+            if(streamBuild.wait_for(std::chrono::seconds(0))!=
+               std::future_status::ready)return;
+            streamBuildActive=false;
+            const std::uint64_t finishedRequestId=streamBuildRequestId;
+            streamBuildRequestId=0;
+            std::pair<std::uint64_t,dense::AoeWorldScene> completed;
+            try {
+                completed=streamBuild.get();
+            } catch(const std::exception& error) {
+                const std::string detail=error.what();
+                streamBuildError.assign(detail.begin(),detail.end());
+                streamState.abandon(finishedRequestId);
+                if(const auto pending=streamState.activeRequest())
+                    launchWorldStream(*pending);
+                refreshInteractionTitle();
+                return;
+            } catch(...) {
+                streamBuildError=L"unknown generation error";
+                streamState.abandon(finishedRequestId);
+                if(const auto pending=streamState.activeRequest())
+                    launchWorldStream(*pending);
+                refreshInteractionTitle();
+                return;
+            }
+            auto [requestId,scene]=std::move(completed);
+            if(!streamState.isCurrent(requestId)) {
+                if(const auto pending=streamState.activeRequest())
+                    launchWorldStream(*pending);
+                return;
+            }
+            const float oldCenterX=static_cast<float>(streamState.centerWorldX());
+            const float oldCenterZ=static_cast<float>(streamState.centerWorldZ());
+            const float newCenterX=scene.sourceCenterX();
+            const float newCenterZ=scene.sourceCenterZ();
+            if(!streamState.commit(requestId))return;
+            auto replacement=std::make_shared<dense::AoeWorldScene>(std::move(scene));
+            firstPersonCamera.setTerrainSampler(
+                [replacement](float x,float z){return replacement->sampleTerrain(x,z);});
+            firstPersonCamera.rebaseHorizontal(oldCenterX-newCenterX,
+                                                oldCenterZ-newCenterZ);
+            orbitTarget.x+=oldCenterX-newCenterX;
+            orbitTarget.z+=oldCenterZ-newCenterZ;
+            aoeWorld=replacement;
+            renderer.setWorld(replacement->takeMesh(),
+                [replacement](float x,float z){return replacement->sampleWater(x,z);});
+            streamBuildError.clear();
+            regenerate(mainWindow,false);
+            return;
+        }
+        const auto request=streamState.requestForCamera(globalX,globalZ);
+        if(request)launchWorldStream(*request);
+    }
+
     dense::CameraView cameraView() const {
         if(cameraMode==CameraMode::FirstPerson) {
             const dense::FirstPersonCameraPose pose=firstPersonCamera.pose();
@@ -330,9 +423,7 @@ struct App {
             view.grassInteractionEnabled=true;
             return view;
         }
-        const dense::Vec3 target=aoeWorld?
-            dense::Vec3{aoeWorld->spawn().x,aoeWorld->spawn().y+3.0f,
-                        aoeWorld->spawn().z}:dense::Vec3{0,4.1f,0};
+        const dense::Vec3 target=aoeWorld?orbitTarget:dense::Vec3{0,4.1f,0};
         dense::Vec3 eye=target+dense::Vec3{
             std::sin(yaw)*std::cos(pitch)*distance,
             std::sin(pitch)*distance,
@@ -357,7 +448,13 @@ struct App {
             title<<L"AI RPG AOE World 3D \u2014 seed "<<aoeWorld->seed()
                  <<L" \u2014 "<<aoeWorld->terrainTileCount()<<L" terrain tiles / "
                  <<aoeWorld->waterTileCount()<<L" water tiles / "
-                 <<aoeWorld->treeCount()<<L" trees \u2014 "<<gpu.adapter<<L" / DXR "
+                 <<aoeWorld->treeCount()<<L" trees";
+            const dense::AoeWorldStats& stats=aoeWorld->stats();
+            if(stats.trails||stats.worldFeatures)
+                title<<L" / "<<stats.trails<<L" trails / "
+                     <<stats.worldFeatures<<L" sites+markers";
+            if(!streamBuildError.empty())title<<L" / stream retry available";
+            title<<L" \u2014 "<<gpu.adapter<<L" / DXR "
                  <<gpu.rayTracingTier/10<<L'.'<<gpu.rayTracingTier%10;
             sceneTitle=title.str();refreshInteractionTitle();return;
         }
@@ -1119,6 +1216,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         if(running) {
             const auto frameStart=std::chrono::steady_clock::now();
             app->updateCamera();
+            app->updateWorldStreaming();
             app->updateEnvironment();
             const dense::CameraView camera=app->cameraView();
             const dense::PlayerLocalLight localLight=app->activePlayerLocalLight();

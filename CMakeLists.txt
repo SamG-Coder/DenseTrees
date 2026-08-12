@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(densetrees_core
+    src/aoe_dressing.cpp
+    src/aoe_horizon.cpp
+    src/aoe_streaming.cpp
     src/aoe_world.cpp
     src/environment.cpp
     src/environment_simulation.cpp
@@ -42,6 +45,12 @@ add_executable(ground_texture_tests tests/ground_texture_tests.cpp)
 target_link_libraries(ground_texture_tests PRIVATE densetrees_core)
 add_executable(aoe_world_tests tests/aoe_world_tests.cpp)
 target_link_libraries(aoe_world_tests PRIVATE densetrees_core)
+add_executable(aoe_dressing_tests tests/aoe_dressing_tests.cpp)
+target_link_libraries(aoe_dressing_tests PRIVATE densetrees_core)
+add_executable(aoe_horizon_tests tests/aoe_horizon_tests.cpp)
+target_link_libraries(aoe_horizon_tests PRIVATE densetrees_core)
+add_executable(aoe_streaming_tests tests/aoe_streaming_tests.cpp)
+target_link_libraries(aoe_streaming_tests PRIVATE densetrees_core)
 add_executable(launch_options_tests tests/launch_options_tests.cpp)
 target_link_libraries(launch_options_tests PRIVATE densetrees_core)
 enable_testing()
@@ -50,9 +59,13 @@ add_test(NAME environment_simulation_tests COMMAND environment_simulation_tests)
 add_test(NAME first_person_camera_tests COMMAND first_person_camera_tests)
 add_test(NAME ground_texture_tests COMMAND ground_texture_tests)
 add_test(NAME aoe_world_tests COMMAND aoe_world_tests)
+add_test(NAME aoe_dressing_tests COMMAND aoe_dressing_tests)
+add_test(NAME aoe_horizon_tests COMMAND aoe_horizon_tests)
+add_test(NAME aoe_streaming_tests COMMAND aoe_streaming_tests)
 add_test(NAME launch_options_tests COMMAND launch_options_tests)
 
 set_target_properties(DenseTrees densetrees_tests environment_simulation_tests
-    first_person_camera_tests ground_texture_tests aoe_world_tests launch_options_tests PROPERTIES
+    first_person_camera_tests ground_texture_tests aoe_world_tests aoe_dressing_tests
+    aoe_horizon_tests aoe_streaming_tests launch_options_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
