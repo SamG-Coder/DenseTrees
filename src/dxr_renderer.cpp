@@ -493,7 +493,7 @@ struct DxrRenderer::Impl{
         const float tallDistance=std::max(shortDistance,
             clamp(settings.tallGrassDrawDistance,4.0f,192.0f));
         const float shortTransitionDistance=std::min(tallDistance,
-            std::max(shortDistance+5.0f,shortDistance*1.18f));
+            std::max(shortDistance+12.0f,shortDistance*1.45f));
         const float streamDeltaX=eye.x-grassStreamCenterX;
         const float streamDeltaZ=eye.z-grassStreamCenterZ;
         const float streamDelta=std::sqrt(streamDeltaX*streamDeltaX+

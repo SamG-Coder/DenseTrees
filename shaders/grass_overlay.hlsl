@@ -443,8 +443,12 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
     uint tallCount=min((uint)ceil(baseTallCount*min(densityScale,1.8)),candidateCount);
     float shortDistance=clamp(camera.grassSettings.z,2.0,128.0);
     float tallDistance=max(shortDistance,clamp(camera.grassSettings.w,4.0,192.0));
+    // Short grass must not switch as one camera-centred ring.  A broad
+    // transition gives each world-stable blade room to leave independently as
+    // the player moves, instead of removing a whole band behind the camera and
+    // introducing the matching band in front.
     float shortTransitionDistance=min(tallDistance,
-        max(shortDistance+5.0,shortDistance*1.18));
+        max(shortDistance+12.0,shortDistance*1.45));
     float3 patchCenter=float3((patch.minX+patch.maxX)*.5,patch.baseY,
                               (patch.minZ+patch.maxZ)*.5);
     float patchDistance=distance(camera.eye,patchCenter);
@@ -452,23 +456,24 @@ VSOutput VSMain(uint vertexId : SV_VertexID,uint instanceId : SV_InstanceID) {
        (tallCount==0u&&patchDistance>=shortTransitionDistance))
         return inactiveVertex();
 
-    float shortFade=saturate((patchDistance-shortDistance)/
-        max(shortTransitionDistance-shortDistance,.01));
-    float shortPopulation=1-shortFade*shortFade*(3-2*shortFade);
-    uint activeCount=(uint)ceil(lerp((float)tallCount,(float)candidateCount,
-                                    shortPopulation));
-    if(bladeIndex>=activeCount)return inactiveVertex();
-
+    if(bladeIndex>=candidateCount)return inactiveVertex();
     bool tallBlade=bladeIndex<tallCount;
-    float shortCoverage=1-smoothstep(shortDistance*.82,shortTransitionDistance,
+    uint selection=(patch.seed&0x00ffffffu)^((bladeIndex+19u)*0x27d4eb2du);
+    // Give every blade a deterministic exit radius derived only from its
+    // absolute patch/blade identity.  The population remains anchored in world
+    // space while the fade shell travels past it.
+    float shortSpan=max(shortTransitionDistance-shortDistance,.01);
+    float shortExit=lerp(shortDistance,shortTransitionDistance,
+                         randomUint(selection^0x68bc21ebu));
+    float shortFadeWidth=min(shortSpan,max(1.5,shortSpan*.30));
+    if(!tallBlade&&patchDistance>=shortExit)return inactiveVertex();
+    float shortCoverage=1-smoothstep(shortExit-shortFadeWidth,shortExit,
                                      patchDistance);
     float tallCoverage=1-smoothstep(tallDistance*.70,tallDistance,patchDistance);
     float distanceCoverage=tallBlade?tallCoverage:shortCoverage;
-    float shortLodDensity=lerp(.68,1.0,1-smoothstep(3.0,shortDistance,patchDistance));
     float tallLodDensity=lerp(.62,1.0,1-smoothstep(3.0,tallDistance,patchDistance));
-    float lodDensity=tallBlade?tallLodDensity:shortLodDensity;
-    uint selection=(patch.seed&0x00ffffffu)^((bladeIndex+19u)*0x27d4eb2du);
-    if(distanceCoverage<=0||(bladeIndex>=2u&&randomUint(selection)>lodDensity))
+    if(distanceCoverage<=0||
+       (tallBlade&&bladeIndex>=2u&&randomUint(selection)>tallLodDensity))
         return inactiveVertex();
 
     float3 patchNormal=normalize(float3(patch.normalX,
